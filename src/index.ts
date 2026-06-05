@@ -5,17 +5,31 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { echoPrompt } from './mcp-server/prompts/definitions/echo.prompt.js';
-import { echoResource } from './mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from './mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoTool } from './mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from './mcp-server/tools/definitions/echo-app.app-tool.js';
+import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
+import { iaItemResource } from './mcp-server/resources/definitions/index.js';
+import {
+  iaFindSnapshots,
+  iaGetItem,
+  iaGetSnapshot,
+  iaGetText,
+  iaSearchItems,
+} from './mcp-server/tools/definitions/index.js';
+import { initArchiveMetadataService } from './services/archive-metadata/archive-metadata-service.js';
+import { initArchiveSearchService } from './services/archive-search/archive-search-service.js';
+import { initWaybackService } from './services/wayback/wayback-service.js';
 
 await createApp({
-  tools: [echoTool, echoAppTool],
-  resources: [echoResource, echoAppUiResource],
-  prompts: [echoPrompt],
-  // instructions: 'Server-level orientation forwarded to the model on every initialize.\n' +
-  //   '- Use shortcut `X` for the most common case\n' +
-  //   '- Tools require auth via the `inventory:read` scope',
+  tools: [iaFindSnapshots, iaGetSnapshot, iaSearchItems, iaGetItem, iaGetText],
+  resources: [iaItemResource],
+  prompts: allPromptDefinitions,
+  instructions:
+    'Internet Archive MCP server — access the Wayback Machine and the IA library.\n' +
+    '- Wayback workflow: ia_find_snapshots → ia_get_snapshot\n' +
+    '- Library workflow: ia_search_items → ia_get_item → ia_get_text (for text items)\n' +
+    '- All tools are read-only; no credentials required.',
+  setup(core) {
+    initWaybackService(core.config, core.storage);
+    initArchiveSearchService(core.config, core.storage);
+    initArchiveMetadataService(core.config, core.storage);
+  },
 });
