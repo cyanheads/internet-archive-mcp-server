@@ -107,6 +107,41 @@ describe('iaGetItem', () => {
     });
   });
 
+  it('handles description as an array (IA can return string or string[])', async () => {
+    mockService.getItem.mockResolvedValue({
+      metadata: {
+        identifier: 'array-desc-item',
+        description: ['First description sentence.', 'Second description sentence.'],
+      },
+      files: [],
+    });
+
+    const ctx = createMockContext({ errors: iaGetItem.errors });
+    const input = iaGetItem.input.parse({ identifier: 'array-desc-item' });
+    const result = await iaGetItem.handler(input, ctx);
+
+    expect(result.description).toEqual([
+      'First description sentence.',
+      'Second description sentence.',
+    ]);
+  });
+
+  it('handles description as a string (scalar form)', async () => {
+    mockService.getItem.mockResolvedValue({
+      metadata: {
+        identifier: 'string-desc-item',
+        description: 'A single description.',
+      },
+      files: [],
+    });
+
+    const ctx = createMockContext({ errors: iaGetItem.errors });
+    const input = iaGetItem.input.parse({ identifier: 'string-desc-item' });
+    const result = await iaGetItem.handler(input, ctx);
+
+    expect(result.description).toBe('A single description.');
+  });
+
   it('handles items with array creator and subject fields', async () => {
     mockService.getItem.mockResolvedValue({
       metadata: {

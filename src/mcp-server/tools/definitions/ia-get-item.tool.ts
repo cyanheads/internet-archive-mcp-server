@@ -35,7 +35,15 @@ export const iaGetItem = tool('ia_get_item', {
       ])
       .optional()
       .describe('Creator or author name(s) when provided.'),
-    description: z.string().optional().describe('Item description when provided.'),
+    description: z
+      .union([
+        z.string().describe('Single description string.'),
+        z
+          .array(z.string().describe('Description string.'))
+          .describe('Multiple description strings.'),
+      ])
+      .optional()
+      .describe('Item description when provided.'),
     mediatype: z.string().optional().describe('Media type (texts, audio, movies, etc.).'),
     date: z.string().optional().describe('Publication or upload date when provided.'),
     subject: z
@@ -140,8 +148,11 @@ export const iaGetItem = tool('ia_get_item', {
     if (result.licenseurl) lines.push(`**License:** ${result.licenseurl}`);
     if (result.rights) lines.push(`**Rights:** ${result.rights}`);
     if (result.description) {
+      const desc = Array.isArray(result.description)
+        ? result.description.join(' ')
+        : result.description;
       lines.push('');
-      lines.push(`**Description:** ${result.description}`);
+      lines.push(`**Description:** ${desc}`);
     }
     lines.push('');
     lines.push(`**Files (${result.file_count}):**`);

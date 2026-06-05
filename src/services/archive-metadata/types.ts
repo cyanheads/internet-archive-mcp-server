@@ -22,7 +22,7 @@ export interface ArchiveItemMetadata {
   collection?: string | string[];
   creator?: string | string[];
   date?: string;
-  description?: string;
+  description?: string | string[];
   identifier: string;
   language?: string;
   licenseurl?: string;

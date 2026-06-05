@@ -67,7 +67,7 @@ export class ArchiveMetadataService {
           identifier,
           ...(meta?.title ? { title: meta.title as string } : {}),
           ...(meta?.creator ? { creator: meta.creator as string | string[] } : {}),
-          ...(meta?.description ? { description: meta.description as string } : {}),
+          ...(meta?.description ? { description: meta.description as string | string[] } : {}),
           ...(meta?.mediatype ? { mediatype: meta.mediatype as string } : {}),
           ...(meta?.date ? { date: meta.date as string } : {}),
           ...(meta?.subject ? { subject: meta.subject as string | string[] } : {}),

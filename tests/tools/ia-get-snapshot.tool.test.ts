@@ -16,6 +16,7 @@ import { getWaybackService } from '@/services/wayback/wayback-service.js';
 const mockService = {
   findClosest: vi.fn(),
   fetchContent: vi.fn(),
+  buildReplayUrl: vi.fn(),
 };
 
 beforeEach(() => {
@@ -24,7 +25,37 @@ beforeEach(() => {
 });
 
 describe('iaGetSnapshot', () => {
-  it('returns text, replay_url, and resolved metadata on success', async () => {
+  it('uses direct path (no Availability API) when exact 14-digit timestamp is given', async () => {
+    // With a full 14-digit timestamp, the handler skips findClosest and calls buildReplayUrl
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20200101120000/https://example.com',
+    );
+    mockService.fetchContent.mockResolvedValue({
+      text: 'Hello world, this is the archived page text.',
+      replayUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
+    });
+
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const input = iaGetSnapshot.input.parse({
+      url: 'https://example.com',
+      timestamp: '20200101120000',
+    });
+    const result = await iaGetSnapshot.handler(input, ctx);
+
+    expect(mockService.findClosest).not.toHaveBeenCalled();
+    expect(mockService.buildReplayUrl).toHaveBeenCalledWith(
+      '20200101120000',
+      'https://example.com',
+    );
+    expect(result.text).toBe('Hello world, this is the archived page text.');
+    expect(result.replay_url).toBe(
+      'https://web.archive.org/web/20200101120000/https://example.com',
+    );
+    expect(result.resolved_timestamp).toBe('20200101120000');
+    expect(result.resolved_status).toBe('200');
+  });
+
+  it('uses Availability API for imprecise timestamps (fewer than 14 digits)', async () => {
     mockService.findClosest.mockResolvedValue({
       snapshotUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
       timestamp: '20200101120000',
@@ -38,14 +69,12 @@ describe('iaGetSnapshot', () => {
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     const input = iaGetSnapshot.input.parse({
       url: 'https://example.com',
-      timestamp: '20200101120000',
+      timestamp: '20200101', // 8 digits — imprecise, uses Availability API
     });
     const result = await iaGetSnapshot.handler(input, ctx);
 
-    expect(result.text).toBe('Hello world, this is the archived page text.');
-    expect(result.replay_url).toBe(
-      'https://web.archive.org/web/20200101120000/https://example.com',
-    );
+    expect(mockService.findClosest).toHaveBeenCalledWith('https://example.com', '20200101', ctx);
+    expect(mockService.buildReplayUrl).not.toHaveBeenCalled();
     expect(result.resolved_timestamp).toBe('20200101120000');
     expect(result.resolved_status).toBe('200');
   });
@@ -67,13 +96,12 @@ describe('iaGetSnapshot', () => {
     await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow();
   });
 
-  it('throws content_fetch_failed when archived page fetch fails', async () => {
+  it('throws content_fetch_failed when archived page fetch fails (exact timestamp)', async () => {
     const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
-    mockService.findClosest.mockResolvedValue({
-      snapshotUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
-      timestamp: '20200101120000',
-      status: '200',
-    });
+    // With a 14-digit timestamp, the handler uses buildReplayUrl + fetchContent (no findClosest)
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20200101120000/https://example.com',
+    );
     mockService.fetchContent.mockRejectedValue(
       serviceUnavailable('Fetch failed.', { reason: 'content_fetch_failed' }),
     );

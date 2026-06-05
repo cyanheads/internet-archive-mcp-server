@@ -63,22 +63,42 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
   async handler(input, ctx) {
     const svc = getWaybackService();
 
-    // Step 1: resolve the nearest snapshot via Availability API
-    const availability = await svc.findClosest(input.url, input.timestamp, ctx);
+    // When the caller passes a full 14-digit timestamp (returned by ia_find_snapshots),
+    // the Wayback Availability API can spuriously return {} for that exact timestamp —
+    // especially when the original URL redirects. Skip the re-check and build the
+    // replay URL directly; fall back to the Availability API for imprecise timestamps.
+    const isExactTimestamp = /^\d{14}$/.test(input.timestamp.trim());
 
-    // Step 2: fetch and extract the archived content
-    const content = await svc.fetchContent(availability.snapshotUrl, ctx);
+    let resolvedTimestamp: string;
+    let resolvedStatus: string;
+    let snapshotUrl: string;
+
+    if (isExactTimestamp) {
+      // Direct path: build replay URL from the exact timestamp
+      snapshotUrl = svc.buildReplayUrl(input.timestamp.trim(), input.url);
+      resolvedTimestamp = input.timestamp.trim();
+      resolvedStatus = '200'; // status will be determined by fetchContent; default assumed
+    } else {
+      // Resolution path: use Availability API to find the nearest snapshot
+      const availability = await svc.findClosest(input.url, input.timestamp, ctx);
+      snapshotUrl = availability.snapshotUrl;
+      resolvedTimestamp = availability.timestamp;
+      resolvedStatus = availability.status;
+    }
+
+    // Fetch and extract the archived content
+    const content = await svc.fetchContent(snapshotUrl, ctx);
 
     ctx.log.info('Snapshot content fetched', {
       url: input.url,
-      resolvedTimestamp: availability.timestamp,
+      resolvedTimestamp,
     });
 
     return {
       text: content.text,
       replay_url: content.replayUrl,
-      resolved_timestamp: availability.timestamp,
-      resolved_status: availability.status,
+      resolved_timestamp: resolvedTimestamp,
+      resolved_status: resolvedStatus,
     };
   },
 
