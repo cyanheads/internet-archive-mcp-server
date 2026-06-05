@@ -38,7 +38,8 @@ ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="internet-archive-mcp-server"
-LABEL org.opencontainers.image.description=""
+LABEL org.opencontainers.image.description="Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, item metadata, and full text via MCP."
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/internet-archive-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 # Copy dependency manifests

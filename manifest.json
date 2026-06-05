@@ -2,8 +2,11 @@
   "manifest_version": "0.3",
   "name": "internet-archive-mcp-server",
   "version": "0.1.0",
-  "description": "",
-  "author": { "name": "" },
+  "description": "Search the Wayback Machine and IA library (40M+ items), fetch snapshots, item metadata, and text.",
+  "author": { "name": "cyanheads" },
+  "repository": "https://github.com/cyanheads/internet-archive-mcp-server",
+  "homepage": "https://github.com/cyanheads/internet-archive-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",

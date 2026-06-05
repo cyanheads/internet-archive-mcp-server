@@ -11,19 +11,6 @@
 
 ---
 
-## First Session
-
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
-
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
-
-1. **Get your bearings.** Take stock of the project tree, the skills in `skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
-
----
-
 ## What's Next?
 
 When the user asks what's next or needs direction, suggest options based on the current project state. Common next steps:
@@ -61,34 +48,38 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const iaSearchItems = tool('ia_search_items', {
+  description: 'Search the Internet Archive library (40M+ items) by keyword and metadata filters.',
+  annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    query: z.string().describe('Solr search query (e.g. "tesla coil" or "subject:astronomy").'),
+    mediatype: z.enum(['texts', 'audio', 'video', 'software', 'image', 'collection'])
+      .optional().describe('Filter by media type.'),
+    rows: z.number().default(20).describe('Number of results per page (max 100).'),
+    page: z.number().default(1).describe('Page number (1-based).'),
   }),
   output: z.object({
+    total_found: z.number().describe('Total items matching the query.'),
+    page: z.number().describe('Current page.'),
+    rows: z.number().describe('Results per page.'),
     items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+      identifier: z.string().describe('Archive item identifier.'),
+      title: z.string().optional().describe('Item title.'),
+      mediatype: z.string().optional().describe('Media type.'),
+    })).describe('Matching items.'),
   }),
-  auth: ['inventory:read'],
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const service = getArchiveSearchService();
+    const result = await service.search(input);
+    ctx.log.info('IA search completed', { query: input.query, total: result.total_found });
+    return result;
   },
 
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: `Found ${result.total_found} items (page ${result.page}):\n` +
+      result.items.map(i => `- **${i.identifier}**: ${i.title ?? '(no title)'} [${i.mediatype ?? '?'}]`).join('\n'),
   }],
 });
 ```
@@ -99,32 +90,15 @@ export const searchItems = tool('search_items', {
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { notFound } from '@cyanheads/mcp-ts-core/errors';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
+export const iaItemResource = resource('ia://item/{identifier}', {
+  description: 'Metadata snapshot for an Internet Archive item — title, creator, mediatype, description, subjects, collections, date, license, and file count.',
+  params: z.object({ identifier: z.string().describe('Archive item identifier (e.g. "gatsby_0809").') }),
   async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
+    const service = getArchiveMetadataService();
+    const item = await service.getItem(params.identifier);
+    if (!item) throw notFound(`Item ${params.identifier} not found`, { identifier: params.identifier });
     return item;
   },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
 });
 ```
 
@@ -136,21 +110,23 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
+  userAgent: z.string().optional().describe('Custom User-Agent string for IA API requests.'),
+  requestTimeoutMs: z.coerce.number().default(30_000).describe('HTTP request timeout in milliseconds.'),
+  maxSnapshotChars: z.coerce.number().default(50_000).describe('Default character cap for ia_get_text responses.'),
 });
 
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
+let _config: ServerConfig | undefined;
+export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
+    userAgent: 'IA_USER_AGENT',
+    requestTimeoutMs: 'IA_REQUEST_TIMEOUT_MS',
+    maxSnapshotChars: 'IA_MAX_SNAPSHOT_CHARS',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`IA_USER_AGENT`) not the path (`userAgent`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
 
 ### Server instructions
 
@@ -225,18 +201,28 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # IA_USER_AGENT, IA_REQUEST_TIMEOUT_MS, IA_MAX_SNAPSHOT_CHARS
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    wayback/
+      wayback-service.ts                # WaybackService — Availability API + CDX API
+      types.ts                          # Wayback domain types
+    archive-search/
+      archive-search-service.ts         # ArchiveSearchService — Solr Advanced Search
+      types.ts                          # Search domain types
+    archive-metadata/
+      archive-metadata-service.ts       # ArchiveMetadataService — Metadata API + downloads
+      types.ts                          # Metadata domain types
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      ia-find-snapshots.tool.ts         # ia_find_snapshots
+      ia-get-snapshot.tool.ts           # ia_get_snapshot
+      ia-search-items.tool.ts           # ia_search_items
+      ia-get-item.tool.ts               # ia_get_item
+      ia-get-text.tool.ts               # ia_get_text
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
+      ia-item.resource.ts               # ia://item/{identifier}
     prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      index.ts                          # No prompts — empty barrel
 ```
 
 ---

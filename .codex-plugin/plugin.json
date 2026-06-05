@@ -1,25 +1,32 @@
 {
-  "name": "internet-archive-mcp-server",
+  "name": "@cyanheads/internet-archive-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads/internet-archive-mcp-server#readme"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/internet-archive-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/internet-archive-mcp-server.git",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "internet-archive",
+    "wayback-machine",
+    "archive"
+  ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "internet-archive-mcp-server",
-    "shortDescription": "",
+    "displayName": "@cyanheads/internet-archive-mcp-server",
+    "shortDescription": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
     "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "developerName": "cyanheads",
+    "category": "data",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/internet-archive-mcp-server",
     "defaultPrompt": []
   }
 }
