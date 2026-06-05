@@ -31,7 +31,8 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     text: z
       .string()
       .describe(
-        'Readable plain text extracted from the archived HTML (scripts, styles, and nav stripped).',
+        'Readable plain text extracted from the archived HTML (scripts, styles, and nav stripped). ' +
+          'Capped at the server-configured IA_MAX_SNAPSHOT_CHARS limit (default 50 000 characters).',
       ),
     replay_url: z
       .string()

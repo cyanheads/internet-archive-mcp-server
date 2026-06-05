@@ -50,11 +50,17 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
           'Example: "20231231".',
       ),
     status_filter: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{3}$/)
+          .describe('3-digit HTTP status code.'),
+      ])
       .optional()
       .describe(
         'Filter CDX results to a specific HTTP status code (history mode only). ' +
-          'Example: "200" to return only successful captures.',
+          'Must be a 3-digit numeric code. Example: "200" to return only successful captures.',
       ),
     limit: z
       .number()

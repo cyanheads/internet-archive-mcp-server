@@ -23,6 +23,26 @@ const SEARCH_FIELDS = [
   'collection',
 ];
 
+/**
+ * Escape a string value for safe embedding inside a Solr phrase query ("value").
+ * Backslash-escapes double-quotes and backslashes so the phrase boundary cannot be closed early.
+ */
+function solrEscape(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * Validate and return a Solr date range boundary.
+ * Accepts YYYY-MM-DD strings or undefined (returns "*").
+ * Rejects anything that doesn't match the expected date format to prevent range injection.
+ */
+function sanitizeDateRange(value: string | undefined): string {
+  if (!value) return '*';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  // Fall back to wildcard for anything that doesn't look like a date
+  return '*';
+}
+
 /** Parameters for the search method. */
 export interface SearchParams {
   collection?: string | undefined;
@@ -56,15 +76,16 @@ export class ArchiveSearchService {
 
     return withRetry(
       async () => {
-        // Build the Solr query string, appending metadata filters as needed
+        // Build the Solr query string, appending metadata filters as needed.
+        // All filter values are quoted or validated to prevent Solr query injection.
         let q = params.query.trim();
-        if (params.mediatype) q += ` AND mediatype:${params.mediatype}`;
-        if (params.collection) q += ` AND collection:${params.collection}`;
-        if (params.creator) q += ` AND creator:"${params.creator}"`;
-        if (params.language) q += ` AND language:${params.language}`;
+        if (params.mediatype) q += ` AND mediatype:"${solrEscape(params.mediatype)}"`;
+        if (params.collection) q += ` AND collection:"${solrEscape(params.collection)}"`;
+        if (params.creator) q += ` AND creator:"${solrEscape(params.creator)}"`;
+        if (params.language) q += ` AND language:"${solrEscape(params.language)}"`;
         if (params.dateFrom || params.dateTo) {
-          const from = params.dateFrom ?? '*';
-          const to = params.dateTo ?? '*';
+          const from = sanitizeDateRange(params.dateFrom);
+          const to = sanitizeDateRange(params.dateTo);
           q += ` AND date:[${from} TO ${to}]`;
         }
 

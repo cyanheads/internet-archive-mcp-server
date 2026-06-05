@@ -67,6 +67,16 @@ export class WaybackService {
           });
         }
 
+        // Guard: ensure the returned URL is a Wayback replay URL, not an arbitrary host.
+        // The Availability API should always return web.archive.org URLs; validate to prevent
+        // SSRF if the response were ever tampered or unexpected.
+        if (!closest.url.startsWith('https://web.archive.org/')) {
+          throw notFound(
+            `Availability API returned an unexpected snapshot URL for ${url} near ${timestamp}.`,
+            { reason: 'no_snapshot_available', url, timestamp },
+          );
+        }
+
         return {
           snapshotUrl: closest.url,
           timestamp: closest.timestamp,
@@ -182,8 +192,10 @@ export class WaybackService {
   /**
    * Fetch archived content for a resolved snapshot URL and extract readable text.
    * Throws `content_fetch_failed` if the fetch fails.
+   * Text is capped at `maxChars` characters (defaults to `maxSnapshotChars` from server config).
    */
-  fetchContent(snapshotUrl: string, ctx: Context): Promise<SnapshotContent> {
+  fetchContent(snapshotUrl: string, ctx: Context, maxChars?: number): Promise<SnapshotContent> {
+    const cap = maxChars ?? getServerConfig().maxSnapshotChars;
     return withRetry(
       async () => {
         const response = await fetchWithTimeout(
@@ -194,7 +206,7 @@ export class WaybackService {
         );
 
         const html = await response.text();
-        const text = stripHtml(html);
+        const text = stripHtml(html).slice(0, cap);
 
         return { text, replayUrl: snapshotUrl };
       },
