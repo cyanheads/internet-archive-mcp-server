@@ -7,6 +7,8 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getWaybackService } from '@/services/wayback/wayback-service.js';
 
+const WAYBACK_WEB = 'https://web.archive.org/web';
+
 export const iaFindSnapshots = tool('ia_find_snapshots', {
   title: 'Find Wayback Machine Snapshots',
   description:
@@ -195,7 +197,6 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       hasResumeKey: !!histResult.resumeKey,
     });
 
-    const WAYBACK_WEB = 'https://web.archive.org/web';
     const snapshots = histResult.records.map((r) => ({
       timestamp: r.timestamp,
       replay_url: `${WAYBACK_WEB}/${r.timestamp}/${r.original || input.url}`,

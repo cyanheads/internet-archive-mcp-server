@@ -26,13 +26,11 @@ export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 let _config: ServerConfig | undefined;
 
 export function getServerConfig(): ServerConfig {
-  if (!_config) {
-    _config = parseEnvConfig(ServerConfigSchema, {
-      userAgent: 'IA_USER_AGENT',
-      requestTimeoutMs: 'IA_REQUEST_TIMEOUT_MS',
-      maxSnapshotChars: 'IA_MAX_SNAPSHOT_CHARS',
-    });
-  }
+  _config ??= parseEnvConfig(ServerConfigSchema, {
+    userAgent: 'IA_USER_AGENT',
+    requestTimeoutMs: 'IA_REQUEST_TIMEOUT_MS',
+    maxSnapshotChars: 'IA_MAX_SNAPSHOT_CHARS',
+  });
   return _config;
 }
 

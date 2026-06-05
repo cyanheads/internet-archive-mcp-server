@@ -38,16 +38,12 @@ export interface SearchParams {
 }
 
 export class ArchiveSearchService {
-  private readonly userAgent: string;
+  private readonly headers: Record<string, string>;
   private readonly timeoutMs: number;
 
   constructor(config: AppConfig, _storage: StorageService) {
-    this.userAgent = getUserAgent(config.mcpServerVersion);
+    this.headers = { 'User-Agent': getUserAgent(config.mcpServerVersion) };
     this.timeoutMs = getServerConfig().requestTimeoutMs;
-  }
-
-  private get headers(): Record<string, string> {
-    return { 'User-Agent': this.userAgent };
   }
 
   /** Search the Internet Archive library. */
@@ -82,11 +78,7 @@ export class ArchiveSearchService {
         for (const field of SEARCH_FIELDS) {
           qp.append('fl[]', field);
         }
-        if (params.sort) {
-          qp.append('sort[]', params.sort);
-        } else {
-          qp.append('sort[]', 'downloads desc');
-        }
+        qp.append('sort[]', params.sort ?? 'downloads desc');
 
         const response = await fetchWithTimeout(
           `${SEARCH_BASE}?${qp}`,

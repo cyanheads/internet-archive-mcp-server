@@ -28,16 +28,12 @@ const WAYBACK_FETCH_BASE = 'https://web.archive.org/web';
 const CDX_FIELDS = 'timestamp,statuscode,mimetype,original,digest,length';
 
 export class WaybackService {
-  private readonly userAgent: string;
+  private readonly headers: Record<string, string>;
   private readonly timeoutMs: number;
 
   constructor(config: AppConfig, _storage: StorageService) {
-    this.userAgent = getUserAgent(config.mcpServerVersion);
+    this.headers = { 'User-Agent': getUserAgent(config.mcpServerVersion) };
     this.timeoutMs = getServerConfig().requestTimeoutMs;
-  }
-
-  private get headers(): Record<string, string> {
-    return { 'User-Agent': this.userAgent };
   }
 
   /**
