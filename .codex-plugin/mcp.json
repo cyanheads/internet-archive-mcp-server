@@ -1,0 +1,9 @@
+{
+  "internet-archive-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "internet-archive-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
