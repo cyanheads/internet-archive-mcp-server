@@ -56,6 +56,15 @@ export class ArchiveMetadataService {
           });
         }
 
+        // Dark/restricted items return HTTP 200 with routing fields but no metadata or files.
+        // is_dark: true means the item has been removed or restricted — treat as not found.
+        if (raw.is_dark === true) {
+          throw notFound(`Item "${identifier}" is dark (restricted) in the Internet Archive.`, {
+            reason: 'item_not_found',
+            identifier,
+          });
+        }
+
         const meta = raw.metadata as Record<string, unknown> | undefined;
         const rawFiles = (raw.files as unknown[] | undefined) ?? [];
 

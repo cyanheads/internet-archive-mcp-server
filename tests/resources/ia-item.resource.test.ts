@@ -88,6 +88,24 @@ describe('iaItemResource', () => {
     });
   });
 
+  it('throws item_not_found when the item is dark (restricted)', async () => {
+    // Dark items: service detects is_dark: true and throws item_not_found
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.getItem.mockRejectedValue(
+      notFound('Item "dark-item" is dark (restricted) in the Internet Archive.', {
+        reason: 'item_not_found',
+        identifier: 'dark-item',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'dark-item' });
+
+    await expect(iaItemResource.handler(params, ctx)).rejects.toMatchObject({
+      data: { reason: 'item_not_found' },
+    });
+  });
+
   describe('list', () => {
     it('returns at least one resource entry with uri and name', async () => {
       const listing = await iaItemResource.list!();

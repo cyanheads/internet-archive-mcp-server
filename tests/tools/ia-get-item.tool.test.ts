@@ -107,6 +107,24 @@ describe('iaGetItem', () => {
     });
   });
 
+  it('throws item_not_found when the item is dark (restricted)', async () => {
+    // Dark items: service detects is_dark: true and throws item_not_found
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.getItem.mockRejectedValue(
+      notFound('Item "pg1342" is dark (restricted) in the Internet Archive.', {
+        reason: 'item_not_found',
+        identifier: 'pg1342',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: iaGetItem.errors });
+    const input = iaGetItem.input.parse({ identifier: 'pg1342' });
+
+    await expect(iaGetItem.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'item_not_found' },
+    });
+  });
+
   it('handles description as an array (IA can return string or string[])', async () => {
     mockService.getItem.mockResolvedValue({
       metadata: {
