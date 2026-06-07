@@ -115,6 +115,55 @@ describe('iaGetSnapshot', () => {
     await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow();
   });
 
+  it('maps Wayback 404 on exact-timestamp direct path to no_snapshot_available', async () => {
+    // fetchContent receives a 404 from Wayback — should surface as no_snapshot_available
+    // rather than the raw NotFound McpError with no recovery hint.
+    const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20200601000000/https://thisurldoesnotexist99999.com',
+    );
+    mockService.fetchContent.mockRejectedValue(
+      new McpError(
+        JsonRpcErrorCode.NotFound,
+        'Fetch failed for https://web.archive.org/web/20200601000000/... Status: 404',
+        { statusCode: 404, errorSource: 'FetchHttpError' },
+      ),
+    );
+
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const input = iaGetSnapshot.input.parse({
+      url: 'https://thisurldoesnotexist99999.com',
+      timestamp: '20200601000000',
+    });
+
+    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_snapshot_available' },
+    });
+  });
+
+  it('does not remap non-404 errors on exact-timestamp path', async () => {
+    // A 503 from fetchContent should pass through as-is, not be re-mapped to no_snapshot_available
+    const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20200601000000/https://example.com',
+    );
+    const serviceUnavailableError = new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'Fetch failed for https://web.archive.org/web/20200601000000/... Status: 503',
+      { statusCode: 503, errorSource: 'FetchHttpError' },
+    );
+    mockService.fetchContent.mockRejectedValue(serviceUnavailableError);
+
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const input = iaGetSnapshot.input.parse({
+      url: 'https://example.com',
+      timestamp: '20200601000000',
+    });
+
+    // Should propagate the original 503, not map to no_snapshot_available
+    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow(serviceUnavailableError);
+  });
+
   describe('format', () => {
     it('renders replay URL, resolved timestamp, status, and text', () => {
       const output = {

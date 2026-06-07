@@ -4,7 +4,8 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import type { SnapshotContent } from '@/services/wayback/types.js';
 import { getWaybackService } from '@/services/wayback/wayback-service.js';
 
 export const iaGetSnapshot = tool('ia_get_snapshot', {
@@ -42,7 +43,11 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .describe('The actual snapshot timestamp resolved from the nearest capture lookup.'),
     resolved_status: z
       .string()
-      .describe('HTTP status code of the original capture at the resolved timestamp.'),
+      .describe(
+        'HTTP status code of the original capture at the resolved timestamp. ' +
+          'Returned by the Availability API for imprecise timestamps; assumed "200" ' +
+          'for exact 14-digit timestamps (direct path skips the Availability API).',
+      ),
   }),
 
   errors: [
@@ -87,8 +92,22 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       resolvedStatus = availability.status;
     }
 
-    // Fetch and extract the archived content
-    const content = await svc.fetchContent(snapshotUrl, ctx);
+    // Fetch and extract the archived content.
+    // For exact-timestamp direct paths, a 404 means no capture at that timestamp —
+    // remap to the declared no_snapshot_available contract so callers get the recovery hint.
+    let content: SnapshotContent;
+    try {
+      content = await svc.fetchContent(snapshotUrl, ctx);
+    } catch (err) {
+      if (isExactTimestamp && err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw ctx.fail(
+          'no_snapshot_available',
+          `No capture found at ${input.url} for timestamp ${resolvedTimestamp}.`,
+          { ...ctx.recoveryFor('no_snapshot_available') },
+        );
+      }
+      throw err;
+    }
 
     ctx.log.info('Snapshot content fetched', {
       url: input.url,
