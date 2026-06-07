@@ -1,7 +1,7 @@
 {
   "name": "@cyanheads/internet-archive-mcp-server",
   "mcpName": "io.github.cyanheads/internet-archive-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
   "type": "module",
   "main": "dist/index.js",
@@ -93,7 +93,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.2",
     "depcheck": "^1.4.7",
     "ignore": "^7.0.5",
     "tsc-alias": "^1.8.17",
