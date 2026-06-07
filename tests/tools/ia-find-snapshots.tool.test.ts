@@ -80,6 +80,31 @@ describe('iaFindSnapshots', () => {
 
       await expect(iaFindSnapshots.handler(input, ctx)).rejects.toThrow();
     });
+
+    it('accepts http:// snapshot URL from Availability API (SSRF guard allows both schemes)', async () => {
+      // The Wayback Availability API returns http:// (not https://) replay URLs.
+      // The SSRF guard in WaybackService.findClosest must accept both schemes.
+      // This test verifies the tool round-trips an http:// URL without errors.
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: 'http://web.archive.org/web/20200101231047/https://example.com/',
+        timestamp: '20200101231047',
+        status: '200',
+      });
+
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const input = iaFindSnapshots.input.parse({
+        url: 'example.com',
+        mode: 'closest',
+        timestamp: '20200101',
+      });
+      const result = await iaFindSnapshots.handler(input, ctx);
+
+      expect(result.snapshots).toHaveLength(1);
+      expect(result.snapshots[0].replay_url).toBe(
+        'http://web.archive.org/web/20200101231047/https://example.com/',
+      );
+      expect(result.snapshots[0].timestamp).toBe('20200101231047');
+    });
   });
 
   describe('mode: history', () => {

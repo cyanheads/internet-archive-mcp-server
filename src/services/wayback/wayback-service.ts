@@ -68,9 +68,12 @@ export class WaybackService {
         }
 
         // Guard: ensure the returned URL is a Wayback replay URL, not an arbitrary host.
-        // The Availability API should always return web.archive.org URLs; validate to prevent
-        // SSRF if the response were ever tampered or unexpected.
-        if (!closest.url.startsWith('https://web.archive.org/')) {
+        // The Availability API returns http:// (not https://) — accept both schemes.
+        // Validate to prevent SSRF if the response were ever tampered or unexpected.
+        if (
+          !closest.url.startsWith('http://web.archive.org/') &&
+          !closest.url.startsWith('https://web.archive.org/')
+        ) {
           throw notFound(
             `Availability API returned an unexpected snapshot URL for ${url} near ${timestamp}.`,
             { reason: 'no_snapshot_available', url, timestamp },
