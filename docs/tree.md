@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-06-05 12:12:19
+Generated on: 2026-06-13 03:47:03
 
 ```text
 internet-archive-mcp-server/
@@ -31,6 +31,7 @@ internet-archive-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -116,6 +117,10 @@ internet-archive-mcp-server/
 │   ├── security-pass/
 │   │   └── SKILL.md
 │   ├── setup/
+│   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md

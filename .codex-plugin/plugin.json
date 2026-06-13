@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/internet-archive-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -20,7 +20,7 @@
   ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/internet-archive-mcp-server",
+    "displayName": "internet-archive-mcp-server",
     "shortDescription": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
     "longDescription": "",
     "developerName": "cyanheads",
