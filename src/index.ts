@@ -19,6 +19,8 @@ import { initArchiveSearchService } from './services/archive-search/archive-sear
 import { initWaybackService } from './services/wayback/wayback-service.js';
 
 await createApp({
+  name: 'internet-archive-mcp-server',
+  title: 'internet-archive-mcp-server',
   tools: [iaFindSnapshots, iaGetSnapshot, iaSearchItems, iaGetItem, iaGetText],
   resources: [iaItemResource],
   prompts: allPromptDefinitions,
