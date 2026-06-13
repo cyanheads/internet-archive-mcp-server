@@ -125,6 +125,15 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       ),
   }),
 
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe('True when the snapshot list was capped at the limit.'),
+    shown: z.number().optional().describe('Number of snapshots returned.'),
+    cap: z.number().optional().describe('The limit that was applied.'),
+  },
+
   errors: [
     {
       reason: 'no_snapshots',
@@ -202,6 +211,10 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       count: histResult.records.length,
       hasResumeKey: !!histResult.resumeKey,
     });
+
+    if (histResult.records.length >= input.limit) {
+      ctx.enrich.truncated({ shown: histResult.records.length, cap: input.limit });
+    }
 
     const snapshots = histResult.records.map((r) => ({
       timestamp: r.timestamp,
