@@ -1,6 +1,15 @@
 [install]
 auto = "fallback"
 frozenLockfile = false
+# Supply-chain guard: hold freshly published versions for 3 days before they
+# install. Existing bun.lock entries are unaffected. The framework is excluded
+# so its releases adopt same-day within the declared range.
+minimumReleaseAge = 259200
+minimumReleaseAgeExcludes = ["@cyanheads/mcp-ts-core"]
+
+[install.security]
+# Socket scanner runs on every install — malware, typosquat, and CVE checks.
+scanner = "@socketsecurity/bun-security-scanner"
 
 [run]
 bun = true
