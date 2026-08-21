@@ -5,7 +5,13 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  forbidden,
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  serviceUnavailable,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, getUserAgent } from '@/config/server-config.js';
@@ -132,14 +138,37 @@ export class ArchiveMetadataService {
     // Step 2: download the text content
     return withRetry(
       async () => {
-        const response = await fetchWithTimeout(
-          textFile.downloadUrl,
-          this.timeoutMs,
-          ctx as unknown as Parameters<typeof fetchWithTimeout>[2],
-          { headers: this.headers, signal: ctx.signal },
-        );
+        // A 401/403 here is the expected outcome for a restricted item — IA answers
+        // 401 for login-required downloads and 403 for limited collections — so both
+        // remap to the declared download_forbidden contract and its recovery hint
+        // reaches the wire. expectedStatuses drops the fetch's own error-level log
+        // to debug; the status-mapped McpError is still thrown, unchanged.
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(
+            textFile.downloadUrl,
+            this.timeoutMs,
+            ctx as unknown as Parameters<typeof fetchWithTimeout>[2],
+            { headers: this.headers, signal: ctx.signal, expectedStatuses: [401, 403] },
+          );
+        } catch (err) {
+          if (
+            err instanceof McpError &&
+            (err.code === JsonRpcErrorCode.Forbidden || err.code === JsonRpcErrorCode.Unauthorized)
+          ) {
+            throw forbidden(
+              `Access to item "${identifier}" is restricted — the file is in a login-required or limited collection.`,
+              {
+                reason: 'download_forbidden',
+                identifier,
+                file: textFile.name,
+                ...ctx.recoveryFor('download_forbidden'),
+              },
+            );
+          }
+          throw err;
+        }
 
-        // fetchWithTimeout throws on non-2xx; we re-classify 403 explicitly for the contract
         const fullText = await response.text();
         const totalChars = fullText.length;
         const slice = fullText.slice(charOffset, charOffset + maxChars);
