@@ -1,6 +1,6 @@
 {
-  "name": "@cyanheads/internet-archive-mcp-server",
-  "version": "0.1.3",
+  "name": "internet-archive-mcp-server",
+  "version": "0.1.4",
   "description": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "internet-archive-mcp-server",
     "shortDescription": "Search the Wayback Machine and IA library (40M+ items), fetch archived snapshots, retrieve item metadata and full text via MCP. STDIO or Streamable HTTP.",
-    "longDescription": "",
+    "longDescription": "MCP server for the Internet Archive and the Wayback Machine. Five read-only tools — ia_find_snapshots (Availability/CDX lookup), ia_get_snapshot (archived page text), ia_search_items (Solr library search), ia_get_item (full metadata + file manifest), and ia_get_text (paginated book/document text) — plus an ia://item/{identifier} metadata resource. No credentials required; runs over stdio or Streamable HTTP.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-08-21
+
+ia_get_text restricted downloads consistently throw the declared download_forbidden contract with recovery hint on the wire (#7, #12); mcp-ts-core ^0.10.6 → ^0.12.3 (SDK v2 dual-era serving, strict tool inputs, supply-chain guard, Bun 1.4 Docker, TypeScript 7); smoke/integration/fuzz suites + community health files
+
 ## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-12
 
 mcp-ts-core ^0.10.6 adoption — ia_find_snapshots truncation enrichment, explicit name/title identity, MCPB bundle agent-doc stripping, Docker healthcheck and version label

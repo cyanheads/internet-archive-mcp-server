@@ -1,5 +1,5 @@
 {
-  "@cyanheads/internet-archive-mcp-server": {
+  "internet-archive-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/internet-archive-mcp-server"],
     "env": {
