@@ -21,6 +21,12 @@ import { initWaybackService } from './services/wayback/wayback-service.js';
 await createApp({
   name: 'internet-archive-mcp-server',
   title: 'internet-archive-mcp-server',
+  /**
+   * No tool here calls `ctx.requestInput`, so nothing needs a live session.
+   * Seeds `MCP_SESSION_MODE` when the environment does not set a meaningful
+   * value; a deployment that sets it explicitly still wins.
+   */
+  sessionMode: 'stateless',
   tools: [iaFindSnapshots, iaGetSnapshot, iaSearchItems, iaGetItem, iaGetText],
   resources: [iaItemResource],
   prompts: allPromptDefinitions,
