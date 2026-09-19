@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/internet-archive-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/internet-archive-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/internet-archive-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/internet-archive-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/internet-archive-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/internet-archive-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -21,92 +21,90 @@
 
 ---
 
-## Tools
+## Overview
 
-Five tools covering two Internet Archive pillars — Wayback Machine snapshot discovery and retrieval, and IA library search and content access:
+The Wayback Machine and Internet Archive library (40M+ items). Find and fetch archived snapshots of any URL, search the library by keyword and metadata, and retrieve item metadata, file manifests, and OCR text from any MCP client. Runs as a stdio process or a local Streamable HTTP server.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
-| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL. Mode `closest` returns the nearest capture to a given timestamp. Mode `history` returns the full capture list via CDX with date range, status, and MIME filters, collapsed by default to one capture per day. Supports resume-key pagination for large histories. |
-| `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Strips HTML to readable text and returns the canonical replay URL. |
-| `ia_search_items` | Search the IA library (40M+ items). Filter by media type, collection, creator, date range, and language. Sort by relevance, date, or downloads. Returns identifiers, titles, types, and pagination context (`total_found`, `page`, `rows`). |
-| `ia_get_item` | Retrieve full metadata and the file manifest for an Archive item by identifier — title, creator, description, subjects, collections, license, and every file with its format, size, and direct download URL. |
-| `ia_get_text` | Retrieve readable OCR text (DjVuTXT or plain-text) from a text item. Length-aware truncation with continuation pointer (`char_offset`) for paging through large documents. |
+| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL, by closest timestamp or full capture history |
+| `ia_get_snapshot` | Fetch archived page content at a specific Wayback timestamp |
+| `ia_search_items` | Search the IA library (40M+ items) by keyword and metadata filters |
+| `ia_get_item` | Retrieve full metadata and file manifest for an Archive item |
+| `ia_get_text` | Retrieve readable OCR text from a text item, with paging |
 
-### `ia_find_snapshots`
+### Resources
 
-Discover what the Wayback Machine has captured for any URL.
+| Resource | Description |
+|:---|:---|
+| `ia://item/{identifier}` | Metadata snapshot for an Archive item — title, creator, mediatype, description, subjects, collections, date, license, and file count |
 
-- **`closest` mode**: single fast lookup via the Availability API — returns the nearest capture to a given timestamp
-- **`history` mode**: full capture list via the CDX API, filterable by date range (`from`/`to`), HTTP status (`status_filter`), and MIME type
-- Default collapse of `timestamp:8` (one capture per day) keeps responses tractable for popular URLs; adjust with the `collapse` parameter (`timestamp:N`, N=1–14)
-- Resume-key pagination (`resume_key`) for stepping through large CDX histories without re-scanning
+All resource data is also reachable via `ia_get_item`.
 
----
+## Capability reference
 
-### `ia_get_snapshot`
+### `ia_find_snapshots` <sub>tool</sub>
 
-Retrieve what a page actually said at a point in time.
-
-- Resolves to the nearest available capture when the exact timestamp has no snapshot
-- Strips Wayback banner injections and extracts readable text — returns clean content alongside the canonical replay URL for browser access
-- Useful for fact-checking, citation verification, and tracing how content changed over time
-
----
-
-### `ia_search_items`
-
-Search across 40M+ Archive items by keyword and metadata filters.
-
-- Full-text Solr query syntax plus structured filters: `mediatype` (texts, audio, video, software, image), `collection`, `creator`, `language`, and date range
-- Sort by relevance, date added, or download count
-- Pagination via `page` and `rows`; output includes `total_found` and current `page`/`rows` so agents can paginate correctly without guessing
+- `closest` mode: single lookup via the Availability API, returns the nearest capture to a given `timestamp`
+- `history` mode: full capture list via the CDX API; filter by date range (`from`/`to`), HTTP status (`status_filter`), and MIME type
+- Default `collapse` of `timestamp:8` (one capture per day); adjustable to `timestamp:N`, N=1–14
+- Up to 10,000 records per call (`limit`, default 100); `resume_key` pagination for large histories
+- Typed errors: `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp), `cdx_unavailable`
 
 ---
 
-### `ia_get_item`
+### `ia_get_snapshot` <sub>tool</sub>
 
-Fetch the complete metadata and file manifest for any Archive item.
-
-- Returns structured fields: `title`, `creator`, `description`, `subjects`, `collections`, `date`, `license`, and more
-- `files[]` includes every file in the item with its `format`, `size`, and direct download URL — the primary way to act on a search result
-- `metadata` response `{}` on unknown identifier → typed `item_not_found` error
+- Resolves to the nearest available capture when the exact timestamp has no snapshot; exact 14-digit timestamps skip resolution and assume status `200`
+- Strips scripts, styles, and nav from the archived HTML, returning readable plain text alongside the canonical replay URL
+- Output capped at `IA_MAX_SNAPSHOT_CHARS` (default 50,000 characters)
+- Typed errors: `no_snapshot_available`, `content_fetch_failed`
 
 ---
 
-### `ia_get_text`
+### `ia_search_items` <sub>tool</sub>
 
-Read the OCR text of public-domain books, documents, and transcripts.
+- Solr query syntax plus structured filters: `mediatype`, `collection`, `creator`, `language`, and date range (`date_from`/`date_to`)
+- Sort by relevance, date, or downloads (`sort`, Solr syntax; default `downloads desc`)
+- Up to 200 results per page (`rows`, default 50), 1-indexed `page`
+- Output carries `total_found`, `page`, `rows` for pagination; empty results return a `notice` with guidance rather than an error
 
-- Locates the best available text file in the item's manifest (DjVuTXT preferred, falls back to plain text)
-- `max_chars` and `char_offset` enable efficient paging through long documents without re-fetching
-- Surfaces `download_forbidden` (HTTP 403) as a typed error for restricted collections rather than failing silently
+---
 
-## Resource
+### `ia_get_item` <sub>tool</sub>
 
-| Type | Name | Description |
-|:---|:---|:---|
-| Resource | `ia://item/{identifier}` | Metadata snapshot for an Archive item — title, creator, mediatype, description, subjects, collections, date, license, and file count. Stable URIs for injectable context. |
+- Returns `title`, `creator`, `description`, `subject`, `collection`, `licenseurl`, `rights`, and `language` when present in upstream metadata
+- `files[]` includes every manifest file — `format`, `size`, `md5`, and a direct `download_url`
+- Typed error `item_not_found` for unknown identifiers
 
-All resource data is also reachable via `ia_get_item`. The resource provides a stable, injectable URI for referencing a specific item across workflows.
+---
+
+### `ia_get_text` <sub>tool</sub>
+
+- `max_chars` (defaults to `IA_MAX_SNAPSHOT_CHARS`) and `char_offset` page through long documents; `has_more` signals additional text remains
+- Locates the best available text file — DjVuTXT preferred, falls back to plain text; `source_file` names the file fetched
+- Typed errors: `item_not_found`, `no_text_file`, `download_forbidden` (restricted collections)
+
+---
+
+### `ia://item/{identifier}` <sub>resource</sub>
+
+- Returns `application/json` — `title`, `creator`, `mediatype`, `description`, `subject`, `collection`, `date`, `licenseurl`, `rights`, `language`, and `file_count`
+- `identifier` comes from `ia_search_items` results
+- Typed error `item_not_found` for unknown identifiers
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool, resource, and prompt definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Internet Archive-specific:
 
 - No credentials required — all four APIs are public
 - Three service layers: `WaybackService` (Availability + CDX), `ArchiveSearchService` (Solr), `ArchiveMetadataService` (Metadata + downloads)
 - CDX collapse-by-day default and configurable `limit` keep responses tractable for high-capture URLs
-- Identifies User-Agent on every request as required by IA's terms; configurable via `IA_USER_AGENT`
+- Identifies via a custom User-Agent on every request as required by IA's terms of use; configurable via `IA_USER_AGENT`
 
 Agent-friendly output:
 
@@ -181,7 +179,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No external accounts or API keys required.
 
 ### Installation
@@ -287,7 +285,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
