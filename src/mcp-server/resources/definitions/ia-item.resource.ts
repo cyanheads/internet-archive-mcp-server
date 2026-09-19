@@ -28,6 +28,7 @@ export const iaItemResource = resource('ia://item/{identifier}', {
       code: JsonRpcErrorCode.NotFound,
       when: 'The identifier does not exist in the Internet Archive.',
       recovery: 'Verify the identifier with ia_search_items or the Internet Archive website.',
+      thrownBy: 'service',
     },
   ],
 

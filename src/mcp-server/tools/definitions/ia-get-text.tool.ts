@@ -65,6 +65,8 @@ export const iaGetText = tool('ia_get_text', {
       when: 'The identifier does not exist in the Internet Archive.',
       recovery:
         'Verify the identifier using ia_search_items or check the Internet Archive website.',
+      severity: 'warning',
+      thrownBy: 'service',
     },
     {
       reason: 'no_text_file',
@@ -72,6 +74,8 @@ export const iaGetText = tool('ia_get_text', {
       when: 'The item exists but contains no readable text file (DjVuTXT or plain-text).',
       recovery:
         'Use ia_get_item to review the file manifest and find an alternative format for download.',
+      severity: 'warning',
+      thrownBy: 'service',
     },
     {
       reason: 'download_forbidden',
@@ -79,6 +83,8 @@ export const iaGetText = tool('ia_get_text', {
       when: 'Access to this item is restricted — it is in a login-required or limited collection.',
       recovery:
         'This item requires login or is in a restricted collection; access via the Archive website directly.',
+      severity: 'warning',
+      thrownBy: 'service',
     },
   ],
 

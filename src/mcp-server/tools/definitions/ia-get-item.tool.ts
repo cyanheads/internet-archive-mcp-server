@@ -88,6 +88,8 @@ export const iaGetItem = tool('ia_get_item', {
       when: 'The identifier does not exist in the Internet Archive.',
       recovery:
         'Verify the identifier using ia_search_items or check the Internet Archive website.',
+      severity: 'warning',
+      thrownBy: 'service',
     },
   ],
 

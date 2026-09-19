@@ -141,6 +141,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       when: 'No snapshots found for the given URL with the current filters.',
       recovery:
         'Broaden the date range, remove status or MIME filters, or verify the URL is correct.',
+      severity: 'warning',
     },
     {
       reason: 'no_snapshot_available',
@@ -148,12 +149,14 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       when: 'No capture exists near the requested timestamp for this URL.',
       recovery:
         'Try a different timestamp or switch to history mode to discover what snapshots exist.',
+      severity: 'warning',
     },
     {
       reason: 'cdx_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The Wayback CDX API is temporarily unavailable or returned an unreadable response.',
       recovery: 'The Wayback CDX API is temporarily overloaded; retry in a few seconds.',
+      thrownBy: 'service',
     },
   ],
 
