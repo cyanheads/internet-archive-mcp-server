@@ -57,6 +57,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       when: 'No capture exists near the requested timestamp for this URL.',
       recovery:
         'Use ia_find_snapshots in history mode to discover what snapshots actually exist for this URL.',
+      severity: 'warning',
     },
     {
       reason: 'content_fetch_failed',
@@ -92,9 +93,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       resolvedStatus = availability.status;
     }
 
-    // Fetch and extract the archived content.
-    // For exact-timestamp direct paths, a 404 means no capture at that timestamp —
-    // remap to the declared no_snapshot_available contract so callers get the recovery hint.
+    // Fetch and extract the archived content. Two upstream failures map onto
+    // declared contract entries so callers receive the reason and recovery hint:
+    // on exact-timestamp direct paths a 404 means no capture at that timestamp,
+    // and a 5xx after retries means the Wayback Machine is unreachable.
     let content: SnapshotContent;
     try {
       content = await svc.fetchContent(snapshotUrl, ctx);
@@ -104,6 +106,13 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
           'no_snapshot_available',
           `No capture found at ${input.url} for timestamp ${resolvedTimestamp}.`,
           { ...ctx.recoveryFor('no_snapshot_available') },
+        );
+      }
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.ServiceUnavailable) {
+        throw ctx.fail(
+          'content_fetch_failed',
+          `Could not fetch the archived page for ${input.url} at ${resolvedTimestamp}.`,
+          { ...ctx.recoveryFor('content_fetch_failed') },
         );
       }
       throw err;

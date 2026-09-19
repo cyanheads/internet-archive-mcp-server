@@ -112,7 +112,12 @@ describe('iaGetSnapshot', () => {
       timestamp: '20200101120000',
     });
 
-    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow();
+    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'content_fetch_failed',
+        recovery: { hint: expect.stringContaining('retry') },
+      },
+    });
   });
 
   it('maps Wayback 404 on exact-timestamp direct path to no_snapshot_available', async () => {
@@ -141,18 +146,18 @@ describe('iaGetSnapshot', () => {
     });
   });
 
-  it('does not remap non-404 errors on exact-timestamp path', async () => {
-    // A 503 from fetchContent should pass through as-is, not be re-mapped to no_snapshot_available
+  it('maps a 503 on exact-timestamp path to content_fetch_failed, not no_snapshot_available', async () => {
     const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
     mockService.buildReplayUrl.mockReturnValue(
       'https://web.archive.org/web/20200601000000/https://example.com',
     );
-    const serviceUnavailableError = new McpError(
-      JsonRpcErrorCode.ServiceUnavailable,
-      'Fetch failed for https://web.archive.org/web/20200601000000/... Status: 503',
-      { statusCode: 503, errorSource: 'FetchHttpError' },
+    mockService.fetchContent.mockRejectedValue(
+      new McpError(
+        JsonRpcErrorCode.ServiceUnavailable,
+        'Fetch failed for https://web.archive.org/web/20200601000000/... Status: 503',
+        { statusCode: 503, errorSource: 'FetchHttpError' },
+      ),
     );
-    mockService.fetchContent.mockRejectedValue(serviceUnavailableError);
 
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     const input = iaGetSnapshot.input.parse({
@@ -160,8 +165,33 @@ describe('iaGetSnapshot', () => {
       timestamp: '20200601000000',
     });
 
-    // Should propagate the original 503, not map to no_snapshot_available
-    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow(serviceUnavailableError);
+    // The upstream 503 keeps its ServiceUnavailable code but reaches the caller
+    // as the declared contract entry, carrying its recovery hint.
+    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'content_fetch_failed' },
+    });
+  });
+
+  it('propagates an unmapped upstream error unchanged', async () => {
+    const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20200601000000/https://example.com',
+    );
+    const timeoutError = new McpError(
+      JsonRpcErrorCode.Timeout,
+      'Request to https://web.archive.org/web/20200601000000/... timed out',
+      { statusCode: 504, errorSource: 'FetchHttpError' },
+    );
+    mockService.fetchContent.mockRejectedValue(timeoutError);
+
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const input = iaGetSnapshot.input.parse({
+      url: 'https://example.com',
+      timestamp: '20200601000000',
+    });
+
+    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow(timeoutError);
   });
 
   describe('format', () => {
