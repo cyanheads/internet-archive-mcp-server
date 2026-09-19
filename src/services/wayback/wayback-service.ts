@@ -147,23 +147,27 @@ export class WaybackService {
         const header = rows[0] as string[];
         const colIndex = (col: string) => header.indexOf(col);
 
-        // Detect trailing resume-key rows: CDX appends [[""], ["<key>"]] at the end
+        /**
+         * Detect the trailing resume-key rows. Under `showResumeKey=true` CDX closes
+         * the body with a blank separator row followed by a single-cell row holding
+         * the key. The separator arrives as `[]`; accept any all-empty row so the
+         * documented `[""]` spelling is handled too. Missing the trailer would emit
+         * both rows as captures and drop the key.
+         */
         let resumeKey: string | undefined;
         let dataRows = rows.slice(1);
 
         if (dataRows.length >= 2) {
           const secondLast = dataRows[dataRows.length - 2];
           const last = dataRows[dataRows.length - 1];
+          const key = Array.isArray(last) && last.length === 1 ? last[0] : undefined;
           if (
             Array.isArray(secondLast) &&
-            secondLast.length === 1 &&
-            secondLast[0] === '' &&
-            Array.isArray(last) &&
-            last.length === 1 &&
-            typeof last[0] === 'string' &&
-            last[0] !== ''
+            secondLast.every((cell) => cell === '') &&
+            typeof key === 'string' &&
+            key !== ''
           ) {
-            resumeKey = last[0] as string;
+            resumeKey = key;
             dataRows = dataRows.slice(0, -2);
           }
         }
@@ -194,7 +198,8 @@ export class WaybackService {
 
   /**
    * Fetch archived content for a resolved snapshot URL and extract readable text.
-   * Throws `content_fetch_failed` if the fetch fails.
+   * Propagates the status-mapped error from the fetch; `ia_get_snapshot` remaps a
+   * `ServiceUnavailable` onto its declared `content_fetch_failed` contract entry.
    * Text is capped at `maxChars` characters (defaults to `maxSnapshotChars` from server config).
    */
   fetchContent(snapshotUrl: string, ctx: Context, maxChars?: number): Promise<SnapshotContent> {
