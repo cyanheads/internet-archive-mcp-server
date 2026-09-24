@@ -239,6 +239,9 @@ src/
   services/
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
+      html-charset.ts                   # Archived-page charset detection + decoding
+      html-text.ts                      # Archived HTML → plain text (markup scan + reference decode)
+      html-entities.ts                  # Named character reference table
       types.ts                          # Wayback domain types
     archive-search/
       archive-search-service.ts         # ArchiveSearchService — Solr Advanced Search
