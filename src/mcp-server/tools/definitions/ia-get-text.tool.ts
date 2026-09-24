@@ -21,6 +21,8 @@ export const iaGetText = tool('ia_get_text', {
   input: z.object({
     identifier: z
       .string()
+      .trim()
+      .min(1, 'Must not be blank — provide an item identifier from ia_search_items.')
       .describe(
         'Internet Archive item identifier, e.g. "prideprejudice00aust" (Pride and Prejudice). ' +
           'Obtain from ia_search_items results.',
@@ -94,7 +96,7 @@ export const iaGetText = tool('ia_get_text', {
     const maxChars = input.max_chars ?? cfg.maxSnapshotChars;
     const charOffset = input.char_offset;
 
-    const result = await svc.getTextContent(input.identifier.trim(), maxChars, charOffset, ctx);
+    const result = await svc.getTextContent(input.identifier, maxChars, charOffset, ctx);
 
     ctx.log.info('Text content retrieved', {
       identifier: input.identifier,

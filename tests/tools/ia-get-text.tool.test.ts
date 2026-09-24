@@ -3,7 +3,8 @@
  * @module tests/tools/ia-get-text.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetText } from '@/mcp-server/tools/definitions/ia-get-text.tool.js';
 
@@ -144,6 +145,48 @@ describe('iaGetText', () => {
 
     await expect(iaGetText.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'download_forbidden' },
+    });
+  });
+
+  describe('blank identifier', () => {
+    it.each([
+      ['empty', ''],
+      ['whitespace-only', '   '],
+    ])(
+      'rejects the %s identifier as invalid_arguments without a lookup',
+      async (_label, identifier) => {
+        const result = await runToolContract(iaGetText, { identifier });
+
+        expect(result.isError).toBe(true);
+        expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+        expect(text).toContain('identifier: Must not be blank');
+        expect(text).not.toContain('no_text_file');
+        expect(mockService.getTextContent).not.toHaveBeenCalled();
+      },
+    );
+
+    it('trims surrounding whitespace from the identifier before the lookup', async () => {
+      mockService.getTextContent.mockResolvedValue({
+        text: 'Chapter 1.',
+        totalChars: 10,
+        charOffset: 0,
+        maxChars: 50_000,
+        sourceFile: 'pg1342_djvu.txt',
+      });
+
+      const result = await runToolContract(iaGetText, { identifier: '  pg1342 ' });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.getTextContent).toHaveBeenCalledWith(
+        'pg1342',
+        50_000,
+        0,
+        expect.anything(),
+      );
     });
   });
 

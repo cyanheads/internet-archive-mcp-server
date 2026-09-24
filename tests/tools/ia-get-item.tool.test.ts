@@ -3,6 +3,7 @@
  * @module tests/tools/ia-get-item.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
@@ -265,6 +266,35 @@ describe('iaGetItem', () => {
       expect(sc).not.toHaveProperty('truncated');
       expect(sc).not.toHaveProperty('totalCount');
       expect(sc).not.toHaveProperty('notice');
+    });
+  });
+
+  describe('blank identifier', () => {
+    it.each([
+      ['empty', ''],
+      ['whitespace-only', '   '],
+    ])(
+      'rejects the %s identifier as invalid_arguments without a metadata lookup',
+      async (_label, identifier) => {
+        const result = await runToolContract(iaGetItem, { identifier });
+
+        expect(result.isError).toBe(true);
+        expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        expect(contentText(result)).toContain('identifier: Must not be blank');
+        expect(mockService.getItem).not.toHaveBeenCalled();
+      },
+    );
+
+    it('trims surrounding whitespace from the identifier before the lookup', async () => {
+      mockService.getItem.mockResolvedValue(fullItem);
+
+      const result = await runToolContract(iaGetItem, { identifier: ' pg1342  ' });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.getItem).toHaveBeenCalledWith('pg1342', expect.anything());
     });
   });
 

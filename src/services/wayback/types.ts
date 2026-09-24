@@ -19,13 +19,13 @@ export interface CdxRecord {
   timestamp: string;
 }
 
-/** Result from the Wayback Availability API. */
-export interface AvailabilityResult {
-  /** Resolved snapshot URL on web.archive.org. */
+/** The capture nearest a requested timestamp, from the Availability API or the CDX fallback. */
+export interface ClosestSnapshot {
+  /** Replay URL of the capture on https://web.archive.org. */
   snapshotUrl: string;
-  /** HTTP status at capture time. */
+  /** HTTP status at capture time (`-` for a CDX revisit record). */
   status: string;
-  /** Timestamp of the nearest snapshot in YYYYMMDDHHMMSS format. */
+  /** Timestamp of the capture in YYYYMMDDHHMMSS format. */
   timestamp: string;
 }
 
@@ -39,8 +39,14 @@ export interface CdxHistoryResult {
 
 /** Fetched snapshot content. */
 export interface SnapshotContent {
-  /** Canonical replay URL used to fetch the content. */
+  /** Replay URL of the capture Wayback served — where the fetch ended after any redirect. */
   replayUrl: string;
+  /** HTTP status Wayback replayed the served capture with. */
+  status: string;
   /** Plain text extracted from the archived HTML. */
   text: string;
+  /** Capture timestamp (YYYYMMDDHHMMSS) read from `replayUrl`, when it carries one. */
+  timestamp?: string | undefined;
+  /** Set when the body ran past the read ceiling: the text comes from this many leading bytes. */
+  truncatedAtBytes?: number | undefined;
 }

@@ -13,7 +13,8 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
   title: 'Find Wayback Machine Snapshots',
   description:
     'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture ' +
-    'to a given timestamp via the Availability API (fast, one result). Mode "history" returns the ' +
+    'to a given timestamp via the Availability API, falling back to a CDX closest-capture query ' +
+    'when the Availability API has no answer (one result). Mode "history" returns the ' +
     'full capture list via the CDX API — filterable by date range, HTTP status code, and MIME type, ' +
     'collapsed by default to one capture per day (collapse=timestamp:8). Use history mode to survey ' +
     'how a page changed over time; use closest mode when you need the snapshot nearest a specific date. ' +
@@ -21,7 +22,11 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
-    url: z.string().describe('The URL to look up in the Wayback Machine.'),
+    url: z
+      .string()
+      .trim()
+      .min(1, 'Must not be blank — provide the URL to look up.')
+      .describe('The URL to look up in the Wayback Machine.'),
     mode: z
       .enum(['closest', 'history'])
       .describe(
@@ -102,7 +107,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
             statuscode: z
               .string()
               .optional()
-              .describe('HTTP status code at time of capture (history mode).'),
+              .describe('HTTP status code at time of capture ("-" for a revisit record).'),
             mimetype: z
               .string()
               .optional()
@@ -136,6 +141,15 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
 
   errors: [
     {
+      reason: 'missing_timestamp',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Closest mode was called without a timestamp, or with a blank one.',
+      recovery:
+        'Pass timestamp in YYYYMMDDHHMMSS format or any prefix of it (e.g. "20200101"), or use ' +
+        'mode "history" to list captures without one.',
+      severity: 'warning',
+    },
+    {
       reason: 'no_snapshots',
       code: JsonRpcErrorCode.NotFound,
       when: 'No snapshots found for the given URL with the current filters.',
@@ -150,12 +164,25 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       recovery:
         'Try a different timestamp or switch to history mode to discover what snapshots exist.',
       severity: 'warning',
+      thrownBy: 'service',
     },
     {
       reason: 'cdx_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Wayback CDX API is temporarily unavailable or returned an unreadable response.',
+      when:
+        'The Wayback CDX API answered HTTP 5xx after retries or 429, or returned an unreadable ' +
+        'response; in closest mode, the CDX closest-capture check failed or did not complete in time.',
       recovery: 'The Wayback CDX API is temporarily overloaded; retry in a few seconds.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'availability_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when:
+        'The Wayback Availability API answered HTTP 5xx after retries or 429, or returned an ' +
+        'unreadable response (closest mode).',
+      recovery:
+        'Retry in a few seconds, or use history mode with from and to around the timestamp to list nearby captures.',
       thrownBy: 'service',
     },
   ],
@@ -166,9 +193,11 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     if (input.mode === 'closest') {
       const ts = input.timestamp?.trim();
       if (!ts) {
-        throw ctx.fail('no_snapshot_available', 'timestamp is required for mode=closest.', {
-          ...ctx.recoveryFor('no_snapshot_available'),
-        });
+        throw ctx.fail(
+          'missing_timestamp',
+          'timestamp is required for mode "closest".',
+          ctx.recoveryFor('missing_timestamp'),
+        );
       }
 
       const result = await svc.findClosest(input.url, ts, ctx);

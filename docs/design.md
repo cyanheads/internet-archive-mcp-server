@@ -6,8 +6,8 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL. Mode `closest` returns the single nearest capture to a given timestamp (fast, via Availability API). Mode `history` returns the full capture list via CDX — filterable by date range, HTTP status, and MIME type, collapsed by default to one capture per day. Returns timestamps and `web.archive.org` replay URLs. Supports resume-key pagination for large histories. | `url`, `mode` (`closest`\|`history`), `timestamp` (closest mode), `from`/`to`, `status_filter`, `limit`, `collapse` (`timestamp:N` precision, default `timestamp:8`), `resume_key` (history mode) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the archived text content (HTML stripped to readable text) and the canonical replay URL. | `url`, `timestamp` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL. Mode `closest` returns the single nearest capture to a given timestamp via the Availability API, falling back to a CDX closest-capture query when the Availability API has no answer. Mode `history` returns the full capture list via CDX — filterable by date range, HTTP status, and MIME type, collapsed by default to one capture per day. Returns timestamps and `https://web.archive.org` replay URLs. Supports resume-key pagination for large histories. | `url`, `mode` (`closest`\|`history`), `timestamp` (closest mode), `from`/`to`, `status_filter`, `limit`, `collapse` (`timestamp:N` precision, default `timestamp:8`), `resume_key` (history mode) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the archived text content (HTML stripped to readable text) and the replay URL and timestamp of the capture Wayback served. | `url`, `timestamp` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `ia_search_items` | Search the Internet Archive library (40M+ items) via the Advanced Search / Solr API. Filter by media type, collection, creator, date range, and language. Sort by relevance, date, or downloads. Returns identifiers, titles, creators, media types, dates, download counts, `total_found`, and current `page`/`rows` for pagination context. | `query`, `mediatype`, `collection`, `creator`, `date_from`/`date_to`, `language`, `sort`, `rows`, `page` | `readOnlyHint: true`, `openWorldHint: true` |
 | `ia_get_item` | Retrieve metadata and the file manifest for an Archive item by identifier. Returns title, creator, description, subjects, collections, license, language, the full `file_count`, and a page of files (default 50, max 500) with format, size, and direct download URL, optionally filtered to one format. The primary hub for acting on a search result. | `identifier`, `format`, `max_files`, `file_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `ia_get_text` | Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) by identifier, with length-aware truncation and continuation pointer. Suited for public-domain books, documents, and transcripts. | `identifier`, `max_chars`, `char_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
@@ -16,16 +16,20 @@
 
 | Tool | `reason` | Code | When |
 |:-----|:---------|:-----|:-----|
+| `ia_find_snapshots` | `missing_timestamp` | `InvalidParams` | Closest mode called with no `timestamp`, `""`, or a whitespace-only one; thrown before any Availability or CDX request |
 | `ia_find_snapshots` | `no_snapshots` | `NotFound` | CDX returned zero results for the given URL/filters |
-| `ia_find_snapshots` | `cdx_unavailable` | `ServiceUnavailable` | CDX returned HTTP 503/504 or timed out |
-| `ia_get_snapshot` | `no_snapshot_available` | `NotFound` | Availability API returned `archived_snapshots: {}` — URL has no capture near the requested timestamp |
-| `ia_get_snapshot` | `content_fetch_failed` | `ServiceUnavailable` | Archived HTML fetch failed (network error or non-200 from `web.archive.org/web/`) |
+| `ia_find_snapshots` | `no_snapshot_available` | `NotFound` | Closest mode: neither the Availability API nor the CDX fallback has a capture near the timestamp |
+| `ia_find_snapshots` | `cdx_unavailable` | `ServiceUnavailable` | CDX answered HTTP 5xx after retries or 429 (not retried), or a 200 carrying an HTML page or unparseable body; in closest mode, the CDX fallback failed or ran past its deadline after the Availability API found nothing |
+| `ia_find_snapshots` | `availability_unavailable` | `ServiceUnavailable` | Closest mode: the Availability API answered HTTP 5xx after retries, 429 (not retried), or a 200 carrying an HTML page or unparseable body |
+| `ia_get_snapshot` | `no_snapshot_available` | `NotFound` | Neither the Availability API nor the CDX fallback has a capture near the requested timestamp, or an exact 14-digit timestamp's replay returned 404 |
+| `ia_get_snapshot` | `content_fetch_failed` | `ServiceUnavailable` | Wayback unreachable (5xx after retries, 429 answered after one request with a wait hint, unreadable lookup response, or network error) during the closest-capture lookup or the archived-page fetch, or the CDX fallback did not complete; keeps the lookup's own wait or history-mode hint when it has one. A request timeout, and a 504 on the page fetch, surface as the baseline `Timeout` instead |
+| `ia_search_items` | `invalid_mediatype` | `InvalidParams` | `mediatype` is neither one of the ten canonical media types nor a recognized alias (case-insensitive); thrown before any Advanced Search request, with a recovery listing the ten values |
 | `ia_get_item` | `item_not_found` | `NotFound` | Metadata API returned `{}` — identifier does not exist |
 | `ia_get_text` | `item_not_found` | `NotFound` | Metadata API returned `{}` for the identifier |
 | `ia_get_text` | `no_text_file` | `NotFound` | Item exists but `files[]` contains no DjVuTXT or plain-text file |
 | `ia_get_text` | `download_forbidden` | `Forbidden` | Text file URL returned HTTP 403 — item is in a restricted collection |
 
-Baseline errors (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`) bubble freely and don't need declaring.
+Baseline errors (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`) bubble freely and don't need declaring. A blank `query`, `identifier`, or `url` (empty or whitespace-only) never reaches a handler: the input schema rejects it as the framework's `invalid_arguments` (`InvalidParams`).
 
 ### Resources
 
@@ -53,8 +57,8 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 ## Requirements
 
 - Read-only access to all four APIs; no credentials needed
-- Wayback Availability API: `GET archive.org/wayback/available?url=&timestamp=` — closest snapshot to a given time, fast single-result response
-- Wayback CDX API: `GET web.archive.org/cdx/search/cdx?url=&output=json` — full capture history; array-of-arrays with header row; supports field selection (`fl`), collapsing (`collapse`), date range (`from`/`to`), status filtering, and resume-key pagination
+- Wayback Availability API: `GET archive.org/wayback/available?url=&timestamp=` — closest snapshot to a given time, single-result response; answers `archived_snapshots: {}` for some heavily archived URLs that have captures
+- Wayback CDX API: `GET web.archive.org/cdx/search/cdx?url=&output=json` — full capture history; array-of-arrays with header row; supports field selection (`fl`), collapsing (`collapse`), date range (`from`/`to`), status filtering, resume-key pagination, and closest-first ordering (`closest=&sort=closest`)
 - Advanced Search API: `GET archive.org/advancedsearch.php?q=&output=json` — Solr-based; `response.docs` envelope; supports `fl[]` field selection, `rows`, `page`, `sort[]`
 - Metadata API: `GET archive.org/metadata/{identifier}` — returns `metadata` object + `files[]` array; `{}` on unknown identifier
 - Identifying User-Agent required as a courtesy per IA's terms
@@ -121,9 +125,10 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 
 | # | Call | Purpose |
 |:--|:-----|:--------|
-| 1 | `GET /wayback/available?url=&timestamp=` | Resolve nearest snapshot URL |
-| 2 | `GET web.archive.org/web/{resolved_timestamp}/{url}` | Fetch archived HTML |
-| — | Strip HTML tags to readable text; truncate if needed | Local transform |
+| 1 | `GET /wayback/available?url=&timestamp=` | Resolve nearest snapshot URL (skipped for an exact 14-digit timestamp) |
+| 1b | `GET /cdx/search/cdx?url=&closest=&sort=closest&limit=10&fl=timestamp,original,statuscode` | Only when step 1 has no answer: nearest capture, preferring a `200` row; one attempt, 25 s deadline |
+| 2 | `GET web.archive.org/web/{resolved_timestamp}/{url}` | Fetch archived HTML; Wayback may redirect to the capture it actually serves |
+| — | Stream at most 4 MiB of the body (cancel the rest); decode with the declared or guessed charset; remove markup, decode character references, collapse whitespace; truncate if needed | Local transform |
 
 ### `ia_search_items`
 
@@ -154,7 +159,19 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 
 **CDX collapse default.** Popular URLs have tens of thousands of captures. Default `collapse=timestamp:8` (one per day) keeps responses tractable. The `collapse` parameter accepts `timestamp:N` where N is 1–14 (precision digits: 4=year, 6=month, 8=day, 10=hour, 14=exact). Validate the format with `z.string().regex(/^timestamp:\d{1,2}$/).optional()` — or omit entirely to get uncollapsed results. Do not accept arbitrary strings.
 
-**No `ia_get_snapshot` HTML passthrough.** Raw Wayback HTML is rewritten by the archive (banner injections, relative URL rewriting) and can be very large. The tool strips to readable text and always returns the canonical replay URL so the human can open the original in a browser. Text extraction via `sanitize-html` (framework optional peer dep) or regex stripping.
+**No `ia_get_snapshot` HTML passthrough.** Raw Wayback HTML is rewritten by the archive (banner injections, relative URL rewriting) and can be very large. The tool strips to readable text and always returns the replay URL so the human can open the original in a browser.
+
+**Text extraction is one linear markup scan, then one reference decode.** A hand-written left-to-right index scan (comment, script/style with raw-text body, any other tag; a quote opens an attribute value only after `=`, as in a browser) replaces each construct with a space, then one callback pass decodes `;`-terminated references against a curated `Map` (HTML 4.01's 252 names plus `apos` and the WHATWG upper-case aliases) with WHATWG numeric rules. Decoding once rules out double-unescaping; no dependency is needed, since a 20-page 1996–2015 corpus used no name outside that table. The scan is index arithmetic rather than a regex so it stays linear on adversarial archived pages in any engine — the earlier regex chain went quadratic, and a regex alternative measured linear in V8 still hit JavaScriptCore's backtracking-stack fallback on long tags under Bun.
+
+**Decode by declared charset.** The replay serves `Content-Type: text/html` with no charset, so the body is decoded from bytes: BOM, then header charset, then the first `<meta>` declaration in the first 16 KiB (past the ~1 KiB banner Wayback injects). A body that declares none stays UTF-8 when a strict UTF-8 decode succeeds; only bytes that are not UTF-8 fall back to Wayback's `x-archive-guessed-charset` (when `TextDecoder` knows the label), else windows-1252. The guess never overrides valid UTF-8 because it is unreliable — a Latin-1 slashdot.org 1999 capture is guessed `ibm852`, and a wrong single-byte guess would turn a valid UTF-8 page into mojibake. On a body cut at the read limit, a character split at the cut is dropped before the strict check, so the cut cannot fail it.
+
+**Read at most 4 MiB of a replay.** The body is streamed and cut at 4 MiB, cancelling the upstream read, and the tool discloses the cut in a `notice`. Measured on 2024 captures of heavy pages, a 3.0 MB edition.cnn.com front page yields all its text within 1.3 MB and Wikipedia articles reach 50,000 characters within 440 KB, so ordinary pages lose nothing.
+
+**Report the capture Wayback served.** Wayback 302-redirects a timestamp that is not itself a capture, and a redirect capture to the capture it points at. `replay_url` is the URL the fetch ended on (always `https://web.archive.org`), `resolved_timestamp` is read from it, and `resolved_status` is the HTTP status of that final replay response (Wayback's own `x-ts` header carries the same value), so all three name the capture the text came from — never the capture the lookup resolved.
+
+**Closest lookup falls back to CDX.** The Availability API sometimes answers `{}` for URLs CDX has captures of, so an empty answer (and only an empty answer — never an error or a cancellation) triggers one CDX `sort=closest` query. A successful Availability answer costs one request, as before. The fallback gets one attempt under a 25 s deadline: measured `sort=closest` latencies ran 2.5–23 s for about half the URLs tried and 31 s to over 60 s for the rest, so no retry ladder could help and the deadline keeps the call under the 30 s request timeout. A fallback that fails or times out is `cdx_unavailable` (`content_fetch_failed` in `ia_get_snapshot`) with a history-mode hint — never `no_snapshot_available`, which would claim there is no capture.
+
+**Upstream 5xx and 429 surface as a declared reason.** `fetchWithTimeout` throws on every non-2xx, so the service reclassifies inside each retry closure: CDX → `cdx_unavailable`, Availability → `availability_unavailable`. A 5xx keeps `retryAfter`/`retryable`, so attempt counts are unchanged. A 429 is marked `retryable: false` and answered after one request with a hint to wait (the `Retry-After` value when sent) — retrying it would only extend a rate limit that, measured, held for 5–13 minutes. An HTML page or unparseable JSON on a 200 is treated as the same reason and retried like a 5xx, for both APIs. `ia_get_snapshot` maps any `ServiceUnavailable` from lookup or fetch onto its own `content_fetch_failed`, since the service cannot know which tool's reason set applies.
 
 **`ia_get_text` separate from `ia_get_item`.** `ia_get_item` returns metadata + file manifest, not content. Fetching text content is a distinct, potentially large second request. Keeping it separate lets agents skip it when they only need metadata and file URLs.
 
@@ -162,7 +179,15 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 
 **Metadata API `{}` empty response = not found.** The API returns HTTP 200 with `{}` for unknown identifiers rather than 404. The service layer must check for empty response and throw `notFound`.
 
-**Advanced Search empty query = HTML fallback.** The API returns an HTML error page (not JSON) when `q` is empty. Service must validate non-empty query before calling.
+**Advanced Search empty query = HTML fallback.** The API returns an HTML error page (not JSON) when `q` is empty, so a blank query must never reach it. The `query` schema enforces that (see the next note), so the service carries no guard of its own.
+
+**Required strings reject blanks at the schema.** `query`, both `identifier`s, and both `url`s are `z.string().trim().min(1)`. A blank value is structurally wrong and no tool-specific guidance would help, so it belongs on the schema, where it also advertises `minLength: 1`; each `.min(1)` message names what to send. Surrounding whitespace is trimmed before the handler runs.
+
+**`mediatype` resolves in the handler, not through `z.enum`.** Solr matches `mediatype` exactly and case-sensitively, so `text` or `Texts` answered zero results as an empty success. The handler trims, lowercases, maps a fixed alias table (`text`/`book`/`books` → `texts`, `movie`/`video`/`videos` → `movies`, `images` → `image`, `collections` → `collection`), and rejects anything else as `invalid_mediatype` listing the ten values. A `z.enum` would reject the near-misses instead of resolving them, and `z.preprocess` does not serialize to JSON Schema. The ten values are the full vocabulary of the index (an aggregation over it, 2026-09-24); a blank `mediatype` still means no filter.
+
+**Closest mode's timestamp requirement is a handler guard.** Whether `timestamp` is required depends on `mode`, and a schema refinement neither shows in the tool's input schema nor carries a declared reason. The handler throws `missing_timestamp` (`InvalidParams`) with a recovery naming the format and history mode — never `no_snapshot_available`, which claims the URL has no captures.
+
+**An empty search page says why.** Advanced Search answers a page past the end with `numFound > 0` and no docs, so the empty-result notice distinguishes that case (naming the last page) from a search that matched nothing (naming the `mediatype` applied, if any).
 
 **CDX array-of-arrays format.** First element is the header row `["timestamp","statuscode",...]`; subsequent elements are data rows. Service strips the header and maps remaining rows to objects by index position. This is stable across CDX field selections.
 
@@ -177,7 +202,10 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 ## Known Limitations
 
 - CDX can time out for extremely popular URLs even with `collapse=timestamp:8` — service wraps in a generous timeout and the tool communicates partial results via the resume key
-- `ia_get_snapshot` text extraction drops embedded scripts, styles, and navigation menus intentionally — agents needing raw HTML should use the replay URL directly
+- `ia_get_snapshot` text extraction drops scripts, styles, comments, and markup; navigation and other page chrome stay in the text — agents needing raw HTML should use the replay URL directly
+- A page with no charset declaration that is not valid UTF-8 decodes with Wayback's guessed charset or windows-1252; a wrong guess can still substitute letters in a page that is neither UTF-8 nor windows-1252
+- The CDX `sort=closest` fallback often takes longer than its 25 s deadline for heavily archived URLs; closest mode then reports `cdx_unavailable` and points at history mode
+- `ia_get_snapshot` reads at most the first 4 MiB of a page
 - Items in restricted collections return metadata but download URLs may 403 — `ia_get_text` surfaces this in the error rather than failing silently
 - Copyright varies widely by item; the `licenseurl` and rights fields are surfaced as-is without legal interpretation
 - The Advanced Search Solr index has a lag — very recently uploaded items may not appear
@@ -190,7 +218,8 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 ```
 GET https://archive.org/wayback/available?url={url}&timestamp={YYYYMMDDHHmmss}
 Response: { url, archived_snapshots: { closest?: { url, timestamp, status, available } }, timestamp }
-Not-found: archived_snapshots = {} (HTTP 200)
+  (closest.url uses http://web.archive.org — the service upgrades it to https)
+Not-found: archived_snapshots = {} (HTTP 200) — also returned for some URLs that have captures
 ```
 
 ### Wayback CDX
@@ -203,6 +232,7 @@ GET https://web.archive.org/cdx/search/cdx?url={url}&output=json
   &limit=100                                                  (cap)
   &showResumeKey=true                                         (pagination token)
   &resumeKey={key}                                            (continue from)
+  &closest={timestamp}&sort=closest                           (nearest captures first)
 Response: array-of-arrays; row[0] = header; row[N] = data; last two rows = ["", resumeKey] when more exist
 Error: empty array or HTTP 503/504 on missing url param or overloaded query
 ```

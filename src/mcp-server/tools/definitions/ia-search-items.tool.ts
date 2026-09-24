@@ -4,7 +4,35 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
+
+/** The complete Advanced Search mediatype vocabulary. Solr matches it exactly and case-sensitively. */
+const MEDIATYPES = [
+  'texts',
+  'movies',
+  'audio',
+  'software',
+  'image',
+  'data',
+  'web',
+  'collection',
+  'etree',
+  'account',
+];
+
+/** Every accepted lowercase spelling, mapped to the canonical mediatype it searches. */
+const MEDIATYPE_BY_SPELLING = new Map<string, string>([
+  ...MEDIATYPES.map((m): [string, string] => [m, m]),
+  ['text', 'texts'],
+  ['book', 'texts'],
+  ['books', 'texts'],
+  ['movie', 'movies'],
+  ['video', 'movies'],
+  ['videos', 'movies'],
+  ['images', 'image'],
+  ['collections', 'collection'],
+]);
 
 export const iaSearchItems = tool('ia_search_items', {
   title: 'Search Internet Archive Items',
@@ -20,6 +48,8 @@ export const iaSearchItems = tool('ia_search_items', {
   input: z.object({
     query: z
       .string()
+      .trim()
+      .min(1, 'Must not be blank — provide search terms or a Solr query.')
       .describe(
         'Solr query string. Supports field prefixes such as title:"war and peace", ' +
           'creator:dickens, subject:history. Plain keywords search all fields.',
@@ -28,8 +58,10 @@ export const iaSearchItems = tool('ia_search_items', {
       .string()
       .optional()
       .describe(
-        'Filter by media type. Common values: texts, audio, movies, software, image, ' +
-          'data, web, collection, account.',
+        'Filter by media type: texts, movies, audio, software, image, data, web, collection, ' +
+          'etree (live concert recordings), or account. Case-insensitive; text, book, and books ' +
+          'mean texts, movie, video, and videos mean movies, images means image, and collections ' +
+          'means collection. Any other value is rejected.',
       ),
     collection: z
       .string()
@@ -110,16 +142,44 @@ export const iaSearchItems = tool('ia_search_items', {
   }),
 
   enrichment: {
-    notice: z.string().optional().describe('Guidance when the search returned no results.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when the page came back empty: nothing matched (naming the mediatype filter ' +
+          'applied, if any), or the requested page is past the last page of results.',
+      ),
   },
+
+  errors: [
+    {
+      reason: 'invalid_mediatype',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'mediatype is not an Internet Archive media type or one of its recognized spellings.',
+      recovery: `Set mediatype to one of ${MEDIATYPES.join(', ')}, or omit it to search every media type.`,
+      severity: 'warning',
+    },
+  ],
 
   async handler(input, ctx) {
     const svc = getArchiveSearchService();
 
+    const requestedMediatype = input.mediatype?.trim();
+    const mediatype = requestedMediatype
+      ? MEDIATYPE_BY_SPELLING.get(requestedMediatype.toLowerCase())
+      : undefined;
+    if (requestedMediatype && !mediatype) {
+      throw ctx.fail(
+        'invalid_mediatype',
+        `mediatype "${requestedMediatype}" is not an Internet Archive media type.`,
+        ctx.recoveryFor('invalid_mediatype'),
+      );
+    }
+
     const result = await svc.search(
       {
         query: input.query,
-        mediatype: input.mediatype?.trim() || undefined,
+        mediatype,
         collection: input.collection?.trim() || undefined,
         creator: input.creator?.trim() || undefined,
         dateFrom: input.date_from?.trim() || undefined,
@@ -140,8 +200,13 @@ export const iaSearchItems = tool('ia_search_items', {
 
     if (result.items.length === 0) {
       ctx.enrich.notice(
-        `No items matched "${input.query}". Try broader search terms, remove filters, ` +
-          `or verify the query syntax (Solr field prefixes: title:, creator:, subject:).`,
+        result.totalFound > 0
+          ? `Page ${result.page} is past the last page of ${result.totalFound.toLocaleString('en-US')} ` +
+              `results at ${result.rows} rows per page; request page ` +
+              `${Math.ceil(result.totalFound / result.rows)} or lower.`
+          : `No items matched "${input.query}"${mediatype ? ` with mediatype "${mediatype}"` : ''}. ` +
+              'Try broader search terms, remove filters, or verify the query syntax ' +
+              '(Solr field prefixes: title:, creator:, subject:).',
       );
     }
 

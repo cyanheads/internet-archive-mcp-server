@@ -3,6 +3,7 @@
  * @module tests/smoke/definitions.smoke.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
@@ -68,6 +69,23 @@ describe('tool annotations', () => {
   );
 });
 
+describe('required string inputs', () => {
+  it.each([
+    ['ia_search_items', 'query', iaSearchItems.input],
+    ['ia_get_item', 'identifier', iaGetItem.input],
+    ['ia_get_text', 'identifier', iaGetText.input],
+    ['ia_get_snapshot', 'url', iaGetSnapshot.input],
+    ['ia_find_snapshots', 'url', iaFindSnapshots.input],
+  ] as const)('%s advertises minLength: 1 on %s', (_name, field, input) => {
+    const schema = z.toJSONSchema(input, { io: 'input' }) as {
+      properties: Record<string, { minLength?: number }>;
+      required: string[];
+    };
+    expect(schema.properties[field]?.minLength).toBe(1);
+    expect(schema.required).toContain(field);
+  });
+});
+
 describe('example identifiers', () => {
   const dead = ['pg1342', 'UndergraduateMathematics'];
 
@@ -106,7 +124,11 @@ describe('definition smoke test', () => {
   it('executes ia_get_snapshot via the exact-timestamp direct path', async () => {
     const replayUrl = 'https://web.archive.org/web/20200101120000/https://example.com';
     mockWayback.buildReplayUrl.mockReturnValue(replayUrl);
-    mockWayback.fetchContent.mockResolvedValue({ text: 'archived page text', replayUrl });
+    mockWayback.fetchContent.mockResolvedValue({
+      text: 'archived page text',
+      replayUrl,
+      status: '200',
+    });
 
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     const result = await iaGetSnapshot.handler(

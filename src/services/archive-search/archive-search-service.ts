@@ -5,7 +5,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, getUserAgent } from '@/config/server-config.js';
@@ -68,12 +68,6 @@ export class ArchiveSearchService {
 
   /** Search the Internet Archive library. */
   search(params: SearchParams, ctx: Context): Promise<SearchResult> {
-    if (!params.query.trim()) {
-      throw validationError('Search query must not be empty.', {
-        reason: 'empty_query',
-      });
-    }
-
     return withRetry(
       async () => {
         // Build the Solr query string, appending metadata filters as needed.

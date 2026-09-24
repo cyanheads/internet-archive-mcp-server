@@ -3,9 +3,19 @@
  * @module tests/tools/ia-find-snapshots.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
+
+type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
+
+/** Every text block of the assembled result. */
+const contentText = (result: ToolResult): string =>
+  result.content
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+    .map((b) => b.text)
+    .join('\n');
 
 // Mock the wayback service module so no real HTTP calls are made.
 vi.mock('@/services/wayback/wayback-service.js', () => ({
@@ -50,17 +60,51 @@ describe('iaFindSnapshots', () => {
       expect(result.resume_key).toBeUndefined();
     });
 
-    it('throws no_snapshot_available when timestamp is missing for closest mode', async () => {
-      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
-      const input = iaFindSnapshots.input.parse({
+    it.each([
+      ['omitted', undefined],
+      ['empty', ''],
+      ['whitespace-only', '   '],
+    ])(
+      'throws missing_timestamp when the timestamp is %s, without a lookup',
+      async (_label, timestamp) => {
+        const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+        const input = iaFindSnapshots.input.parse({
+          url: 'https://example.com',
+          mode: 'closest',
+          ...(timestamp !== undefined && { timestamp }),
+        });
+
+        const err = await iaFindSnapshots.handler(input, ctx).catch((e: unknown) => e);
+
+        expect(err).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'missing_timestamp' },
+        });
+        const hint = (err as { data: { recovery?: { hint?: string } } }).data.recovery?.hint ?? '';
+        expect(hint).toContain('timestamp');
+        expect(hint).toContain('YYYYMMDDHHMMSS');
+        expect(hint).toContain('history');
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+      },
+    );
+
+    it('renders missing_timestamp with its Recovery line in content[]', async () => {
+      const result = await runToolContract(iaFindSnapshots, {
         url: 'https://example.com',
         mode: 'closest',
-        // no timestamp
+        timestamp: '  ',
       });
 
-      await expect(iaFindSnapshots.handler(input, ctx)).rejects.toMatchObject({
-        data: { reason: 'no_snapshot_available' },
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'missing_timestamp' },
       });
+      const text = contentText(result);
+      expect(text).toMatch(/^Recovery: .*timestamp.*YYYYMMDDHHMMSS/m);
+      expect(text).toContain('(reason missing_timestamp');
+      expect(text).not.toContain('no_snapshot_available');
+      expect(mockService.findClosest).not.toHaveBeenCalled();
     });
 
     it('propagates no_snapshot_available from the service (empty archived_snapshots)', async () => {
@@ -78,32 +122,32 @@ describe('iaFindSnapshots', () => {
         timestamp: '20200101',
       });
 
-      await expect(iaFindSnapshots.handler(input, ctx)).rejects.toThrow();
+      await expect(iaFindSnapshots.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_snapshot_available' },
+      });
+      expect(mockService.findClosest).toHaveBeenCalledWith(
+        'https://example.com',
+        '20200101',
+        expect.anything(),
+      );
     });
 
-    it('accepts http:// snapshot URL from Availability API (SSRF guard allows both schemes)', async () => {
-      // The Wayback Availability API returns http:// (not https://) replay URLs.
-      // The SSRF guard in WaybackService.findClosest must accept both schemes.
-      // This test verifies the tool round-trips an http:// URL without errors.
-      mockService.findClosest.mockResolvedValue({
-        snapshotUrl: 'http://web.archive.org/web/20200101231047/https://example.com/',
-        timestamp: '20200101231047',
-        status: '200',
+    it('propagates a service-thrown availability_unavailable unchanged', async () => {
+      const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+      const unavailable = serviceUnavailable('Wayback Availability API returned HTTP 503.', {
+        reason: 'availability_unavailable',
       });
+      mockService.findClosest.mockRejectedValue(unavailable);
 
       const ctx = createMockContext({ errors: iaFindSnapshots.errors });
       const input = iaFindSnapshots.input.parse({
-        url: 'example.com',
+        url: 'https://example.com',
         mode: 'closest',
         timestamp: '20200101',
       });
-      const result = await iaFindSnapshots.handler(input, ctx);
 
-      expect(result.snapshots).toHaveLength(1);
-      expect(result.snapshots[0].replay_url).toBe(
-        'http://web.archive.org/web/20200101231047/https://example.com/',
-      );
-      expect(result.snapshots[0].timestamp).toBe('20200101231047');
+      await expect(iaFindSnapshots.handler(input, ctx)).rejects.toBe(unavailable);
     });
   });
 
@@ -197,6 +241,53 @@ describe('iaFindSnapshots', () => {
 
       expect(mockService.fetchHistory).toHaveBeenCalledWith(
         expect.objectContaining({ collapse: undefined }),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('blank url', () => {
+    it.each([
+      ['empty', 'closest', ''],
+      ['whitespace-only', 'closest', '  '],
+      ['empty', 'history', ''],
+      ['whitespace-only', 'history', '  '],
+    ] as const)(
+      'rejects the %s url in %s mode as invalid_arguments without a lookup',
+      async (_label, mode, url) => {
+        const result = await runToolContract(iaFindSnapshots, {
+          url,
+          mode,
+          timestamp: '20200101',
+        });
+
+        expect(result.isError).toBe(true);
+        expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        expect(contentText(result)).toContain('url: Must not be blank');
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+        expect(mockService.fetchHistory).not.toHaveBeenCalled();
+      },
+    );
+
+    it('trims surrounding whitespace from the url before the lookup', async () => {
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
+        timestamp: '20200101120000',
+        status: '200',
+      });
+
+      await runToolContract(iaFindSnapshots, {
+        url: '  https://example.com ',
+        mode: 'closest',
+        timestamp: '20200101',
+      });
+
+      expect(mockService.findClosest).toHaveBeenCalledWith(
+        'https://example.com',
+        '20200101',
         expect.anything(),
       );
     });

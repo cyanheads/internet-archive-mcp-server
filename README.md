@@ -47,29 +47,33 @@ All resource data is also reachable via `ia_get_item`.
 
 ### `ia_find_snapshots` <sub>tool</sub>
 
-- `closest` mode: single lookup via the Availability API, returns the nearest capture to a given `timestamp`
+- `closest` mode: returns the nearest capture to a given `timestamp` via the Availability API, falling back to one CDX closest-capture query (preferring a `200` capture, 25 s deadline) when the Availability API has no answer
 - `history` mode: full capture list via the CDX API; filter by date range (`from`/`to`), HTTP status (`status_filter`), and MIME type
 - Default `collapse` of `timestamp:8` (one capture per day); adjustable to `timestamp:N`, N=1–14
 - Up to 10,000 records per call (`limit`, default 100); `resume_key` pagination for large histories
-- Typed errors: `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp), `cdx_unavailable`
+- Replay URLs are always `https://web.archive.org/web/…`
+- Typed errors: `missing_timestamp` (closest mode without a `timestamp`, answered before any lookup), `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp from either source), `cdx_unavailable` (CDX 5xx, 429, or unreadable response, or the closest-mode CDX check did not complete), `availability_unavailable` (closest mode, Availability API 5xx, 429, or unreadable response); a 429 is answered after one request with a hint to wait
 
 ---
 
 ### `ia_get_snapshot` <sub>tool</sub>
 
-- Resolves to the nearest available capture when the exact timestamp has no snapshot; exact 14-digit timestamps skip resolution and assume status `200`
-- Strips scripts, styles, and nav from the archived HTML, returning readable plain text alongside the canonical replay URL
-- Output capped at `IA_MAX_SNAPSHOT_CHARS` (default 50,000 characters)
-- Typed errors: `no_snapshot_available`, `content_fetch_failed`
+- Resolves to the nearest available capture when the exact timestamp has no snapshot; exact 14-digit timestamps skip resolution
+- Reports the capture Wayback served — `replay_url`, `resolved_timestamp`, and `resolved_status` follow Wayback's redirect when the requested timestamp is not itself a capture
+- Decodes the page with its declared charset (`Content-Type`, then `<meta>`, else UTF-8 when the bytes are valid UTF-8, else Wayback's guessed charset or windows-1252), then removes scripts, styles, comments, and tags and decodes character references, returning readable plain text alongside the replay URL
+- Reads at most the first 4 MiB of a page (a `notice` says when a page is longer); output capped at `IA_MAX_SNAPSHOT_CHARS` (default 50,000 characters)
+- Typed errors: `no_snapshot_available`, `content_fetch_failed` (Wayback unreachable during lookup or fetch)
 
 ---
 
 ### `ia_search_items` <sub>tool</sub>
 
 - Solr query syntax plus structured filters: `mediatype`, `collection`, `creator`, `language`, and date range (`date_from`/`date_to`)
+- `mediatype` takes the ten Internet Archive media types — `texts`, `movies`, `audio`, `software`, `image`, `data`, `web`, `collection`, `etree`, `account` — case-insensitively, and resolves common near-misses (`text`, `book`, `books` → `texts`; `movie`, `video`, `videos` → `movies`; `images` → `image`; `collections` → `collection`)
 - Sort by relevance, date, or downloads (`sort`, Solr syntax; default `downloads desc`)
 - Up to 200 results per page (`rows`, default 50), 1-indexed `page`
-- Output carries `total_found`, `page`, `rows` for pagination; empty results return a `notice` with guidance rather than an error
+- Output carries `total_found`, `page`, `rows` for pagination; an empty page returns a `notice` rather than an error — naming the `mediatype` applied when nothing matched, or the last page when `page` is past the end
+- Typed error `invalid_mediatype` for any other `mediatype`, listing the accepted values, answered before any search request
 
 ---
 
@@ -111,7 +115,7 @@ Internet Archive-specific:
 Agent-friendly output:
 
 - Pagination context on every list response — `total_found`, `page`, `rows` (search), `resume_key` (CDX history), and `file_count` plus the next `file_offset` (item files) so agents never have to guess whether results are complete
-- Typed error reasons (`no_snapshots`, `no_snapshot_available`, `cdx_unavailable`, `item_not_found`, `no_text_file`, `download_forbidden`) with recovery hints so callers can retry or explain to users without parsing text
+- Typed error reasons (`missing_timestamp`, `no_snapshots`, `no_snapshot_available`, `cdx_unavailable`, `availability_unavailable`, `content_fetch_failed`, `invalid_mediatype`, `item_not_found`, `no_text_file`, `download_forbidden`) with recovery hints so callers can retry or explain to users without parsing text
 - Structured file manifests — `ia_get_item` returns file-level metadata (format, size, URL) and a `format` filter, so agents can pick the right file without paging through thumbnails
 
 ## Getting started
@@ -271,7 +275,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Five tools across Wayback and IA library. |
 | `src/mcp-server/resources` | Resource definitions. `ia://item/{identifier}` item metadata resource. |
-| `src/services/wayback` | `WaybackService` — Availability API + CDX API client. |
+| `src/services/wayback` | `WaybackService` — Availability API + CDX API client, plus archived-page charset decoding and text extraction. |
 | `src/services/archive-search` | `ArchiveSearchService` — Solr Advanced Search client. |
 | `src/services/archive-metadata` | `ArchiveMetadataService` — Metadata API + file download client. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
