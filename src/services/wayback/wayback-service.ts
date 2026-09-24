@@ -38,7 +38,8 @@ export class WaybackService {
 
   /**
    * Find the closest snapshot to a given timestamp using the Availability API.
-   * Throws `not_found` data when archived_snapshots is empty.
+   * Throws `no_snapshot_available`, carrying the calling tool's recovery hint, when
+   * archived_snapshots is empty or the returned URL is not a Wayback replay URL.
    */
   findClosest(url: string, timestamp: string, ctx: Context): Promise<AvailabilityResult> {
     return withRetry(
@@ -64,6 +65,7 @@ export class WaybackService {
             reason: 'no_snapshot_available',
             url,
             timestamp,
+            ...ctx.recoveryFor('no_snapshot_available'),
           });
         }
 
@@ -76,7 +78,12 @@ export class WaybackService {
         ) {
           throw notFound(
             `Availability API returned an unexpected snapshot URL for ${url} near ${timestamp}.`,
-            { reason: 'no_snapshot_available', url, timestamp },
+            {
+              reason: 'no_snapshot_available',
+              url,
+              timestamp,
+              ...ctx.recoveryFor('no_snapshot_available'),
+            },
           );
         }
 
@@ -127,6 +134,7 @@ export class WaybackService {
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable('CDX API returned HTML — likely overloaded.', {
             reason: 'cdx_unavailable',
+            ...ctx.recoveryFor('cdx_unavailable'),
           });
         }
 
@@ -136,6 +144,7 @@ export class WaybackService {
         } catch {
           throw serviceUnavailable('CDX API returned unparseable response.', {
             reason: 'cdx_unavailable',
+            ...ctx.recoveryFor('cdx_unavailable'),
           });
         }
 
