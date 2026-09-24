@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-24 · 🛡️ Security
+
+Snapshot text extraction rewritten for linear time, correct decoding, and a 4 MiB read limit; snapshots report the capture Wayback served, closest lookups fall back to CDX, and blank inputs, unknown mediatype values, and upstream failures surface as declared errors
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-24
 
 ia_get_item pages its file manifest (50 files by default) with max_files, file_offset, and a format filter, accepts multi-language items, and service-thrown errors now forward their declared recovery hints
