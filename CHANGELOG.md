@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-24
+
+ia_get_item pages its file manifest (50 files by default) with max_files, file_offset, and a format filter, accepts multi-language items, and service-thrown errors now forward their declared recovery hints
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-09-19
 
 MCP_SESSION_MODE defaults to stateless everywhere, ia_find_snapshots history-mode pagination surfaces its resume key instead of two fabricated snapshots, and mcp-ts-core ^0.12.3 to ^0.13.6 lands the skill-tree move, a sessionMode option, and error severity/thrownBy metadata

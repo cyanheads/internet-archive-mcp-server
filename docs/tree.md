@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 16:21:35
+Generated on: 2026-09-24 16:45:58
 
 ```text
 internet-archive-mcp-server/
@@ -25,6 +25,7 @@ internet-archive-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
