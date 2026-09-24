@@ -18,7 +18,7 @@ export const iaItemResource = resource('ia://item/{identifier}', {
     identifier: z
       .string()
       .describe(
-        'Internet Archive item identifier, e.g. "pg1342". Obtain from ia_search_items results.',
+        'Internet Archive item identifier, e.g. "prideprejudice00aust". Obtain from ia_search_items results.',
       ),
   }),
 
@@ -56,8 +56,8 @@ export const iaItemResource = resource('ia://item/{identifier}', {
   list: async () => ({
     resources: [
       {
-        uri: 'ia://item/pg1342',
-        name: 'Example: Pride and Prejudice (pg1342)',
+        uri: 'ia://item/prideprejudice00aust',
+        name: 'Example: Pride and Prejudice (prideprejudice00aust)',
         mimeType: 'application/json',
       },
     ],

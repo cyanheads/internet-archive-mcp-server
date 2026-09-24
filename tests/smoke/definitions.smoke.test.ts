@@ -25,6 +25,7 @@ import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { iaGetText } from '@/mcp-server/tools/definitions/ia-get-text.tool.js';
 import { iaSearchItems } from '@/mcp-server/tools/definitions/ia-search-items.tool.js';
+import * as toolDefinitions from '@/mcp-server/tools/definitions/index.js';
 
 const mockWayback = {
   findClosest: vi.fn(),
@@ -44,6 +45,40 @@ beforeEach(() => {
   (getWaybackService as ReturnType<typeof vi.fn>).mockReturnValue(mockWayback);
   (getArchiveSearchService as ReturnType<typeof vi.fn>).mockReturnValue(mockSearch);
   (getArchiveMetadataService as ReturnType<typeof vi.fn>).mockReturnValue(mockMetadata);
+});
+
+describe('tool annotations', () => {
+  const tools = Object.values(toolDefinitions);
+
+  it('covers all five ia_* tools', () => {
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'ia_find_snapshots',
+      'ia_get_item',
+      'ia_get_snapshot',
+      'ia_get_text',
+      'ia_search_items',
+    ]);
+  });
+
+  it.each(tools.map((t) => [t.name, t] as const))(
+    '%s advertises openWorldHint: true (it calls Internet Archive APIs)',
+    (_name, definition) => {
+      expect(definition.annotations?.openWorldHint).toBe(true);
+    },
+  );
+});
+
+describe('example identifiers', () => {
+  const dead = ['pg1342', 'UndergraduateMathematics'];
+
+  it.each([
+    ['ia_get_item', iaGetItem.input.shape.identifier.description],
+    ['ia_get_text', iaGetText.input.shape.identifier.description],
+    ['ia://item/{identifier}', iaItemResource.params.shape.identifier.description],
+  ])('%s identifier description names a resolvable example', (_name, description) => {
+    expect(description).toContain('prideprejudice00aust');
+    for (const id of dead) expect(description).not.toContain(id);
+  });
 });
 
 describe('definition smoke test', () => {

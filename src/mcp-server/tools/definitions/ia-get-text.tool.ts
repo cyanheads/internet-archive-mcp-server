@@ -14,15 +14,15 @@ export const iaGetText = tool('ia_get_text', {
     'Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) from the ' +
     'Internet Archive, with length-aware truncation and a continuation pointer for pagination. ' +
     'Suited for public-domain books, documents, scanned periodicals, and transcripts. ' +
-    'Use max_chars and char_offset to page through long documents. Use ia_get_item first to confirm ' +
-    'the item has a text file and to find its mediatype.',
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    'Use max_chars and char_offset to page through long documents. To confirm the item has a ' +
+    'text file first, call ia_get_item with format "DjVuTXT"; its response also gives the mediatype.',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
     identifier: z
       .string()
       .describe(
-        'Internet Archive item identifier, e.g. "pg1342" (Pride and Prejudice). ' +
+        'Internet Archive item identifier, e.g. "prideprejudice00aust" (Pride and Prejudice). ' +
           'Obtain from ia_search_items results.',
       ),
     max_chars: z

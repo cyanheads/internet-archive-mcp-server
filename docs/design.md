@@ -6,11 +6,11 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL. Mode `closest` returns the single nearest capture to a given timestamp (fast, via Availability API). Mode `history` returns the full capture list via CDX — filterable by date range, HTTP status, and MIME type, collapsed by default to one capture per day. Returns timestamps and `web.archive.org` replay URLs. Supports resume-key pagination for large histories. | `url`, `mode` (`closest`\|`history`), `timestamp` (closest mode), `from`/`to`, `status_filter`, `limit`, `collapse` (`timestamp:N` precision, default `timestamp:8`), `resume_key` (history mode) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the archived text content (HTML stripped to readable text) and the canonical replay URL. | `url`, `timestamp` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `ia_find_snapshots` | Find Wayback Machine snapshots of a URL. Mode `closest` returns the single nearest capture to a given timestamp (fast, via Availability API). Mode `history` returns the full capture list via CDX — filterable by date range, HTTP status, and MIME type, collapsed by default to one capture per day. Returns timestamps and `web.archive.org` replay URLs. Supports resume-key pagination for large histories. | `url`, `mode` (`closest`\|`history`), `timestamp` (closest mode), `from`/`to`, `status_filter`, `limit`, `collapse` (`timestamp:N` precision, default `timestamp:8`), `resume_key` (history mode) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the archived text content (HTML stripped to readable text) and the canonical replay URL. | `url`, `timestamp` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `ia_search_items` | Search the Internet Archive library (40M+ items) via the Advanced Search / Solr API. Filter by media type, collection, creator, date range, and language. Sort by relevance, date, or downloads. Returns identifiers, titles, creators, media types, dates, download counts, `total_found`, and current `page`/`rows` for pagination context. | `query`, `mediatype`, `collection`, `creator`, `date_from`/`date_to`, `language`, `sort`, `rows`, `page` | `readOnlyHint: true`, `openWorldHint: true` |
-| `ia_get_item` | Retrieve full metadata and the file manifest for an Archive item by identifier. Returns title, creator, description, subjects, collections, license, and every file with its format, size, and direct download URL. The primary hub for acting on a search result. | `identifier` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `ia_get_text` | Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) by identifier, with length-aware truncation and continuation pointer. Suited for public-domain books, documents, and transcripts. | `identifier`, `max_chars`, `char_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `ia_get_item` | Retrieve metadata and the file manifest for an Archive item by identifier. Returns title, creator, description, subjects, collections, license, language, the full `file_count`, and a page of files (default 50, max 500) with format, size, and direct download URL, optionally filtered to one format. The primary hub for acting on a search result. | `identifier`, `format`, `max_files`, `file_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `ia_get_text` | Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) by identifier, with length-aware truncation and continuation pointer. Suited for public-domain books, documents, and transcripts. | `identifier`, `max_chars`, `char_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 
 ### Error Contracts
 
@@ -136,6 +136,7 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 | # | Call | Purpose |
 |:--|:-----|:--------|
 | 1 | `GET /metadata/{identifier}` | Metadata + file manifest |
+| — | Filter `files[]` by `format`, then slice `[file_offset, file_offset + max_files]`; report `file_count` and the match count | Local paging |
 
 ### `ia_get_text`
 
@@ -156,6 +157,8 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 **No `ia_get_snapshot` HTML passthrough.** Raw Wayback HTML is rewritten by the archive (banner injections, relative URL rewriting) and can be very large. The tool strips to readable text and always returns the canonical replay URL so the human can open the original in a browser. Text extraction via `sanitize-html` (framework optional peer dep) or regex stripping.
 
 **`ia_get_text` separate from `ia_get_item`.** `ia_get_item` returns metadata + file manifest, not content. Fetching text content is a distinct, potentially large second request. Keeping it separate lets agents skip it when they only need metadata and file URLs.
+
+**`ia_get_item` pages the manifest in the handler, not the service.** Most items have a few dozen files, but scanned books and collections carry hundreds to thousands (mostly per-page derivatives), which put megabytes on both response surfaces. The handler filters by `format` and slices by `max_files`/`file_offset` so `structuredContent` and `content[]` carry the same page; `ArchiveMetadataService.getItem` keeps returning the full manifest because `ia_get_text` scans every file for its text source. Truncation and the match count go through the enrichment block (`truncated`, `totalCount`, `notice`) rather than a domain field.
 
 **Metadata API `{}` empty response = not found.** The API returns HTTP 200 with `{}` for unknown identifiers rather than 404. The service layer must check for empty response and throw `notFound`.
 

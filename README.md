@@ -75,8 +75,10 @@ All resource data is also reachable via `ia_get_item`.
 
 ### `ia_get_item` <sub>tool</sub>
 
-- Returns `title`, `creator`, `description`, `subject`, `collection`, `licenseurl`, `rights`, and `language` when present in upstream metadata
-- `files[]` includes every manifest file — `format`, `size`, `md5`, and a direct `download_url`
+- Returns `title`, `creator`, `description`, `subject`, `collection`, `licenseurl`, `rights`, and `language` when present in upstream metadata; `creator`, `description`, `subject`, `collection`, and `language` may be a string or a list
+- `files[]` is one page of the manifest in upstream order — `format`, `size`, `md5`, and a direct `download_url` per file; `file_count` is always the full manifest size
+- `max_files` (1–500, default 50) and `file_offset` (default 0) page through large items; when files remain, the response sets `truncated` and names the next `file_offset`
+- `format` keeps one file type (exact match, case-insensitive — e.g. `DjVuTXT`, `Text PDF`, `VBR MP3`) before paging and reports the match count as `totalCount`; a format with no matches returns an empty page and a notice listing the formats the item has
 - Typed error `item_not_found` for unknown identifiers
 
 ---
@@ -108,9 +110,9 @@ Internet Archive-specific:
 
 Agent-friendly output:
 
-- Pagination context on every list response — `total_found`, `page`, `rows` (search) and `resume_key` (CDX history) so agents never have to guess whether results are complete
-- Typed error reasons (`no_snapshots`, `no_snapshot_available`, `item_not_found`, `no_text_file`, `download_forbidden`) with recovery hints so callers can retry or explain to users without parsing text
-- Structured file manifests — every `ia_get_item` response includes file-level metadata (format, size, URL) enabling agents to select the right file without a follow-up call
+- Pagination context on every list response — `total_found`, `page`, `rows` (search), `resume_key` (CDX history), and `file_count` plus the next `file_offset` (item files) so agents never have to guess whether results are complete
+- Typed error reasons (`no_snapshots`, `no_snapshot_available`, `cdx_unavailable`, `item_not_found`, `no_text_file`, `download_forbidden`) with recovery hints so callers can retry or explain to users without parsing text
+- Structured file manifests — `ia_get_item` returns file-level metadata (format, size, URL) and a `format` filter, so agents can pick the right file without paging through thumbnails
 
 ## Getting started
 

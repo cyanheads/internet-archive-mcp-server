@@ -33,8 +33,10 @@ export class ArchiveMetadataService {
   }
 
   /**
-   * Retrieve full metadata and file manifest for an Archive item.
-   * Throws `item_not_found` when the API returns `{}`.
+   * Retrieve full metadata and the complete file manifest for an Archive item —
+   * `ia_get_text` scans every file, so paging stays in the `ia_get_item` handler.
+   * Throws `item_not_found` (with the caller's recovery hint) when the API returns
+   * `{}` or the item is dark.
    */
   getItem(identifier: string, ctx: Context): Promise<ArchiveItem> {
     return withRetry(
@@ -59,6 +61,7 @@ export class ArchiveMetadataService {
           throw notFound(`Item "${identifier}" not found in the Internet Archive.`, {
             reason: 'item_not_found',
             identifier,
+            ...ctx.recoveryFor('item_not_found'),
           });
         }
 
@@ -68,6 +71,7 @@ export class ArchiveMetadataService {
           throw notFound(`Item "${identifier}" is dark (restricted) in the Internet Archive.`, {
             reason: 'item_not_found',
             identifier,
+            ...ctx.recoveryFor('item_not_found'),
           });
         }
 
@@ -85,7 +89,7 @@ export class ArchiveMetadataService {
           ...(meta?.collection ? { collection: meta.collection as string | string[] } : {}),
           ...(meta?.licenseurl ? { licenseurl: meta.licenseurl as string } : {}),
           ...(meta?.rights ? { rights: meta.rights as string } : {}),
-          ...(meta?.language ? { language: meta.language as string } : {}),
+          ...(meta?.language ? { language: meta.language as string | string[] } : {}),
         };
 
         const files: ArchiveFile[] = rawFiles.map((f) => {
@@ -131,7 +135,7 @@ export class ArchiveMetadataService {
       throw notFound(
         `No readable text file found for item "${identifier}". ` +
           `The item exists but has no DjVuTXT or plain-text file in its manifest.`,
-        { reason: 'no_text_file', identifier },
+        { reason: 'no_text_file', identifier, ...ctx.recoveryFor('no_text_file') },
       );
     }
 

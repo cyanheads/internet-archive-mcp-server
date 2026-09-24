@@ -15,7 +15,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     'nearest available capture when the exact timestamp has no snapshot. Returns the archived page ' +
     'as readable plain text (HTML stripped) and the canonical replay URL for browser access. ' +
     'Use ia_find_snapshots first to discover valid timestamps for a URL.',
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
     url: z.string().describe('The URL whose archived content to retrieve.'),

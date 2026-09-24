@@ -56,6 +56,23 @@ describe('iaItemResource', () => {
     expect(result.files).toBeUndefined();
   });
 
+  it('returns an array-valued language unchanged', async () => {
+    mockService.getItem.mockResolvedValue({
+      metadata: { identifier: 'multi-lang', language: ['German', 'English', 'French'] },
+      files: [],
+    });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'multi-lang' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({
+      identifier: 'multi-lang',
+      language: ['German', 'English', 'French'],
+      file_count: 0,
+    });
+  });
+
   it('returns only identifier and file_count=0 for sparse metadata ({})', async () => {
     mockService.getItem.mockResolvedValue({
       metadata: { identifier: 'sparse-item' },
@@ -120,6 +137,16 @@ describe('iaItemResource', () => {
     it('lists resources with the ia:// URI scheme', async () => {
       const listing = await iaItemResource.list!();
       expect(listing.resources.every((r) => r.uri.startsWith('ia://'))).toBe(true);
+    });
+
+    it('advertises a public, non-dark example item', async () => {
+      const listing = await iaItemResource.list!();
+      expect(listing.resources).toEqual([
+        expect.objectContaining({
+          uri: 'ia://item/prideprejudice00aust',
+          name: expect.stringContaining('Pride and Prejudice'),
+        }),
+      ]);
     });
   });
 });

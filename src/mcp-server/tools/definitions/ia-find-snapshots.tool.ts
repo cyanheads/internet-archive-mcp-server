@@ -18,7 +18,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     'collapsed by default to one capture per day (collapse=timestamp:8). Use history mode to survey ' +
     'how a page changed over time; use closest mode when you need the snapshot nearest a specific date. ' +
     'history mode supports resume-key pagination for URLs with very large capture histories.',
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
     url: z.string().describe('The URL to look up in the Wayback Machine.'),

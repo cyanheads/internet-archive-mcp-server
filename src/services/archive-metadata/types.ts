@@ -24,7 +24,7 @@ export interface ArchiveItemMetadata {
   date?: string;
   description?: string | string[];
   identifier: string;
-  language?: string;
+  language?: string | string[];
   licenseurl?: string;
   mediatype?: string;
   rights?: string;

@@ -1,7 +1,8 @@
 /**
- * @fileoverview Tests for the ArchiveMetadataService download-path error contract —
- * restricted-item 401/403 responses must surface as the declared `download_forbidden`
- * reason with its recovery hint, and other failures must pass through untouched.
+ * @fileoverview Tests for ArchiveMetadataService — the download-path error contract
+ * (restricted-item 401/403 → `download_forbidden`), the recovery hint every
+ * service-thrown reason forwards from the calling definition's contract, metadata
+ * field mapping, and text-file selection across the full manifest.
  * @module tests/services/archive-metadata-service.test
  */
 
@@ -22,6 +23,8 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   };
 });
 
+import { iaItemResource } from '@/mcp-server/resources/definitions/ia-item.resource.js';
+import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
 import { iaGetText } from '@/mcp-server/tools/definitions/ia-get-text.tool.js';
 import { ArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
 
@@ -110,6 +113,151 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
     await expect(svc.getTextContent('gone-item', 100, 0, ctx)).rejects.toSatisfy((err: unknown) => {
       expect(err).toBe(upstream);
       return true;
+    });
+  });
+});
+
+/** A Metadata API body as the service reads it (`response.text()`). */
+const jsonBody = (body: unknown): Response =>
+  ({ text: async () => JSON.stringify(body) }) as Response;
+
+/** Reject any fetch a test did not stage, so an unexpected upstream call fails loudly. */
+const rejectUnstagedFetches = (): void => {
+  fetchWithTimeout.mockReset();
+  fetchWithTimeout.mockImplementation((url: string) =>
+    Promise.reject(new Error(`unmocked fetch: ${url}`)),
+  );
+};
+
+describe('ArchiveMetadataService.getItem field mapping', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  it('passes an array-valued language through unchanged', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: { title: 'Protestant review', language: ['German', 'English', 'French'] },
+        files: [],
+      }),
+    );
+
+    const item = await buildService().getItem('multi-lang', createMockContext());
+
+    expect(item.metadata.language).toEqual(['German', 'English', 'French']);
+  });
+
+  it('keeps a single language as a plain string', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({ metadata: { title: 'Pride and prejudice', language: 'eng' }, files: [] }),
+    );
+
+    const item = await buildService().getItem('one-lang', createMockContext());
+
+    expect(item.metadata.language).toBe('eng');
+  });
+});
+
+describe('ArchiveMetadataService.getTextContent text-file selection', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  it('finds a DjVuTXT file positioned far past the first 50 manifest entries', async () => {
+    const files = Array.from({ length: 120 }, (_, i) => ({
+      name: `page_${String(i).padStart(3, '0')}.jpg`,
+      format: 'JPEG Thumb',
+    }));
+    files[100] = { name: 'big-item_djvu.txt', format: 'DjVuTXT' };
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: { title: 'Big' }, files }));
+    fetchWithTimeout.mockResolvedValueOnce({ text: async () => 'Full OCR text.' } as Response);
+
+    const result = await buildService().getTextContent('big-item', 100, 0, createMockContext());
+
+    expect(result.sourceFile).toBe('big-item_djvu.txt');
+    expect(result.text).toBe('Full OCR text.');
+    expect(fetchWithTimeout).toHaveBeenLastCalledWith(
+      'https://archive.org/download/big-item/big-item_djvu.txt',
+      expect.any(Number),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});
+
+/** The declared recovery string for `reason` on a definition's error contract. */
+const declaredRecovery = (
+  errors: readonly { reason: string; recovery: string }[] | undefined,
+  reason: string,
+): string => {
+  const entry = errors?.find((e) => e.reason === reason);
+  if (!entry) throw new Error(`contract declares no ${reason}`);
+  return entry.recovery;
+};
+
+describe('ArchiveMetadataService service-thrown reasons carry the caller’s recovery hint', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  const callers = [
+    ['ia_get_item', iaGetItem.errors],
+    ['ia_get_text', iaGetText.errors],
+    ['ia://item/{identifier}', iaItemResource.errors],
+  ] as const;
+
+  describe.each(callers)('item_not_found under the %s contract', (_name, errors) => {
+    const hint = declaredRecovery(errors, 'item_not_found');
+
+    it('forwards the hint when the Metadata API returns {} (unknown identifier)', async () => {
+      fetchWithTimeout.mockResolvedValueOnce(jsonBody({}));
+
+      await expect(
+        buildService().getItem('no-such-item', createMockContext({ errors })),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: 'Item "no-such-item" not found in the Internet Archive.',
+        data: { reason: 'item_not_found', identifier: 'no-such-item', recovery: { hint } },
+      });
+    });
+
+    it('forwards the hint when the item is dark', async () => {
+      fetchWithTimeout.mockResolvedValueOnce(
+        jsonBody({ is_dark: true, server: 'ia800000.us.archive.org', dir: '/0/items/x' }),
+      );
+
+      await expect(
+        buildService().getItem('dark-item', createMockContext({ errors })),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: 'Item "dark-item" is dark (restricted) in the Internet Archive.',
+        data: { reason: 'item_not_found', identifier: 'dark-item', recovery: { hint } },
+      });
+    });
+  });
+
+  it('resolves different item_not_found hints for the tool and resource contracts', () => {
+    expect(declaredRecovery(iaGetItem.errors, 'item_not_found')).not.toBe(
+      declaredRecovery(iaItemResource.errors, 'item_not_found'),
+    );
+  });
+
+  it('forwards the ia_get_text hint on no_text_file', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: { title: 'A Film' },
+        files: [{ name: 'film.mp4', format: 'MPEG4' }],
+      }),
+    );
+
+    await expect(
+      buildService().getTextContent(
+        'film-item',
+        100,
+        0,
+        createMockContext({ errors: iaGetText.errors }),
+      ),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'no_text_file',
+        identifier: 'film-item',
+        recovery: { hint: declaredRecovery(iaGetText.errors, 'no_text_file') },
+      },
     });
   });
 });

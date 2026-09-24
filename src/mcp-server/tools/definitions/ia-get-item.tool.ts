@@ -1,5 +1,5 @@
 /**
- * @fileoverview Tool for retrieving full metadata and file manifest for an Archive item.
+ * @fileoverview Tool for retrieving metadata and a paged, format-filterable file manifest for an Archive item.
  * @module mcp-server/tools/definitions/ia-get-item
  */
 
@@ -10,18 +10,43 @@ import { getArchiveMetadataService } from '@/services/archive-metadata/archive-m
 export const iaGetItem = tool('ia_get_item', {
   title: 'Get Internet Archive Item',
   description:
-    'Retrieve full metadata and the complete file manifest for an Internet Archive item by identifier. ' +
-    'Returns title, creator, description, subjects, collections, license, language, and every file ' +
-    'with its format, size, and direct download URL. The primary tool to act on a search result ' +
-    'from ia_search_items. Use ia_get_text to retrieve the readable text of a text item.',
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    'Retrieve metadata and the file manifest for an Internet Archive item by identifier. ' +
+    'Returns title, creator, description, subjects, collections, license, language, the total ' +
+    'file count, and a page of files, each with its format, size, and direct download URL. ' +
+    'Pages hold up to max_files files (default 50) starting at file_offset; set format to keep ' +
+    'a single file type (e.g. "DjVuTXT", "Text PDF", "VBR MP3"). The primary tool to act on a ' +
+    'search result from ia_search_items. Use ia_get_text to retrieve the readable text of a text item.',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
     identifier: z
       .string()
       .describe(
-        'Internet Archive item identifier, e.g. "pg1342" (Pride and Prejudice) or ' +
-          '"UndergraduateMathematics". Obtain from ia_search_items results.',
+        'Internet Archive item identifier, e.g. "prideprejudice00aust" (Pride and Prejudice). ' +
+          'Obtain from ia_search_items results.',
+      ),
+    format: z
+      .string()
+      .optional()
+      .describe(
+        'Keep only files whose format equals this value, ignoring case — e.g. "DjVuTXT", ' +
+          '"Text PDF", "VBR MP3". Applied before paging. Omit to list every format.',
+      ),
+    max_files: z
+      .number()
+      .int()
+      .min(1)
+      .max(500)
+      .default(50)
+      .describe('Maximum number of files to return (1–500, default 50).'),
+    file_offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based position in the (format-filtered) file list to start from (default 0). ' +
+          'To read the next page, add max_files to the previous file_offset.',
       ),
   }),
 
@@ -64,8 +89,16 @@ export const iaGetItem = tool('ia_get_item', {
       .describe('Collection(s) this item belongs to when provided.'),
     licenseurl: z.string().optional().describe('License URL when provided.'),
     rights: z.string().optional().describe('Rights statement when provided.'),
-    language: z.string().optional().describe('Language when provided.'),
-    file_count: z.number().describe('Total number of files in the item manifest.'),
+    language: z
+      .union([
+        z.string().describe('Single language.'),
+        z.array(z.string().describe('Language.')).describe('Multiple languages.'),
+      ])
+      .optional()
+      .describe('Language(s) of the item when provided.'),
+    file_count: z
+      .number()
+      .describe('Total number of files in the full item manifest, before filtering and paging.'),
     files: z
       .array(
         z
@@ -78,8 +111,27 @@ export const iaGetItem = tool('ia_get_item', {
           })
           .describe('A single file in the item manifest.'),
       )
-      .describe('Complete file manifest for the item.'),
+      .describe(
+        'This page of the manifest in upstream order — up to max_files files from file_offset, ' +
+          'after the format filter.',
+      ),
   }),
+
+  enrichment: {
+    truncated: z.boolean().optional().describe('True when more files remain past this page.'),
+    shown: z.number().optional().describe('Number of files returned on this page.'),
+    cap: z.number().optional().describe('The max_files cap that was applied.'),
+    totalCount: z
+      .number()
+      .optional()
+      .describe('Number of files matching the format filter, before paging.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Paging guidance with the next file_offset, or the formats present when the filter matched nothing.',
+      ),
+  },
 
   errors: [
     {
@@ -97,9 +149,52 @@ export const iaGetItem = tool('ia_get_item', {
     const svc = getArchiveMetadataService();
     const item = await svc.getItem(input.identifier.trim(), ctx);
 
+    const format = input.format?.trim();
+    const matched = format
+      ? item.files.filter((f) => f.format?.toLowerCase() === format.toLowerCase())
+      : item.files;
+    const page = matched.slice(input.file_offset, input.file_offset + input.max_files);
+    const nextOffset = input.file_offset + page.length;
+
+    /** Notice segments from every source, flushed once — `notice` is last-wins. */
+    const notices: string[] = [];
+    if (format) {
+      ctx.enrich.total(matched.length);
+      if (matched.length === 0) {
+        const present = [...new Set(item.files.flatMap((f) => (f.format ? [f.format] : [])))];
+        notices.push(
+          present.length > 0
+            ? `No files have format "${format}". Formats in this item: ${present.join(', ')}.`
+            : `No files have format "${format}"; no file in this item declares a format.`,
+        );
+      }
+    }
+    if (matched.length > 0 && input.file_offset >= matched.length) {
+      notices.push(
+        `file_offset ${input.file_offset} is past the last of ${matched.length} ` +
+          `${format ? 'matching files' : 'files'}; use a file_offset below ${matched.length}.`,
+      );
+    }
+    if (nextOffset < matched.length) {
+      notices.push(
+        `Showing files ${input.file_offset + 1}–${nextOffset} of ${matched.length}` +
+          `${format ? ' matching' : ''}. Pass file_offset: ${nextOffset} for the next page` +
+          `${format ? '.' : ', or set format to keep one file type.'}`,
+      );
+      ctx.enrich.truncated({
+        shown: page.length,
+        cap: input.max_files,
+        guidance: notices.join(' '),
+      });
+    } else if (notices.length > 0) {
+      ctx.enrich.notice(notices.join(' '));
+    }
+
     ctx.log.info('Item retrieved', {
       identifier: input.identifier,
       fileCount: item.files.length,
+      matched: matched.length,
+      returned: page.length,
     });
 
     const meta = item.metadata;
@@ -116,7 +211,7 @@ export const iaGetItem = tool('ia_get_item', {
       ...(meta.rights ? { rights: meta.rights } : {}),
       ...(meta.language ? { language: meta.language } : {}),
       file_count: item.files.length,
-      files: item.files.map((f) => ({
+      files: page.map((f) => ({
         name: f.name,
         download_url: f.downloadUrl,
         ...(f.format ? { format: f.format } : {}),
@@ -136,7 +231,12 @@ export const iaGetItem = tool('ia_get_item', {
       lines.push(`**Creator:** ${creators}`);
     }
     if (result.date) lines.push(`**Date:** ${result.date}`);
-    if (result.language) lines.push(`**Language:** ${result.language}`);
+    if (result.language) {
+      const languages = Array.isArray(result.language)
+        ? result.language.join(', ')
+        : result.language;
+      lines.push(`**Language:** ${languages}`);
+    }
     if (result.subject) {
       const subjects = Array.isArray(result.subject) ? result.subject.join(', ') : result.subject;
       lines.push(`**Subjects:** ${subjects}`);
@@ -157,7 +257,11 @@ export const iaGetItem = tool('ia_get_item', {
       lines.push(`**Description:** ${desc}`);
     }
     lines.push('');
-    lines.push(`**Files (${result.file_count}):**`);
+    const count =
+      result.files.length === result.file_count
+        ? `${result.file_count}`
+        : `showing ${result.files.length} of ${result.file_count} in the manifest`;
+    lines.push(`**Files (${count}):**`);
     for (const f of result.files) {
       const meta = [
         f.format,
