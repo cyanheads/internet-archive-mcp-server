@@ -38,16 +38,18 @@ export interface ArchiveItem {
   metadata: ArchiveItemMetadata;
 }
 
-/** Text content retrieved from a text item. */
+/** One page of text read from a text item. Offsets and lengths count UTF-16 code units. */
 export interface TextContent {
   /** Character offset used for this slice. */
   charOffset: number;
+  /** True when the file holds text past the end of this slice. */
+  hasMore: boolean;
   /** Maximum characters returned in this slice. */
   maxChars: number;
   /** Name of the source file fetched. */
   sourceFile: string;
+  /** Size of the source file in bytes, from the manifest; absent when the manifest has none. */
+  sourceFileBytes?: number;
   /** Extracted text slice. */
   text: string;
-  /** Total character count of the full text file. */
-  totalChars: number;
 }

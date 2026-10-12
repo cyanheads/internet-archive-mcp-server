@@ -505,7 +505,7 @@ describe('iaGetItem', () => {
 
     it.each([
       ['max_files 0', { max_files: 0 }, 'max_files', 'too_small'],
-      ['max_files 501', { max_files: 501 }, 'max_files', 'too_big'],
+      ['max_files 300001', { max_files: 300_001 }, 'max_files', 'too_big'],
       ['max_files 2.5', { max_files: 2.5 }, 'max_files', 'invalid_type'],
       ['file_offset -1', { file_offset: -1 }, 'file_offset', 'too_small'],
     ])('rejects %s against the field bound', async (_label, input, field, issueCode) => {
@@ -527,6 +527,124 @@ describe('iaGetItem', () => {
 
       expect(mockService.getItem).toHaveBeenCalledTimes(1);
       expect(mockService.getItem).toHaveBeenCalledWith('big', expect.anything());
+    });
+
+    it('serves max_files above the cap on an item with fewer files, with no truncation or notice', async () => {
+      const { result, sc } = await run({ max_files: 1000 });
+
+      expect(structuredNames(result)).toEqual(names(bigManifest));
+      expect(sc).not.toHaveProperty('truncated');
+      expect(sc).not.toHaveProperty('cap');
+      expect(sc).not.toHaveProperty('notice');
+      expect(contentText(result)).toContain('**Files (297):**');
+    });
+  });
+
+  describe('max_files above the 500 cap', () => {
+    /** 1,234 files, half of them `JPEG Thumb`, so both the whole manifest and a filtered one run past the cap. */
+    const hugeManifest = Array.from({ length: 1_234 }, (_, i) => {
+      const name = `f_${String(i).padStart(4, '0')}`;
+      return {
+        name,
+        format: i % 2 === 0 ? 'JPEG Thumb' : 'Text PDF',
+        downloadUrl: `https://archive.org/download/huge/${name}`,
+      };
+    });
+    const names = (files: { name: string }[]) => files.map((f) => f.name);
+
+    beforeEach(() => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: 'huge', title: 'Huge item' },
+        files: hugeManifest,
+      });
+    });
+
+    const run = async (input: Record<string, unknown>) => {
+      const result = await runToolContract(iaGetItem, { identifier: 'huge', ...input });
+      expect(result.isError).toBeFalsy();
+      expect(renderedNames(result)).toEqual(structuredNames(result));
+      return { result, sc: result.structuredContent as Record<string, unknown> };
+    };
+
+    it('serves max_files 1000 at 500, naming the cap and the next file_offset on both surfaces', async () => {
+      const { result, sc } = await run({ max_files: 1000 });
+
+      expect(structuredNames(result)).toEqual(names(hugeManifest.slice(0, 500)));
+      expect(sc).toMatchObject({ truncated: true, shown: 500, cap: 500 });
+      expect(sc.notice).toContain('max_files 1000 is above the cap of 500 per call');
+      expect(sc.notice).toContain('Showing files 1–500 of 1234');
+      expect(sc.notice).toContain('file_offset: 500');
+      const text = contentText(result);
+      expect(text).toContain('max_files 1000 is above the cap of 500 per call');
+      expect(text).toContain('file_offset: 500');
+      expect(text).toContain('showing 500 of 1234');
+    });
+
+    it('serves the 300,000 ceiling at 500', async () => {
+      const { result, sc } = await run({ max_files: 300_000 });
+
+      expect(structuredNames(result)).toEqual(names(hugeManifest.slice(0, 500)));
+      expect(sc).toMatchObject({ truncated: true, shown: 500, cap: 500 });
+    });
+
+    it('walks the whole manifest by the advertised file_offset with no gap or repeat', async () => {
+      const seen: string[] = [];
+      const offsets: number[] = [];
+      let offset = 0;
+      for (let pages = 0; pages < 10; pages++) {
+        offsets.push(offset);
+        const { result, sc } = await run({ max_files: 1000, file_offset: offset });
+        seen.push(...structuredNames(result));
+        if (!sc.truncated) {
+          expect(sc).not.toHaveProperty('notice');
+          break;
+        }
+        expect(sc.cap).toBe(500);
+        offset = Number(/file_offset: (\d+)/.exec(sc.notice as string)?.[1]);
+      }
+
+      expect(offsets).toEqual([0, 500, 1000]);
+      expect(seen).toEqual(names(hugeManifest));
+    });
+
+    it('applies the cap after the format filter and names the filtered count', async () => {
+      const thumbs = hugeManifest.filter((f) => f.format === 'JPEG Thumb');
+
+      const first = await run({ format: 'JPEG Thumb', max_files: 2000 });
+      expect(structuredNames(first.result)).toEqual(names(thumbs.slice(0, 500)));
+      expect(first.sc).toMatchObject({ totalCount: 617, truncated: true, shown: 500, cap: 500 });
+      expect(first.sc.notice).toContain('Showing files 1–500 of 617 matching');
+      expect(first.sc.notice).toContain('file_offset: 500');
+
+      const last = await run({ format: 'JPEG Thumb', max_files: 2000, file_offset: 500 });
+      expect(structuredNames(last.result)).toEqual(names(thumbs.slice(500)));
+      expect(last.sc).not.toHaveProperty('truncated');
+      expect(last.sc).not.toHaveProperty('notice');
+    });
+
+    it('keeps the past-the-end notice for an over-cap max_files', async () => {
+      const { sc } = await run({ max_files: 1000, file_offset: 5000 });
+
+      expect(sc.files).toEqual([]);
+      expect(sc).not.toHaveProperty('truncated');
+      expect(sc.notice).toContain('file_offset 5000 is past the last of 1234 files');
+      expect(sc.notice).not.toContain('cap of 500');
+    });
+
+    it('reports the requested cap, not 500, when max_files is at or below it', async () => {
+      const { sc } = await run({ max_files: 499 });
+
+      expect(sc).toMatchObject({ truncated: true, shown: 499, cap: 499 });
+      expect(sc.notice).not.toContain('cap of 500');
+      expect(sc.notice).toContain('file_offset: 499');
+    });
+
+    it('rejects max_files above the 300,000 ceiling, naming it, before any lookup', async () => {
+      const result = await runToolContract(iaGetItem, { identifier: 'huge', max_files: 300_001 });
+
+      expect(result.isError).toBe(true);
+      expect(contentText(result)).toContain('max_files: Too big: expected number to be <=300000');
+      expect(mockService.getItem).not.toHaveBeenCalled();
     });
   });
 });

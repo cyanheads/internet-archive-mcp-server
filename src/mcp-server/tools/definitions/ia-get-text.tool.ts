@@ -34,7 +34,8 @@ export const iaGetText = tool('ia_get_text', {
       .optional()
       .describe(
         'Maximum number of characters to return in this response. Defaults to the server-configured ' +
-          'maximum (IA_MAX_SNAPSHOT_CHARS, typically 50 000). Lower values reduce token usage.',
+          'maximum (IA_MAX_SNAPSHOT_CHARS, typically 50 000); a larger value is served at that ' +
+          'maximum, with a notice. Lower values reduce token usage.',
       ),
     char_offset: z
       .number()
@@ -49,16 +50,38 @@ export const iaGetText = tool('ia_get_text', {
 
   output: z.object({
     text: z.string().describe('The text slice starting at char_offset up to max_chars characters.'),
-    total_chars: z.number().describe('Total character count of the full text file.'),
     char_offset: z.number().describe('Character offset used for this response.'),
-    max_chars: z.number().describe('Maximum characters returned in this response.'),
+    max_chars: z
+      .number()
+      .describe(
+        'Maximum characters this response could hold — the requested max_chars, or the server ' +
+          'maximum when the request exceeded it.',
+      ),
     has_more: z
       .boolean()
       .describe(
         'True when there is more text beyond this slice. Increment char_offset by max_chars to read the next page.',
       ),
     source_file: z.string().describe('Filename of the source text file fetched from the item.'),
+    source_file_bytes: z
+      .number()
+      .optional()
+      .describe(
+        'Size of the source text file in bytes, from the item manifest — a byte count, not a ' +
+          'character count (non-ASCII text takes several bytes per character). Omitted when the ' +
+          'manifest lists no size.',
+      ),
   }),
+
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Set when max_chars exceeded the server maximum (IA_MAX_SNAPSHOT_CHARS) and was served at it, ' +
+          'naming the char_offset of the next page, or saying the page reaches the end of the document.',
+      ),
+  },
 
   errors: [
     {
@@ -88,12 +111,26 @@ export const iaGetText = tool('ia_get_text', {
       severity: 'warning',
       thrownBy: 'service',
     },
+    {
+      reason: 'archive_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when:
+        'The Internet Archive Metadata API or the text file download did not answer within ' +
+        'the request timeout, could not be reached, answered HTTP 5xx after retries, 429, or ' +
+        'another 4xx, or the metadata response was unreadable.',
+      recovery:
+        'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes. ' +
+        'When the message names a download timeout, a retry can time out the same way; the ' +
+        'download_url ia_get_item lists for the file serves it whole.',
+      thrownBy: 'service',
+    },
   ],
 
   async handler(input, ctx) {
     const svc = getArchiveMetadataService();
-    const cfg = getServerConfig();
-    const maxChars = input.max_chars ?? cfg.maxSnapshotChars;
+    const ceiling = getServerConfig().maxSnapshotChars;
+    // The page size is what bounds a call's memory and upstream read, so it never exceeds the ceiling.
+    const maxChars = Math.min(input.max_chars ?? ceiling, ceiling);
     const charOffset = input.char_offset;
 
     const result = await svc.getTextContent(input.identifier, maxChars, charOffset, ctx);
@@ -101,27 +138,41 @@ export const iaGetText = tool('ia_get_text', {
     ctx.log.info('Text content retrieved', {
       identifier: input.identifier,
       sourceFile: result.sourceFile,
-      totalChars: result.totalChars,
+      sourceFileBytes: result.sourceFileBytes,
       sliceChars: result.text.length,
+      hasMore: result.hasMore,
     });
 
-    const hasMore = charOffset + maxChars < result.totalChars;
+    if (input.max_chars !== undefined && input.max_chars > ceiling) {
+      ctx.enrich.notice(
+        `max_chars ${input.max_chars.toLocaleString('en-US')} is above this server's maximum of ` +
+          `${ceiling.toLocaleString('en-US')} characters per call, so this page holds up to ` +
+          `${ceiling.toLocaleString('en-US')}. ` +
+          (result.hasMore
+            ? `Continue from char_offset ${(charOffset + maxChars).toLocaleString('en-US')}.`
+            : 'This page reaches the end of the document.'),
+      );
+    }
 
     return {
       text: result.text,
-      total_chars: result.totalChars,
       char_offset: charOffset,
       max_chars: maxChars,
-      has_more: hasMore,
+      has_more: result.hasMore,
       source_file: result.sourceFile,
+      ...(result.sourceFileBytes !== undefined && { source_file_bytes: result.sourceFileBytes }),
     };
   },
 
   format: (result) => {
     const nextOffset = result.char_offset + result.max_chars;
+    const fileSize =
+      result.source_file_bytes === undefined
+        ? ''
+        : ` | **File Size:** ${result.source_file_bytes.toLocaleString()} bytes`;
     const lines: string[] = [
-      `**Source:** ${result.source_file}`,
-      `**Max Chars:** ${result.max_chars.toLocaleString()} | **Offset:** ${result.char_offset.toLocaleString()} / ${result.total_chars.toLocaleString()} chars${result.has_more ? ` — more follows (next offset: ${nextOffset.toLocaleString()})` : ' — end of document'}`,
+      `**Source:** ${result.source_file}${fileSize}`,
+      `**Max Chars:** ${result.max_chars.toLocaleString()} | **Offset:** ${result.char_offset.toLocaleString()}${result.has_more ? ` — more follows (next offset: ${nextOffset.toLocaleString()})` : ' — end of document'}`,
       '',
       '---',
       '',

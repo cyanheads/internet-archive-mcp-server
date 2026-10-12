@@ -30,6 +30,17 @@ export const iaItemResource = resource('ia://item/{identifier}', {
       recovery: 'Verify the identifier with ia_search_items or the Internet Archive website.',
       thrownBy: 'service',
     },
+    {
+      reason: 'archive_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when:
+        'The Internet Archive Metadata API did not answer within the request timeout, could ' +
+        'not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an ' +
+        'unreadable response.',
+      recovery:
+        'The Internet Archive is temporarily unavailable or overloaded; read the resource again in a few minutes.',
+      thrownBy: 'service',
+    },
   ],
 
   async handler(params, ctx) {

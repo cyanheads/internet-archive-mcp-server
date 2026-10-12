@@ -7,15 +7,26 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
 
+/** Files returned per call. A larger `max_files` is served at this cap. */
+const MAX_FILES_CAP = 500;
+
+/** The largest `max_files` accepted: above the largest manifest measured (288,113 files). */
+const MAX_FILES_CEILING = 300_000;
+
+/** A string-or-list field as one line of text. */
+const listText = (value: string | string[]): string =>
+  Array.isArray(value) ? value.join(', ') : value;
+
 export const iaGetItem = tool('ia_get_item', {
   title: 'Get Internet Archive Item',
   description:
     'Retrieve metadata and the file manifest for an Internet Archive item by identifier. ' +
     'Returns title, creator, description, subjects, collections, license, language, the total ' +
     'file count, and a page of files, each with its format, size, and direct download URL. ' +
-    'Pages hold up to max_files files (default 50) starting at file_offset; set format to keep ' +
-    'a single file type (e.g. "DjVuTXT", "Text PDF", "VBR MP3"). The primary tool to act on a ' +
-    'search result from ia_search_items. Use ia_get_text to retrieve the readable text of a text item.',
+    'Pages hold up to max_files files (default 50, at most 500 per call) starting at ' +
+    'file_offset; set format to keep a single file type (e.g. "DjVuTXT", "Text PDF", "VBR MP3"). ' +
+    'The primary tool to act on a search result from ia_search_items. Use ia_get_text to ' +
+    'retrieve the readable text of a text item.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -38,9 +49,12 @@ export const iaGetItem = tool('ia_get_item', {
       .number()
       .int()
       .min(1)
-      .max(500)
+      .max(MAX_FILES_CEILING)
       .default(50)
-      .describe('Maximum number of files to return (1–500, default 50).'),
+      .describe(
+        'Maximum number of files to return (default 50). One call returns at most 500: a ' +
+          'larger value (up to 300,000) is served as 500, with a notice naming the next file_offset.',
+      ),
     file_offset: z
       .number()
       .int()
@@ -48,7 +62,8 @@ export const iaGetItem = tool('ia_get_item', {
       .default(0)
       .describe(
         'Zero-based position in the (format-filtered) file list to start from (default 0). ' +
-          'To read the next page, add max_files to the previous file_offset.',
+          'To read the next page, add the number of files returned to the previous file_offset, ' +
+          'or pass the file_offset the notice names.',
       ),
   }),
 
@@ -114,15 +129,18 @@ export const iaGetItem = tool('ia_get_item', {
           .describe('A single file in the item manifest.'),
       )
       .describe(
-        'This page of the manifest in upstream order — up to max_files files from file_offset, ' +
-          'after the format filter.',
+        'This page of the manifest in upstream order — up to max_files files (at most 500) ' +
+          'from file_offset, after the format filter.',
       ),
   }),
 
   enrichment: {
     truncated: z.boolean().optional().describe('True when more files remain past this page.'),
     shown: z.number().optional().describe('Number of files returned on this page.'),
-    cap: z.number().optional().describe('The max_files cap that was applied.'),
+    cap: z
+      .number()
+      .optional()
+      .describe('The page size applied: max_files, or 500 when a larger value was capped.'),
     totalCount: z
       .number()
       .optional()
@@ -145,6 +163,17 @@ export const iaGetItem = tool('ia_get_item', {
       severity: 'warning',
       thrownBy: 'service',
     },
+    {
+      reason: 'archive_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when:
+        'The Internet Archive Metadata API did not answer within the request timeout, could ' +
+        'not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an ' +
+        'unreadable response.',
+      recovery:
+        'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes.',
+      thrownBy: 'service',
+    },
   ],
 
   async handler(input, ctx) {
@@ -155,7 +184,8 @@ export const iaGetItem = tool('ia_get_item', {
     const matched = format
       ? item.files.filter((f) => f.format?.toLowerCase() === format.toLowerCase())
       : item.files;
-    const page = matched.slice(input.file_offset, input.file_offset + input.max_files);
+    const maxFiles = Math.min(input.max_files, MAX_FILES_CAP);
+    const page = matched.slice(input.file_offset, input.file_offset + maxFiles);
     const nextOffset = input.file_offset + page.length;
 
     /** Notice segments from every source, flushed once — `notice` is last-wins. */
@@ -178,6 +208,9 @@ export const iaGetItem = tool('ia_get_item', {
       );
     }
     if (nextOffset < matched.length) {
+      if (maxFiles < input.max_files) {
+        notices.push(`max_files ${input.max_files} is above the cap of ${MAX_FILES_CAP} per call.`);
+      }
       notices.push(
         `Showing files ${input.file_offset + 1}–${nextOffset} of ${matched.length}` +
           `${format ? ' matching' : ''}. Pass file_offset: ${nextOffset} for the next page` +
@@ -185,7 +218,7 @@ export const iaGetItem = tool('ia_get_item', {
       );
       ctx.enrich.truncated({
         shown: page.length,
-        cap: input.max_files,
+        cap: maxFiles,
         guidance: notices.join(' '),
       });
     } else if (notices.length > 0) {
@@ -228,27 +261,11 @@ export const iaGetItem = tool('ia_get_item', {
     lines.push(`# ${result.title ?? result.identifier}`);
     lines.push(`**Identifier:** ${result.identifier}`);
     if (result.mediatype) lines.push(`**Media Type:** ${result.mediatype}`);
-    if (result.creator) {
-      const creators = Array.isArray(result.creator) ? result.creator.join(', ') : result.creator;
-      lines.push(`**Creator:** ${creators}`);
-    }
+    if (result.creator) lines.push(`**Creator:** ${listText(result.creator)}`);
     if (result.date) lines.push(`**Date:** ${result.date}`);
-    if (result.language) {
-      const languages = Array.isArray(result.language)
-        ? result.language.join(', ')
-        : result.language;
-      lines.push(`**Language:** ${languages}`);
-    }
-    if (result.subject) {
-      const subjects = Array.isArray(result.subject) ? result.subject.join(', ') : result.subject;
-      lines.push(`**Subjects:** ${subjects}`);
-    }
-    if (result.collection) {
-      const cols = Array.isArray(result.collection)
-        ? result.collection.join(', ')
-        : result.collection;
-      lines.push(`**Collection:** ${cols}`);
-    }
+    if (result.language) lines.push(`**Language:** ${listText(result.language)}`);
+    if (result.subject) lines.push(`**Subjects:** ${listText(result.subject)}`);
+    if (result.collection) lines.push(`**Collection:** ${listText(result.collection)}`);
     if (result.licenseurl) lines.push(`**License:** ${result.licenseurl}`);
     if (result.rights) lines.push(`**Rights:** ${result.rights}`);
     if (result.description) {

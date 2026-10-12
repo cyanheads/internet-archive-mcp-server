@@ -186,7 +186,8 @@ describe('definition smoke test', () => {
   it('executes ia_get_text', async () => {
     mockMetadata.getTextContent.mockResolvedValue({
       text: 'It is a truth universally acknowledged',
-      totalChars: 680_000,
+      hasMore: true,
+      sourceFileBytes: 704_139,
       charOffset: 0,
       maxChars: 50_000,
       sourceFile: 'pg1342.txt',

@@ -29,10 +29,19 @@ const manifest = Array.from({ length: 175 }, (_, i) => {
   };
 });
 
+/** 1,150 files — past the 500-file cap, so an over-cap max_files withholds some. */
+const largeManifest = Array.from({ length: 1_150 }, (_, i) => {
+  const name = `big_${String(i).padStart(4, '0')}`;
+  return { name, downloadUrl: `https://archive.org/download/large/${name}`, format: 'JPEG Thumb' };
+});
+
+/** Files per call; a larger max_files is served at this cap. */
+const CAP = 500;
+
 const mockService = {
   getItem: vi.fn(async (identifier: string) => ({
     metadata: { identifier, title: 'Fuzz Fixture' },
-    files: manifest,
+    files: identifier === 'large' ? largeManifest : manifest,
   })),
 };
 
@@ -77,7 +86,7 @@ it('keeps ia_get_item safe across generated and adversarial inputs', async () =>
 it('returns exactly the requested slice of the filtered manifest on both surfaces', async () => {
   await fc.assert(
     fc.asyncProperty(
-      fc.integer({ min: 1, max: 500 }),
+      fc.oneof(fc.integer({ min: 1, max: CAP }), fc.integer({ min: CAP + 1, max: 300_000 })),
       fc.integer({ min: 0, max: 220 }),
       formatArb,
       async (max_files, file_offset, format) => {
@@ -88,7 +97,9 @@ it('returns exactly the requested slice of the filtered manifest on both surface
           ...(format === undefined ? {} : { format }),
         });
         const matched = expectedMatches(format);
-        const expected = matched.slice(file_offset, file_offset + max_files).map((f) => f.name);
+        const expected = matched
+          .slice(file_offset, file_offset + Math.min(max_files, CAP))
+          .map((f) => f.name);
         const sc = result.structuredContent as Record<string, unknown>;
 
         expect(result.isError).toBeFalsy();
@@ -126,5 +137,41 @@ it('walks every page by the advertised next offset and reassembles the filtered 
       expect(collected).toEqual(expectedMatches(format).map((f) => f.name));
     }),
     { numRuns: 40, seed: 20_260_925 },
+  );
+});
+
+it('walks a manifest past the cap by the advertised next offset under any max_files', async () => {
+  await fc.assert(
+    fc.asyncProperty(
+      fc.oneof(fc.integer({ min: 1, max: CAP }), fc.integer({ min: CAP + 1, max: 300_000 })),
+      fc.integer({ min: 0, max: 1_200 }),
+      async (max_files, start) => {
+        const collected: string[] = [];
+        let offset = start;
+        for (let pages = 0; pages < 1_200; pages++) {
+          const result = await runToolContract(iaGetItem, {
+            identifier: 'large',
+            max_files,
+            file_offset: offset,
+          });
+          const page = structuredNames(result);
+          const sc = result.structuredContent as {
+            truncated?: boolean;
+            cap?: number;
+            shown?: number;
+            notice?: string;
+          };
+          expect(page.length).toBeLessThanOrEqual(CAP);
+          collected.push(...page);
+          if (!sc.truncated) break;
+          expect(sc.cap).toBe(Math.min(max_files, CAP));
+          expect(sc.shown).toBe(page.length);
+          offset = Number(/file_offset: (\d+)/.exec(sc.notice ?? '')?.[1]);
+        }
+
+        expect(collected).toEqual(largeManifest.slice(start).map((f) => f.name));
+      },
+    ),
+    { numRuns: 40, seed: 20_261_012 },
   );
 });
