@@ -2,9 +2,9 @@
 
 **Server:** internet-archive-mcp-server
 **Version:** 0.3.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.13`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -116,8 +116,8 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   userAgent: z.string().optional().describe('Custom User-Agent string for IA API requests.'),
-  requestTimeoutMs: z.coerce.number().default(30_000).describe('HTTP request timeout in milliseconds.'),
-  maxSnapshotChars: z.coerce.number().default(50_000).describe('Default character cap for ia_get_text responses.'),
+  requestTimeoutMs: z.coerce.number().int().positive().default(30_000).describe('HTTP request timeout in milliseconds.'),
+  maxSnapshotChars: z.coerce.number().int().min(1).default(50_000).describe('Default and maximum characters per ia_get_text page (a larger max_chars is served at it); also the text cap for ia_get_snapshot.'),
 });
 
 let _config: ServerConfig | undefined;
@@ -238,6 +238,7 @@ src/
   config/
     server-config.ts                    # IA_USER_AGENT, IA_REQUEST_TIMEOUT_MS, IA_MAX_SNAPSHOT_CHARS
   services/
+    upstream-errors.ts                  # Shared transport/429 classification + retry predicate
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
       html-charset.ts                   # Archived-page charset detection + decoding

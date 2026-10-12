@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/internet-archive-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/internet-archive-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/internet-archive-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/internet-archive-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/internet-archive-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/internet-archive-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -19,11 +19,17 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://internet-archive.caseyjhand.com/mcp](https://internet-archive.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Overview
 
-The Wayback Machine and Internet Archive library (40M+ items). Find and fetch archived snapshots of any URL, search the library by keyword and metadata, and retrieve item metadata, file manifests, and OCR text from any MCP client. Runs as a stdio process or a local Streamable HTTP server.
+The Wayback Machine and Internet Archive library (40M+ items). Find and fetch archived snapshots of any URL, search the library by keyword and metadata, and retrieve item metadata, file manifests, and OCR text from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 ### Tools
 
@@ -48,11 +54,11 @@ All resource data is also reachable via `ia_get_item`.
 ### `ia_find_snapshots` <sub>tool</sub>
 
 - `closest` mode: returns the nearest capture to a given `timestamp` via the Availability API, falling back to one CDX closest-capture query (preferring a `200` capture, 25 s deadline) when the Availability API has no answer
-- `history` mode: full capture list via the CDX API; filter by date range (`from`/`to`), HTTP status (`status_filter`), and MIME type
-- Default `collapse` of `timestamp:8` (one capture per day); adjustable to `timestamp:N`, N=1–14
-- Up to 10,000 records per call (`limit`, default 100); `resume_key` pagination for large histories
+- `history` mode: full capture list via the CDX API; filter by date range (`from`/`to`) and HTTP status (`status_filter`)
+- `collapse` is `timestamp:8` (one capture per day) when omitted or blank; adjustable to `timestamp:N`, N=1–14, with `timestamp:14` listing one row per distinct capture second
+- Up to 10,000 records per call (`limit`, default 100); a larger `limit` (up to 150,000) is served as 10,000, setting `truncated` and a `notice` naming `resume_key` when captures remain; `resume_key` pagination for large histories
 - Replay URLs are always `https://web.archive.org/web/…`
-- Typed errors: `missing_timestamp` (closest mode without a `timestamp`, answered before any lookup), `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp from either source), `cdx_unavailable` (CDX 5xx, 429, or unreadable response, or the closest-mode CDX check did not complete), `availability_unavailable` (closest mode, Availability API 5xx, 429, or unreadable response); a 429 is answered after one request with a hint to wait
+- Typed errors: `missing_timestamp` (closest mode without a `timestamp`, answered before any lookup), `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp from either source; or, in either mode, the Wayback Machine does not serve the URL — a 403, 410, or 451, as for a site excluded from it), `cdx_unavailable` (CDX 5xx, 429, another 4xx, timeout, network error, or unreadable response, or the closest-mode CDX check did not complete), `availability_unavailable` (closest mode, Availability API 5xx, 429, another 4xx, timeout, network error, or unreadable response); a 429, another 4xx, or a request timeout is answered after one request, a 429 with a hint to wait and a 4xx with a hint that repeating the request will not help
 
 ---
 
@@ -62,7 +68,7 @@ All resource data is also reachable via `ia_get_item`.
 - Reports the capture Wayback served — `replay_url`, `resolved_timestamp`, and `resolved_status` follow Wayback's redirect when the requested timestamp is not itself a capture
 - Decodes the page with its declared charset (`Content-Type`, then `<meta>`, else UTF-8 when the bytes are valid UTF-8, else Wayback's guessed charset or windows-1252), then removes scripts, styles, comments, and tags and decodes character references, returning readable plain text alongside the replay URL
 - Reads at most the first 4 MiB of a page (a `notice` says when a page is longer); output capped at `IA_MAX_SNAPSHOT_CHARS` (default 50,000 characters)
-- Typed errors: `no_snapshot_available`, `content_fetch_failed` (Wayback unreachable during lookup or fetch)
+- Typed errors: `no_snapshot_available` (no capture near the timestamp, the capture is an archived error page — the message names its timestamp and archived status — or Wayback refused the replay with a 4xx, or the lookup with a 403, 410, or 451, as it does for a site excluded from the Wayback Machine), `content_fetch_failed` (Wayback unreachable, rate-limiting, refusing the lookup, or timed out during lookup or fetch)
 
 ---
 
@@ -70,10 +76,14 @@ All resource data is also reachable via `ia_get_item`.
 
 - Solr query syntax plus structured filters: `mediatype`, `collection`, `creator`, `language`, and date range (`date_from`/`date_to`)
 - `mediatype` takes the ten Internet Archive media types — `texts`, `movies`, `audio`, `software`, `image`, `data`, `web`, `collection`, `etree`, `account` — case-insensitively, and resolves common near-misses (`text`, `book`, `books` → `texts`; `movie`, `video`, `videos` → `movies`; `images` → `image`; `collections` → `collection`)
-- Sort by relevance, date, or downloads (`sort`, Solr syntax; default `downloads desc`)
-- Up to 200 results per page (`rows`, default 50), 1-indexed `page`
-- Output carries `total_found`, `page`, `rows` for pagination; an empty page returns a `notice` rather than an error — naming the `mediatype` applied when nothing matched, or the last page when `page` is past the end
-- Typed error `invalid_mediatype` for any other `mediatype`, listing the accepted values, answered before any search request
+- Sort by downloads, date, title, or random (`sort`, Solr syntax such as `date asc` or `titleSorter asc`; default `downloads desc`; Advanced Search has no relevance sort). Ties under the sort are ordered by `identifier`, so consecutive pages neither repeat nor skip an item
+- `query` is at most 2,047 characters, the longest Advanced Search accepts; the filters count toward it, and a URL in the query must be quoted
+- Up to 200 results per call (`rows`, default 50), 1-indexed `page`; on page 1 a larger `rows` (up to 10,000) is served as 200, setting `truncated` and a `notice` naming `rows: 200, page: 2` when more results remain
+- Advanced Search serves only the first 10,000 results, so `page × rows ≤ 10,000`
+- Output carries `total_found`, `page`, and the `rows` applied for pagination; an empty page returns a `notice` rather than an error — naming the `mediatype` applied when nothing matched, or the last page when `page` is past the end
+- `title`, `date`, `creator`, and `collection` may be a string or a list; `collection` leaves out per-account `fav-` favorites lists, and `creator` lists the first 10 names, with `creator_count` when a record has more
+- Typed errors answered before any search request: `invalid_mediatype` (any other `mediatype`, listing the accepted values), `rows_over_cap` (`rows` above 200 past page 1), and `page_limit_exceeded` (`page × rows` past 10,000, naming the last reachable page)
+- Typed errors from Advanced Search: `invalid_query` (it rejected the query syntax, an unquoted URL, a query its filters take past 2,047 characters, or the sort field; its message is relayed) and `search_unavailable` (it failed, rate-limited the request, sent an unreadable response, timed out, or could not be reached); a 5xx or network error is retried, while a 429, another 4xx, a timeout, or an error body is answered after one request, a 4xx with a hint that repeating the request will not help
 
 ---
 
@@ -81,17 +91,18 @@ All resource data is also reachable via `ia_get_item`.
 
 - Returns `title`, `creator`, `description`, `subject`, `collection`, `licenseurl`, `rights`, and `language` when present in upstream metadata; `creator`, `description`, `subject`, `collection`, and `language` may be a string or a list
 - `files[]` is one page of the manifest in upstream order — `format`, `size`, `md5`, and a direct `download_url` per file; `file_count` is always the full manifest size
-- `max_files` (1–500, default 50) and `file_offset` (default 0) page through large items; when files remain, the response sets `truncated` and names the next `file_offset`
+- `max_files` (default 50, at most 500 per call) and `file_offset` (default 0) page through large items; a larger `max_files` (up to 300,000) is served as 500. When files remain, the response sets `truncated` and names the next `file_offset`
 - `format` keeps one file type (exact match, case-insensitive — e.g. `DjVuTXT`, `Text PDF`, `VBR MP3`) before paging and reports the match count as `totalCount`; a format with no matches returns an empty page and a notice listing the formats the item has
-- Typed error `item_not_found` for unknown identifiers
+- Typed errors: `item_not_found` (unknown or dark identifiers), `archive_unavailable` (the Metadata API failed, rate-limited or refused the request, timed out, could not be reached, or sent an unreadable response); a first timeout is retried once, so a call waits at most two request timeouts
 
 ---
 
 ### `ia_get_text` <sub>tool</sub>
 
-- `max_chars` (defaults to `IA_MAX_SNAPSHOT_CHARS`) and `char_offset` page through long documents; `has_more` signals additional text remains
-- Locates the best available text file — DjVuTXT preferred, falls back to plain text; `source_file` names the file fetched
-- Typed errors: `item_not_found`, `no_text_file`, `download_forbidden` (restricted collections)
+- `max_chars` and `char_offset` page through long documents; `has_more` signals additional text remains. `max_chars` defaults to and is capped at `IA_MAX_SNAPSHOT_CHARS` — a larger value is served at that maximum, with a `notice`, and the output `max_chars` reports the value applied
+- The upstream read stops at the page's end, so memory per call is bounded by the page size
+- Locates the best available text file — DjVuTXT preferred, falls back to plain text; `source_file` names the file fetched and `source_file_bytes` its size in bytes, from the item manifest
+- Typed errors: `item_not_found`, `no_text_file`, `download_forbidden` (restricted collections), `archive_unavailable` (the Metadata API or the text download failed, rate-limited or refused the request, timed out, or could not be reached); the metadata request and the download each retry a first timeout once and stop at a second
 
 ---
 
@@ -99,7 +110,7 @@ All resource data is also reachable via `ia_get_item`.
 
 - Returns `application/json` — `title`, `creator`, `mediatype`, `description`, `subject`, `collection`, `date`, `licenseurl`, `rights`, `language`, and `file_count`
 - `identifier` comes from `ia_search_items` results
-- Typed error `item_not_found` for unknown identifiers
+- Typed errors: `item_not_found` for unknown identifiers, `archive_unavailable` when the Metadata API fails
 
 ## Features
 
@@ -115,10 +126,27 @@ Internet Archive-specific:
 Agent-friendly output:
 
 - Pagination context on every list response — `total_found`, `page`, `rows` (search), `resume_key` (CDX history), and `file_count` plus the next `file_offset` (item files) so agents never have to guess whether results are complete
-- Typed error reasons (`missing_timestamp`, `no_snapshots`, `no_snapshot_available`, `cdx_unavailable`, `availability_unavailable`, `content_fetch_failed`, `invalid_mediatype`, `item_not_found`, `no_text_file`, `download_forbidden`) with recovery hints so callers can retry or explain to users without parsing text
+- Typed error reasons (`missing_timestamp`, `no_snapshots`, `no_snapshot_available`, `cdx_unavailable`, `availability_unavailable`, `content_fetch_failed`, `invalid_mediatype`, `rows_over_cap`, `page_limit_exceeded`, `invalid_query`, `search_unavailable`, `item_not_found`, `no_text_file`, `download_forbidden`, `archive_unavailable`) with recovery hints so callers can retry or explain to users without parsing text
 - Structured file manifests — `ia_get_item` returns file-level metadata (format, size, URL) and a `format` filter, so agents can pick the right file without paging through thumbnails
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://internet-archive.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "internet-archive-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://internet-archive.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 No API key required — the Internet Archive's APIs are fully public.
 
@@ -229,8 +257,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `STORAGE_PROVIDER_TYPE` | Storage backend | `in-memory` |
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation | `false` |
 | `IA_USER_AGENT` | Custom User-Agent for IA API requests | `internet-archive-mcp-server/{version} (github.com/cyanheads/internet-archive-mcp-server)` |
-| `IA_REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds | `30000` |
-| `IA_MAX_SNAPSHOT_CHARS` | Default character cap for `ia_get_text` responses | `50000` |
+| `IA_REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds, headers and body. A positive integer — anything else fails startup | `30000` |
+| `IA_MAX_SNAPSHOT_CHARS` | Default and maximum characters per `ia_get_text` page (a larger `max_chars` is served at it); also caps `ia_get_snapshot` text. A positive integer — anything else fails startup | `50000` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 
