@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-10-07 12:28:18
+Generated on: 2026-10-12 20:45:12
 
 ```text
 internet-archive-mcp-server/
@@ -27,6 +27,7 @@ internet-archive-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -162,17 +163,23 @@ internet-archive-mcp-server/
 │   │   ├── archive-search/
 │   │   │   ├── archive-search-service.ts
 │   │   │   └── types.ts
-│   │   └── wayback/
-│   │       ├── html-charset.ts
-│   │       ├── html-entities.ts
-│   │       ├── html-text.ts
-│   │       ├── types.ts
-│   │       └── wayback-service.ts
+│   │   ├── wayback/
+│   │   │   ├── html-charset.ts
+│   │   │   ├── html-entities.ts
+│   │   │   ├── html-text.ts
+│   │   │   ├── types.ts
+│   │   │   └── wayback-service.ts
+│   │   └── upstream-errors.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── fuzz/
 │   │   └── ia-get-item.fuzz.test.ts
+│   ├── helpers/
+│   │   └── cpu-time.ts
 │   ├── integration/
+│   │   ├── archive-metadata-failures.int.test.ts
 │   │   ├── ia-get-item-contract.int.test.ts
 │   │   ├── ia-search-items-contract.int.test.ts
 │   │   └── wayback-contract.int.test.ts
