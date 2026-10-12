@@ -13,12 +13,18 @@ const ServerConfigSchema = z.object({
     .describe('Custom User-Agent string for Internet Archive API requests.'),
   requestTimeoutMs: z.coerce
     .number()
+    .int()
+    .positive()
     .default(30_000)
     .describe('HTTP request timeout in milliseconds.'),
   maxSnapshotChars: z.coerce
     .number()
+    .int()
+    .min(1)
     .default(50_000)
-    .describe('Default character cap for ia_get_text responses.'),
+    .describe(
+      'Default and maximum characters per ia_get_text page (a larger max_chars is served at it); also the text cap for ia_get_snapshot.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
