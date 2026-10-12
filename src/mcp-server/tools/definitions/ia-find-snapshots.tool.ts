@@ -9,16 +9,24 @@ import { getWaybackService } from '@/services/wayback/wayback-service.js';
 
 const WAYBACK_WEB = 'https://web.archive.org/web';
 
+/** CDX records returned per call. A larger history-mode `limit` is sent to CDX as this cap. */
+const LIMIT_CAP = 10_000;
+
+/** The largest `limit` accepted: the CDX server's documented per-query maximum. */
+const LIMIT_CEILING = 150_000;
+
 export const iaFindSnapshots = tool('ia_find_snapshots', {
   title: 'Find Wayback Machine Snapshots',
   description:
     'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture ' +
     'to a given timestamp via the Availability API, falling back to a CDX closest-capture query ' +
     'when the Availability API has no answer (one result). Mode "history" returns the ' +
-    'full capture list via the CDX API — filterable by date range, HTTP status code, and MIME type, ' +
-    'collapsed by default to one capture per day (collapse=timestamp:8). Use history mode to survey ' +
+    'full capture list via the CDX API — filterable by date range and HTTP status code, ' +
+    'collapsed by default to one capture per day (collapse "timestamp:8"); collapse ' +
+    '"timestamp:14" lists one row per distinct capture second. Use history mode to survey ' +
     'how a page changed over time; use closest mode when you need the snapshot nearest a specific date. ' +
-    'history mode supports resume-key pagination for URLs with very large capture histories.',
+    'History mode returns up to limit records (at most 10,000 per call) and supports resume-key ' +
+    'pagination for URLs with very large capture histories.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -71,9 +79,13 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .number()
       .int()
       .min(1)
-      .max(10000)
+      .max(LIMIT_CEILING)
       .default(100)
-      .describe('Maximum number of CDX records to return (history mode only, default 100).'),
+      .describe(
+        'Maximum number of CDX records to return (history mode only, default 100). One call ' +
+          'returns at most 10,000: a larger value (up to 150,000) is served as 10,000, and the ' +
+          'resume_key continues from there.',
+      ),
     collapse: z
       .union([
         z.literal(''),
@@ -85,8 +97,9 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .optional()
       .describe(
         'CDX collapse parameter (history mode only). Format: "timestamp:N" where N is 1–14 ' +
-          '(4=year, 6=month, 8=day, 10=hour, 14=exact). Default "timestamp:8" collapses to one per day. ' +
-          'Pass an empty string or omit to get uncollapsed results.',
+          '(4=year, 6=month, 8=day, 10=hour, 14=second): consecutive captures sharing the first ' +
+          'N timestamp digits are listed once. Omitted or blank, it is "timestamp:8", one ' +
+          'capture per day. Pass "timestamp:14" for one row per distinct capture second.',
       ),
     resume_key: z
       .string()
@@ -136,7 +149,14 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .optional()
       .describe('True when the snapshot list was capped at the limit.'),
     shown: z.number().optional().describe('Number of snapshots returned.'),
-    cap: z.number().optional().describe('The limit that was applied.'),
+    cap: z
+      .number()
+      .optional()
+      .describe('The limit applied: limit, or 10,000 when a larger value was capped.'),
+    notice: z
+      .string()
+      .optional()
+      .describe('Set when the list was capped: how to continue, naming resume_key.'),
   },
 
   errors: [
@@ -153,14 +173,17 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       reason: 'no_snapshots',
       code: JsonRpcErrorCode.NotFound,
       when: 'No snapshots found for the given URL with the current filters.',
-      recovery:
-        'Broaden the date range, remove status or MIME filters, or verify the URL is correct.',
+      recovery: 'Broaden the date range, remove status_filter, or verify the URL is correct.',
       severity: 'warning',
     },
     {
       reason: 'no_snapshot_available',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No capture exists near the requested timestamp for this URL.',
+      when:
+        'Closest mode: no capture exists near the requested timestamp for this URL. Either ' +
+        'mode: the Wayback Machine does not serve captures of this URL at all — the CDX or ' +
+        'Availability API answered HTTP 403, 410, or 451, as it does for a site excluded from ' +
+        'the archive.',
       recovery:
         'Try a different timestamp or switch to history mode to discover what snapshots exist.',
       severity: 'warning',
@@ -170,17 +193,22 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       reason: 'cdx_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when:
-        'The Wayback CDX API answered HTTP 5xx after retries or 429, or returned an unreadable ' +
-        'response; in closest mode, the CDX closest-capture check failed or did not complete in time.',
-      recovery: 'The Wayback CDX API is temporarily overloaded; retry in a few seconds.',
+        'The Wayback CDX API answered HTTP 5xx after retries or 429, refused the request with ' +
+        'another 4xx, did not answer within the request timeout, could not be reached, or ' +
+        'returned an unreadable response; in closest mode, the CDX closest-capture check ' +
+        'failed or did not complete in time.',
+      recovery:
+        'The Wayback CDX API is temporarily overloaded or unreachable; retry in a few seconds. ' +
+        'A query that keeps timing out needs a narrower from and to range or a smaller limit.',
       thrownBy: 'service',
     },
     {
       reason: 'availability_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when:
-        'The Wayback Availability API answered HTTP 5xx after retries or 429, or returned an ' +
-        'unreadable response (closest mode).',
+        'The Wayback Availability API answered HTTP 5xx after retries or 429, refused the ' +
+        'request with another 4xx, did not answer within the request timeout, could not be ' +
+        'reached, or returned an unreadable response (closest mode).',
       recovery:
         'Retry in a few seconds, or use history mode with from and to around the timestamp to list nearby captures.',
       thrownBy: 'service',
@@ -216,6 +244,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
 
     // history mode
     const collapseParam = input.collapse === '' ? undefined : (input.collapse ?? 'timestamp:8');
+    const limit = Math.min(input.limit, LIMIT_CAP);
 
     const histResult = await svc.fetchHistory(
       {
@@ -223,7 +252,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
         from: input.from?.trim() || undefined,
         to: input.to?.trim() || undefined,
         statusFilter: input.status_filter?.trim() || undefined,
-        limit: input.limit,
+        limit,
         collapse: collapseParam,
         resumeKey: input.resume_key?.trim() || undefined,
       },
@@ -234,7 +263,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       throw ctx.fail(
         'no_snapshots',
         `No snapshots found for "${input.url}" with the specified filters.`,
-        { ...ctx.recoveryFor('no_snapshots') },
+        ctx.recoveryFor('no_snapshots'),
       );
     }
 
@@ -244,8 +273,19 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       hasResumeKey: !!histResult.resumeKey,
     });
 
-    if (histResult.records.length >= input.limit) {
-      ctx.enrich.truncated({ shown: histResult.records.length, cap: input.limit });
+    const shown = histResult.records.length;
+    if (shown >= limit) {
+      const clamped =
+        limit < input.limit
+          ? `limit ${input.limit} is above the cap of ${LIMIT_CAP.toLocaleString('en-US')} per call, so this page holds ${shown.toLocaleString('en-US')} captures. `
+          : `This page holds ${shown.toLocaleString('en-US')} captures, the limit. `;
+      ctx.enrich.truncated({
+        shown,
+        cap: limit,
+        guidance: histResult.resumeKey
+          ? `${clamped}Pass this response's resume_key as resume_key for the next page.`
+          : `${clamped}Narrow from and to to list the captures past it.`,
+      });
     }
 
     const snapshots = histResult.records.map((r) => ({

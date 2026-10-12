@@ -14,6 +14,15 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, getUserAgent } from '@/config/server-config.js';
+import {
+  bodyReadError,
+  isHtmlPage,
+  isRetriedFailure,
+  rateLimitError,
+  statusOf,
+  transportError,
+  waitPhrase,
+} from '../upstream-errors.js';
 import { decodeHtml } from './html-charset.js';
 import { htmlToText } from './html-text.js';
 import type { CdxHistoryResult, CdxRecord, ClosestSnapshot, SnapshotContent } from './types.js';
@@ -29,17 +38,54 @@ export interface FetchHistoryParams {
   url: string;
 }
 
-/** A Wayback lookup API and the declared reason its upstream failures surface as. */
+/**
+ * A Wayback upstream, the declared reason its failures surface as, and what a caller can
+ * check when it refuses a request with a 4xx no retry fixes. The replay fetch has neither:
+ * `ia_get_snapshot`, its only caller, maps its failures onto its own reasons.
+ */
 interface UpstreamApi {
   name: string;
-  reason: 'availability_unavailable' | 'cdx_unavailable';
+  reason?: 'availability_unavailable' | 'cdx_unavailable';
+  refusalCheck?: string;
 }
 
 const AVAILABILITY_API: UpstreamApi = {
   name: 'Availability API',
   reason: 'availability_unavailable',
+  refusalCheck: 'check url and timestamp',
 };
-const CDX_API: UpstreamApi = { name: 'CDX API', reason: 'cdx_unavailable' };
+const CDX_API: UpstreamApi = {
+  name: 'CDX API',
+  reason: 'cdx_unavailable',
+  refusalCheck: 'check url, from, to, and resume_key',
+};
+const REPLAY: UpstreamApi = { name: 'Wayback Machine' };
+
+/**
+ * Statuses with which the Wayback Machine declines to serve a URL at all — 403 is its
+ * answer for a site excluded from the archive — so no timestamp can help. The replay and
+ * both lookup APIs answer them alike.
+ */
+export const NOT_SERVED = new Set([403, 410, 451]);
+
+/** The recovery for a URL the Wayback Machine does not serve: no retry or timestamp helps. */
+export const NOT_SERVED_HINT =
+  'No capture of this URL can be read from the Wayback Machine at any timestamp, so another ' +
+  'timestamp or a retry will not help; look for the content under a different URL.';
+
+/** The message for a URL the Wayback Machine answered with a `NOT_SERVED` status. */
+export function notServedMessage(url: string, status: number): string {
+  return (
+    `The Wayback Machine does not serve captures of ${url} (HTTP ${status}` +
+    `${status === 403 ? ', its answer for a site excluded from the archive' : ''}).`
+  );
+}
+
+/**
+ * The header only an archived representation carries (RFC 7089 §2.1.1). A replay non-2xx
+ * with it is a capture of the site's own error page; without it, Wayback itself failed.
+ */
+const MEMENTO_DATETIME = 'memento-datetime';
 
 const AVAILABILITY_BASE = 'https://archive.org/wayback/available';
 const CDX_BASE = 'https://web.archive.org/cdx/search/cdx';
@@ -83,14 +129,17 @@ export class WaybackService {
    * Find the capture nearest `timestamp`. Asks the Availability API first; only when it
    * answers without a usable capture does it query CDX (`closest` + `sort=closest`), which
    * finds captures the Availability API sometimes misses. Throws `no_snapshot_available`,
-   * carrying the calling tool's recovery hint, only when both sources answer with none. A
-   * failed or cancelled Availability request propagates as it is and never triggers the
-   * fallback; a fallback that fails or runs out of time is `cdx_unavailable`, never a miss.
+   * carrying the calling tool's recovery hint, when both sources answer with none or either
+   * answers 403, 410, or 451. A
+   * failed Availability request, thrown as `availability_unavailable`, or a cancelled one
+   * never triggers the fallback; a fallback that fails or runs out of time is
+   * `cdx_unavailable`, never a miss.
    */
   async findClosest(url: string, timestamp: string, ctx: Context): Promise<ClosestSnapshot> {
     const closest =
-      (await this.retry('findClosest', ctx, () => this.queryAvailability(url, timestamp, ctx))) ??
-      (await this.closestFromCdx(url, timestamp, ctx));
+      (await this.retry('findClosest', AVAILABILITY_API, ctx, () =>
+        this.queryAvailability(url, timestamp, ctx),
+      )) ?? (await this.closestFromCdx(url, timestamp, ctx));
     if (closest) return closest;
 
     throw notFound(`No snapshot available for ${url} near ${timestamp}.`, {
@@ -103,10 +152,11 @@ export class WaybackService {
 
   /**
    * Fetch paginated capture history from the CDX API.
-   * Throws `cdx_unavailable` on an HTTP 5xx (after retries) or 429, an HTML page, or an unparseable body.
+   * Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429 or a
+   * timeout (after one request), an HTML page, or an unparseable body.
    */
   fetchHistory(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
-    return this.retry('fetchHistory', ctx, async () => {
+    return this.retry('fetchHistory', CDX_API, ctx, async () => {
       const qp = new URLSearchParams({
         url: params.url,
         output: 'json',
@@ -176,23 +226,31 @@ export class WaybackService {
    * a timestamp that is not itself a capture, and the HTTP status it replayed that capture
    * with. The body is streamed and read up to `REPLAY_BYTE_CEILING` bytes — a longer body
    * is cut there, the upstream read cancelled, and `truncatedAtBytes` set — then decoded
-   * with the charset the page declares. A 429 is answered after one request, as
-   * `ServiceUnavailable` with `retryable: false` and a hint to wait; every other failure
-   * propagates as the status-mapped error from the fetch. `ia_get_snapshot` remaps a
-   * `ServiceUnavailable` onto its declared `content_fetch_failed` contract entry. Text is
-   * capped at `maxChars` characters (defaults to `maxSnapshotChars` from server config).
+   * with the charset the page declares.
+   *
+   * A non-2xx carrying `Memento-Datetime` is an archived error page, not a Wayback failure:
+   * it is not retried and throws `NotFound` with `status` and `captureTimestamp`. Any other
+   * 4xx but a 404, 408, 425, or 429 is Wayback refusing the request — a 403 is its answer
+   * for a site excluded from the archive — and throws `NotFound` with `status` alone,
+   * after one request. Otherwise a 5xx, 408, 425, or network error is retried, and a 429
+   * or a timeout answered after one request, each as `ServiceUnavailable` (a 429 with a
+   * hint to wait), which `ia_get_snapshot` remaps onto its declared `content_fetch_failed`;
+   * a 404 and a caller cancellation propagate as the fetch threw them. No error carries
+   * the replay's body. Text is capped at `maxChars` characters (defaults to
+   * `maxSnapshotChars` from server config).
    */
   fetchContent(snapshotUrl: string, ctx: Context, maxChars?: number): Promise<SnapshotContent> {
     const cap = maxChars ?? getServerConfig().maxSnapshotChars;
-    return this.retry('fetchContent', ctx, async () => {
-      const response = await fetchWithTimeout(snapshotUrl, this.timeoutMs, ctx, {
-        headers: this.headers,
-        signal: ctx.signal,
-      }).catch((err: unknown) => {
-        throw statusOf(err) === 429 ? rateLimitError('Wayback Machine', err as McpError) : err;
+    return this.retry('fetchContent', REPLAY, ctx, async () => {
+      const response = await this.fetchUpstream(snapshotUrl, REPLAY, ctx, {
+        errorHeaders: [MEMENTO_DATETIME],
       });
 
-      const { bytes, truncated } = await readCapped(response, REPLAY_BYTE_CEILING);
+      const { bytes, truncated } = await readCapped(response, REPLAY_BYTE_CEILING).catch(
+        (err: unknown) => {
+          throw bodyReadError(err, REPLAY.name);
+        },
+      );
       const html = decodeHtml(bytes, {
         contentType: response.headers.get('content-type'),
         guessedCharset: response.headers.get('x-archive-guessed-charset'),
@@ -226,6 +284,7 @@ export class WaybackService {
       `${AVAILABILITY_BASE}?${params}`,
       AVAILABILITY_API,
       ctx,
+      { target: url },
     );
     const raw = (await readJson(response, AVAILABILITY_API, ctx)) as {
       archived_snapshots?: {
@@ -245,7 +304,9 @@ export class WaybackService {
   /**
    * The CDX fallback: one attempt under its own deadline, no retries. Any upstream failure
    * or timeout becomes `cdx_unavailable` saying the lookup could not finish, never a
-   * miss; a caller cancellation passes through untouched.
+   * miss — one marked `retryable: false` (a 4xx refusal, a 501) without promising a
+   * retry. A URL the Wayback Machine does not serve and a caller cancellation pass
+   * through untouched.
    */
   private async closestFromCdx(
     url: string,
@@ -255,12 +316,20 @@ export class WaybackService {
     try {
       return await this.queryCdxClosest(url, timestamp, ctx);
     } catch (err) {
-      if (!(err instanceof McpError) || err.code === JsonRpcErrorCode.RequestCancelled) throw err;
+      if (
+        !(err instanceof McpError) ||
+        err.code === JsonRpcErrorCode.RequestCancelled ||
+        err.data?.reason === 'no_snapshot_available'
+      ) {
+        throw err;
+      }
       const { status, retryAfter, retryable } = err.data ?? {};
       const hint =
         status === 429
           ? `The CDX API is rate-limiting requests; ${waitPhrase(retryAfter)}, then ${NEARBY_CAPTURES}.`
-          : `Retry later, or ${NEARBY_CAPTURES}.`;
+          : retryable === false
+            ? `A retry will not help; ${NEARBY_CAPTURES}.`
+            : `Retry later, or ${NEARBY_CAPTURES}.`;
       throw serviceUnavailable(
         `The Availability API found no capture of ${url} near ${timestamp}, and the CDX closest-capture check did not complete: ${err.message}`,
         {
@@ -301,63 +370,97 @@ export class WaybackService {
     return { snapshotUrl: this.buildReplayUrl(captureTs, original), timestamp: captureTs, status };
   }
 
-  /** Rows of a CDX JSON query. Throws `cdx_unavailable` on a 5xx, a 429, an HTML page, or unparseable text. */
+  /**
+   * Rows of a CDX JSON query. Throws `cdx_unavailable` on a 5xx, a 429, another 4xx, an
+   * HTML page, or unparseable text, and `no_snapshot_available` on a `NOT_SERVED` status.
+   */
   private async queryCdx(
     params: URLSearchParams,
     ctx: Context,
     timeoutMs = this.timeoutMs,
   ): Promise<unknown[][]> {
-    const response = await this.fetchUpstream(`${CDX_BASE}?${params}`, CDX_API, ctx, timeoutMs);
+    const response = await this.fetchUpstream(`${CDX_BASE}?${params}`, CDX_API, ctx, {
+      timeoutMs,
+      target: params.get('url') ?? '',
+    });
     const rows = await readJson(response, CDX_API, ctx);
     return Array.isArray(rows) ? rows : [];
   }
 
   /**
-   * `fetchWithTimeout` with an upstream 5xx or 429 rethrown as `api`'s declared reason.
-   * It runs inside the caller's retry closure. A 5xx keeps the code and the fields the
-   * retry loop reads (`retryAfter`, `retryable`), so the attempt count is unchanged and
-   * the error surfacing after the last attempt carries the reason and its recovery hint.
-   * A 429 is marked `retryable: false` — the upstream asked the client to slow down, so
-   * it is answered after one request with a hint to wait. Every other failure, caller
-   * cancellation included, propagates untouched.
+   * `fetchWithTimeout` with an upstream 5xx, 408, 425, or 429 rethrown as `api`'s declared
+   * reason. It runs inside the caller's retry closure. A 5xx, 408, or 425 keeps the fields
+   * the retry loop reads (`retryAfter`, `retryable`) and is retried like a 5xx, so the error
+   * surfacing after the last attempt carries the reason and its recovery hint.
+   * A 429 carries a hint to wait and is answered after one request by the retry predicate —
+   * the upstream asked the client to slow down. A non-2xx whose `errorHeaders`
+   * capture includes `Memento-Datetime` is an archived error page, thrown as `NotFound`.
+   * Any other replay 4xx except a 404 is `replayRefusal`; any other lookup 4xx is
+   * `lookupRefusal`, about the looked-up `target` URL. Every other failure, timeouts and
+   * caller cancellation included, propagates untouched. A `NOT_SERVED` status, and a replay
+   * 404, is an expected answer, so the fetch logs it at debug rather than error.
    */
   private async fetchUpstream(
     url: string,
     api: UpstreamApi,
     ctx: Context,
-    timeoutMs = this.timeoutMs,
+    {
+      timeoutMs = this.timeoutMs,
+      errorHeaders,
+      target = url,
+    }: { errorHeaders?: string[]; target?: string; timeoutMs?: number } = {},
   ): Promise<Response> {
     try {
       return await fetchWithTimeout(url, timeoutMs, ctx, {
         headers: this.headers,
         signal: ctx.signal,
+        expectedStatuses: api === REPLAY ? [...NOT_SERVED, 404] : [...NOT_SERVED],
+        ...(errorHeaders && { errorHeaders }),
       });
     } catch (err) {
       const status = statusOf(err);
-      if (status === undefined || (status < 500 && status !== 429)) throw err;
-      if (status === 429) throw rateLimitError(api.name, err as McpError, api.reason);
+      if (status === undefined) throw err;
+      const archived = archivedCaptureError(err as McpError, status);
+      if (archived) throw archived;
+      if (status === 429) throw rateLimitError(err, api.name, `The ${api.name}`, api.reason);
+      if (status < 500 && status !== 408 && status !== 425) {
+        if (api !== REPLAY) throw lookupRefusal(err as McpError, status, api, target);
+        throw status !== 404 ? replayRefusal(err as McpError, status) : err;
+      }
       const { retryAfter, retryable } = (err as McpError).data ?? {};
       throw serviceUnavailable(
         `${api.name} returned HTTP ${status}.`,
         {
-          reason: api.reason,
+          ...declaredReason(api, ctx),
           status,
           ...(retryAfter !== undefined && { retryAfter }),
           ...(retryable !== undefined && { retryable }),
-          ...ctx.recoveryFor(api.reason),
         },
         { cause: err },
       );
     }
   }
 
-  /** Run `fn` under the framework retry loop, bound to the request's cancellation signal. */
-  private retry<T>(operation: string, ctx: Context, fn: () => Promise<T>): Promise<T> {
+  /**
+   * Run `fn` under the framework retry loop, bound to the request's cancellation signal.
+   * A timeout or a 429 is not retried (`isRetriedFailure`). A timeout, or a network error
+   * once its retries are spent, surfaces as `api`'s declared reason; everything else leaves
+   * as it was thrown.
+   */
+  private retry<T>(
+    operation: string,
+    api: UpstreamApi,
+    ctx: Context,
+    fn: () => Promise<T>,
+  ): Promise<T> {
     return withRetry(fn, {
       operation: `WaybackService.${operation}`,
       context: ctx,
       baseDelayMs: 1_000,
       signal: ctx.signal,
+      isTransient: isRetriedFailure,
+    }).catch((err: unknown) => {
+      throw transportError(err, api.name, this.timeoutMs, declaredReason(api, ctx));
     });
   }
 }
@@ -368,21 +471,28 @@ export class WaybackService {
  * the retry loop retries like a 5xx.
  */
 async function readJson(response: Response, api: UpstreamApi, ctx: Context): Promise<unknown> {
-  const text = await response.text();
-  if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-    throw serviceUnavailable(`${api.name} returned HTML — likely overloaded.`, {
-      reason: api.reason,
-      ...ctx.recoveryFor(api.reason),
-    });
+  const text = await response.text().catch((err: unknown) => {
+    throw bodyReadError(err, api.name);
+  });
+  if (isHtmlPage(text)) {
+    throw serviceUnavailable(
+      `${api.name} returned HTML — likely overloaded.`,
+      declaredReason(api, ctx),
+    );
   }
   try {
     return JSON.parse(text);
   } catch {
-    throw serviceUnavailable(`${api.name} returned unparseable response.`, {
-      reason: api.reason,
-      ...ctx.recoveryFor(api.reason),
-    });
+    throw serviceUnavailable(
+      `${api.name} returned unparseable response.`,
+      declaredReason(api, ctx),
+    );
   }
+}
+
+/** `api`'s declared reason with the calling tool's recovery hint, as error `data` fields. */
+function declaredReason(api: UpstreamApi, ctx: Context): Record<string, unknown> {
+  return api.reason ? { reason: api.reason, ...ctx.recoveryFor(api.reason) } : {};
 }
 
 /**
@@ -419,43 +529,67 @@ function concatBytes(chunks: readonly Uint8Array[], length: number): Uint8Array 
   return bytes;
 }
 
-/** The upstream HTTP status a `fetchWithTimeout` error carries, if it came from a response. */
-function statusOf(err: unknown): number | undefined {
-  const status = err instanceof McpError ? err.data?.statusCode : undefined;
-  return typeof status === 'number' ? status : undefined;
-}
-
 /**
- * A 429 from `upstream`, rethrown as `ServiceUnavailable` that the retry loop does not
- * retry (`retryable: false`), with the `Retry-After` value and a hint to wait — the
- * upstream asked the client to slow down, so retrying would only extend the limit.
+ * A replay non-2xx carrying `Memento-Datetime` — Wayback replaying the error page the site
+ * returned when it was captured — as a `NotFound` the retry loop does not retry, naming the
+ * archived status and the capture's 14-digit timestamp. Undefined for any other failure.
  */
-function rateLimitError(upstream: string, err: McpError, reason?: UpstreamApi['reason']): McpError {
-  const { retryAfter } = err.data ?? {};
-  return serviceUnavailable(
-    `${upstream} returned HTTP 429 (rate limited).`,
-    {
-      ...(reason && { reason }),
-      status: 429,
-      ...(retryAfter !== undefined && { retryAfter }),
-      retryable: false,
-      recovery: {
-        hint: `The ${upstream} is rate-limiting requests; ${waitPhrase(retryAfter)} before retrying.`,
-      },
-    },
+function archivedCaptureError(err: McpError, status: number): McpError | undefined {
+  const headers = err.data?.headers as Record<string, string> | undefined;
+  const datetime = headers?.[MEMENTO_DATETIME];
+  if (typeof datetime !== 'string') return;
+  const captured = Date.parse(datetime);
+  const timestamp = Number.isNaN(captured)
+    ? datetime
+    : new Date(captured).toISOString().replace(/\D/g, '').slice(0, 14);
+  return notFound(
+    `The capture at ${timestamp} is an archived HTTP ${status} page.`,
+    { status, captureTimestamp: timestamp },
     { cause: err },
   );
 }
 
-/** How long a rate-limited caller should wait, from a `Retry-After` value when one was sent. */
-function waitPhrase(retryAfter: unknown): string {
-  if (typeof retryAfter === 'string' && /^\d+$/.test(retryAfter.trim())) {
-    return `wait ${retryAfter.trim()} seconds`;
+/**
+ * A replay 4xx without `Memento-Datetime` — Wayback refusing the request rather than
+ * replaying a capture, as with the 403 it answers for a site excluded from the archive —
+ * as a `NotFound` the retry loop does not retry, carrying the status and never the
+ * playback page Wayback sent as its body.
+ */
+function replayRefusal(err: McpError, status: number): McpError {
+  return notFound(
+    `The Wayback Machine answered the replay request with HTTP ${status} and no capture.`,
+    { status },
+    { cause: err },
+  );
+}
+
+/**
+ * A lookup API 4xx (not a 408, 425, or 429) about `target`, never carrying the upstream
+ * body, and answered after one request. A `NOT_SERVED` status is the Wayback Machine
+ * declining the URL itself, thrown as the declared `no_snapshot_available` with a hint that
+ * no timestamp or retry helps. Any other is `api`'s declared reason marked
+ * `retryable: false`, with a hint naming what the caller can check.
+ */
+function lookupRefusal(err: McpError, status: number, api: UpstreamApi, target: string): McpError {
+  if (NOT_SERVED.has(status)) {
+    return notFound(
+      notServedMessage(target, status),
+      { reason: 'no_snapshot_available', status, recovery: { hint: NOT_SERVED_HINT } },
+      { cause: err },
+    );
   }
-  const until = typeof retryAfter === 'string' ? Date.parse(retryAfter) : Number.NaN;
-  return Number.isNaN(until)
-    ? 'wait several minutes'
-    : `wait until ${new Date(until).toUTCString()}`;
+  return serviceUnavailable(
+    `${api.name} returned HTTP ${status}.`,
+    {
+      ...(api.reason && { reason: api.reason }),
+      status,
+      retryable: false,
+      recovery: {
+        hint: `The ${api.name} refused this request with HTTP ${status}, so repeating it unchanged will not help; ${api.refusalCheck}.`,
+      },
+    },
+    { cause: err },
+  );
 }
 
 /** The https form of a web.archive.org URL; undefined for any other URL. */

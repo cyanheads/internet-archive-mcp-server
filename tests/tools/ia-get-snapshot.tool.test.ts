@@ -8,7 +8,8 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 
-vi.mock('@/services/wayback/wayback-service.js', () => ({
+vi.mock('@/services/wayback/wayback-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/wayback/wayback-service.js')>()),
   getWaybackService: vi.fn(),
 }));
 
@@ -200,10 +201,11 @@ describe('iaGetSnapshot', () => {
     mockService.buildReplayUrl.mockReturnValue(
       'https://web.archive.org/web/20200601000000/https://example.com',
     );
+    // A caller-side deadline: the one Timeout the service leaves as the fetch threw it.
     const timeoutError = new McpError(
       JsonRpcErrorCode.Timeout,
-      'Request to https://web.archive.org/web/20200601000000/... timed out',
-      { statusCode: 504, errorSource: 'FetchHttpError' },
+      "fetch GET https://web.archive.org/web/20200601000000/... timed out on the caller's signal.",
+      { errorSource: 'FetchSignalTimeout' },
     );
     mockService.fetchContent.mockRejectedValue(timeoutError);
 
@@ -214,6 +216,66 @@ describe('iaGetSnapshot', () => {
     });
 
     await expect(iaGetSnapshot.handler(input, ctx)).rejects.toThrow(timeoutError);
+  });
+
+  it('names the capture and its archived status when the page fetch hit an archived error page', async () => {
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    const archived = notFound('The capture at 20190419141856 is an archived HTTP 503 page.', {
+      status: 503,
+      captureTimestamp: '20190419141856',
+    });
+    mockService.buildReplayUrl.mockReturnValue(
+      'https://web.archive.org/web/20190419141856/https://httpstat.us/503',
+    );
+    mockService.fetchContent.mockRejectedValue(archived);
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://httpstat.us/503',
+      timestamp: '20190419141856',
+    });
+
+    const recovery = iaGetSnapshot.errors?.find((e) => e.reason === 'no_snapshot_available')
+      ?.recovery as string;
+    const message =
+      'The capture of https://httpstat.us/503 at 20190419141856 is an archived HTTP 503 error page';
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining(message),
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery } },
+      },
+    });
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(message);
+    expect(text).toContain(`Recovery: ${recovery}`);
+    expect(recovery).toContain('status_filter "200"');
+  });
+
+  it('maps a page-fetch 404 on the lookup path to no_snapshot_available too', async () => {
+    const { McpError } = await import('@cyanheads/mcp-ts-core/errors');
+    mockService.findClosest.mockResolvedValue({
+      snapshotUrl: 'https://web.archive.org/web/20200101000000/https://example.com/',
+      timestamp: '20200101000000',
+      status: '200',
+    });
+    const missing = new McpError(
+      JsonRpcErrorCode.NotFound,
+      'Fetch failed for https://web.archive.org/…. Status: 404',
+      { status: 404, body: '<html>playback</html>', errorSource: 'FetchHttpError' },
+    );
+    mockService.fetchContent.mockRejectedValue(missing);
+
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const input = iaGetSnapshot.input.parse({ url: 'example.com', timestamp: '20200101' });
+    const err = await iaGetSnapshot.handler(input, ctx).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: 'No capture found at example.com for timestamp 20200101.',
+      data: { reason: 'no_snapshot_available' },
+    });
+    expect((err as InstanceType<typeof McpError>).data).not.toHaveProperty('body');
+    expect((err as Error).cause).toBe(missing);
   });
 
   it('reports the served capture when Wayback redirected an exact timestamp', async () => {
@@ -325,10 +387,11 @@ describe('iaGetSnapshot', () => {
 
   it('keeps the service’s own next step when the lookup was rate-limited', async () => {
     const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
-    const limited = serviceUnavailable('Availability API returned HTTP 429.', {
+    // Shaped as the service's rateLimitError throws it: no `retryable` — the retry predicate,
+    // not the error, answers a 429 after one request.
+    const limited = serviceUnavailable('Availability API returned HTTP 429 (rate limited).', {
       reason: 'availability_unavailable',
       status: 429,
-      retryable: false,
       retryAfter: '120',
       recovery: {
         hint: 'The Availability API is rate-limiting requests; wait 120 seconds before retrying.',
@@ -338,15 +401,17 @@ describe('iaGetSnapshot', () => {
 
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     const input = iaGetSnapshot.input.parse({ url: 'https://example.com', timestamp: '20200101' });
+    const err = await iaGetSnapshot.handler(input, ctx).catch((e: unknown) => e);
 
-    await expect(iaGetSnapshot.handler(input, ctx)).rejects.toMatchObject({
+    expect(err).toMatchObject({
+      message: 'Availability API returned HTTP 429 (rate limited).',
       data: {
         reason: 'content_fetch_failed',
-        retryable: false,
         retryAfter: '120',
         recovery: { hint: expect.stringContaining('wait 120 seconds') },
       },
     });
+    expect((err as { data: object }).data).not.toHaveProperty('retryable');
   });
 
   it('keeps the message and history-mode hint of an incomplete CDX fallback', async () => {

@@ -3,8 +3,9 @@
  * ia_get_snapshot — both tools run against the real WaybackService, the real
  * fetchWithTimeout, and the real retry loop, with only the upstream HTTP boundary
  * stubbed. Covers closest resolution (Availability, then CDX), the capture Wayback
- * actually served, charset and text extraction, upstream 5xx reasons, and caller
- * cancellation, on both the structuredContent and content[] surfaces.
+ * actually served, charset and text extraction, upstream 5xx, timeout, and network-error
+ * reasons, archived error captures, and caller cancellation, on both the
+ * structuredContent and content[] surfaces.
  * @module tests/integration/wayback-contract.int.test
  */
 
@@ -16,6 +17,7 @@ import {
   type FetchMockResponder,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
@@ -62,6 +64,51 @@ const RATE_LIMITED = () =>
 const hang: FetchMockResponder = (request) =>
   new Promise((_, reject) => {
     request.signal.addEventListener('abort', () => reject(request.signal.reason));
+  });
+
+/** Headers arrive with `head` as the first body bytes; the rest never comes until the request's signal aborts. */
+const stall =
+  (head: string): FetchMockResponder =>
+  (request) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(head));
+          request.signal.addEventListener('abort', () => controller.error(request.signal.reason));
+        },
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    );
+
+/** A refused connection, as the runtime's `fetch` rejects with it. */
+const refused: FetchMockResponder = () =>
+  Promise.reject(
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), {
+        code: 'ECONNREFUSED',
+      }),
+    }),
+  );
+
+/** Headers and `head` arrive, then the connection drops, as undici rejects the body read. */
+const dropped =
+  (head: string): FetchMockResponder =>
+  () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(head));
+          queueMicrotask(() => controller.error(new TypeError('terminated')));
+        },
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    );
+
+/** A replay of an archived error page: the capture's own status, with its Memento-Datetime. */
+const archivedError = (status: number, mementoDatetime: string) => () =>
+  new Response('<html><body>archived error page</body></html>', {
+    status,
+    headers: { 'content-type': 'text/html', 'memento-datetime': mementoDatetime },
   });
 
 const calls = (match: (r: Request) => boolean) => http.calls.filter((c) => match(c.request));
@@ -251,14 +298,38 @@ describe('ia_find_snapshots closest mode', () => {
         code: JsonRpcErrorCode.ServiceUnavailable,
         data: {
           reason: 'availability_unavailable',
-          retryable: false,
           recovery: { hint: expect.stringContaining('wait') },
         },
       },
     });
-    expect(contentText(result)).toContain('not retryable');
+    expect((result.structuredContent as { error: { data: object } }).error.data).not.toHaveProperty(
+      'retryable',
+    );
+    expect(contentText(result)).not.toContain('not retryable');
     expect(calls(isAvailability)).toHaveLength(1);
     expect(calls(isCdx)).toHaveLength(0);
+  });
+
+  it('answers a CDX fallback 429 after one request with the wait-then-history-mode hint', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(() => new Response('rate limited', { status: 429, headers: { 'retry-after': '60' } }));
+
+    const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(FALLBACK_MESSAGE),
+        data: {
+          reason: 'cdx_unavailable',
+          retryAfter: '60',
+          recovery: { hint: expect.stringMatching(/rate-limiting.*wait 60 seconds.*history mode/) },
+        },
+      },
+    });
+    expect(contentText(result)).not.toContain('not retryable');
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(1);
   });
 
   it('never reports an Availability HTML page as a ValidationError', async () => {
@@ -331,6 +402,201 @@ describe('ia_find_snapshots history mode', () => {
     });
     expect(contentText(result)).toContain(`Recovery: ${recovery}`);
     expect(calls(isCdx)).toHaveLength(4);
+  });
+});
+
+describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
+  const RESUME_KEY = 'com%2Cexample%29%2F+20150612000000';
+
+  /** A CDX history answer of `limit` captures, as CDX sends it, with a resume key when more remain. */
+  const cdxHistory = (total: number) => (request: Request) => {
+    const limit = Number(new URL(request.url).searchParams.get('limit'));
+    const n = Math.min(limit, total);
+    const rows = Array.from({ length: n }, (_, i) => [
+      `2015${String(i).padStart(10, '0')}`,
+      '200',
+      'text/html',
+      'http://example.com/',
+      `DIGEST${i}`,
+      '1256',
+    ]);
+    return Response.json([
+      ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'],
+      ...rows,
+      ...(n < total ? [[], [RESUME_KEY]] : []),
+    ]);
+  };
+
+  const sentLimits = () =>
+    calls(isCdx).map((c) => new URL(c.request.url).searchParams.get('limit'));
+
+  type History = {
+    snapshots: { timestamp: string }[];
+    resume_key?: string;
+    truncated?: boolean;
+    shown?: number;
+    cap?: number;
+    notice?: string;
+  };
+  const historyOf = (result: ToolResult) => result.structuredContent as History;
+
+  const history = (input: Record<string, unknown>) =>
+    runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      from: '2015',
+      to: '2016',
+      ...input,
+    });
+
+  it('sends limit 20000 to CDX as 10000 and discloses the cap with the resume_key', async () => {
+    routeCdx(cdxHistory(25_000));
+
+    const result = await history({ limit: 20_000 });
+
+    expect(result.isError).toBeFalsy();
+    expect(sentLimits()).toEqual(['10000']);
+    const out = historyOf(result);
+    expect(out.snapshots).toHaveLength(10_000);
+    expect(out).toMatchObject({
+      resume_key: RESUME_KEY,
+      truncated: true,
+      shown: 10_000,
+      cap: 10_000,
+    });
+    expect(out.notice).toContain('limit 20000 is above the cap of 10,000 per call');
+    expect(out.notice).toContain('resume_key');
+    const text = contentText(result);
+    expect(text).toContain('limit 20000 is above the cap of 10,000 per call');
+    expect(text).toContain(`**Resume Key:** ${RESUME_KEY}`);
+  });
+
+  it('returns the same captures and resume_key as limit 10000', async () => {
+    routeCdx(cdxHistory(25_000));
+
+    const capped = historyOf(await history({ limit: 20_000 }));
+    const atCap = historyOf(await history({ limit: 10_000 }));
+
+    expect(sentLimits()).toEqual(['10000', '10000']);
+    expect(capped.snapshots).toEqual(atCap.snapshots);
+    expect(capped.resume_key).toBe(atCap.resume_key);
+    expect(atCap).toMatchObject({ truncated: true, cap: 10_000 });
+    expect(atCap.notice).toContain('resume_key');
+    expect(atCap.notice).not.toContain('above the cap');
+  });
+
+  it('serves the 150,000 ceiling at 10,000', async () => {
+    routeCdx(cdxHistory(25_000));
+
+    const result = await history({ limit: 150_000 });
+
+    expect(sentLimits()).toEqual(['10000']);
+    expect(historyOf(result)).toMatchObject({ truncated: true, shown: 10_000, cap: 10_000 });
+  });
+
+  it('sets no truncation or notice when the clamp withheld nothing', async () => {
+    routeCdx(cdxHistory(42));
+
+    const result = await history({ limit: 20_000 });
+
+    expect(sentLimits()).toEqual(['10000']);
+    const out = historyOf(result);
+    expect(out.snapshots).toHaveLength(42);
+    expect(out).not.toHaveProperty('truncated');
+    expect(out).not.toHaveProperty('notice');
+    expect(out).not.toHaveProperty('resume_key');
+  });
+
+  it('names resume_key when the default limit of 100 is reached', async () => {
+    routeCdx(cdxHistory(250));
+
+    const result = await history({});
+
+    expect(sentLimits()).toEqual(['100']);
+    const out = historyOf(result);
+    expect(out).toMatchObject({ truncated: true, shown: 100, cap: 100, resume_key: RESUME_KEY });
+    expect(out.notice).toContain('resume_key');
+    expect(contentText(result)).toContain('resume_key');
+  });
+
+  it.each([
+    ['above the 150,000 ceiling', 150_001, 'limit: Too big: expected number to be <=150000'],
+    ['zero', 0, 'limit: Too small: expected number to be >=1'],
+    ['a non-integer', 2.5, 'limit: Invalid input: expected int'],
+  ])('rejects limit %s at the schema, with no request', async (_label, limit, named) => {
+    routeCdx(cdxHistory(25_000));
+
+    const result = await history({ limit });
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
+    });
+    expect(contentText(result)).toContain(named);
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('closest mode ignores an over-cap limit and answers as it does without one', async () => {
+    routeAvailability(() =>
+      Response.json({
+        archived_snapshots: {
+          closest: {
+            url: 'http://web.archive.org/web/20200104000551/https://example.com/',
+            timestamp: '20200104000551',
+            status: '200',
+            available: true,
+          },
+        },
+      }),
+    );
+    const closest = { url: 'example.com', mode: 'closest', timestamp: '20200101' } as const;
+
+    const withLimit = await runToolContract(iaFindSnapshots, { ...closest, limit: 20_000 });
+    const without = await runToolContract(iaFindSnapshots, closest);
+
+    expect(withLimit.isError).toBeFalsy();
+    expect(withLimit.structuredContent).toEqual(without.structuredContent);
+    expect(calls(isCdx)).toHaveLength(0);
+  });
+});
+
+describe('ia_find_snapshots history-mode collapse', () => {
+  const sentCollapse = () =>
+    calls(isCdx).map((c) => new URL(c.request.url).searchParams.get('collapse'));
+
+  beforeEach(() => {
+    routeCdx(() =>
+      Response.json([
+        ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'],
+        ['20150101000000', '200', 'text/html', 'http://example.com/', 'D', '1'],
+      ]),
+    );
+  });
+
+  it.each([
+    ['omitted', {}],
+    ['blank', { collapse: '' }],
+  ])('sends the timestamp:8 default when collapse is %s', async (_label, collapse) => {
+    await runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history', ...collapse });
+
+    expect(sentCollapse()).toEqual(['timestamp:8']);
+  });
+
+  it('sends timestamp:14 as given', async () => {
+    await runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      collapse: 'timestamp:14',
+    });
+
+    expect(sentCollapse()).toEqual(['timestamp:14']);
+  });
+
+  it('describes blank and omitted as the default and names timestamp:14', () => {
+    const described = iaFindSnapshots.input.shape.collapse.description ?? '';
+
+    expect(described).not.toMatch(/uncollapsed/i);
+    expect(described).toContain('timestamp:14');
+    expect(iaFindSnapshots.description).toContain('timestamp:14');
   });
 });
 
@@ -451,11 +717,11 @@ describe('ia_get_snapshot', () => {
       error: {
         data: {
           reason: 'content_fetch_failed',
-          retryable: false,
           recovery: { hint: expect.stringContaining('wait') },
         },
       },
     });
+    expect(contentText(result)).not.toContain('not retryable');
     expect(calls(isAvailability)).toHaveLength(1);
   });
 
@@ -568,12 +834,11 @@ describe('ia_get_snapshot', () => {
         code: JsonRpcErrorCode.ServiceUnavailable,
         data: {
           reason: 'content_fetch_failed',
-          retryable: false,
           recovery: { hint: expect.stringMatching(/rate-limiting.*wait several minutes/) },
         },
       },
     });
-    expect(contentText(result)).toContain('not retryable');
+    expect(contentText(result)).not.toContain('not retryable');
     expect(calls(isReplay)).toHaveLength(1);
   });
 
@@ -646,6 +911,832 @@ describe('ia_get_snapshot', () => {
     expect(sc.text).toBe('Actualités · Multimédia');
     expect(contentText(result)).toContain('Actualités · Multimédia');
     expect(contentText(result)).not.toContain('�');
+  });
+});
+
+describe('Wayback failures that keep their current handling', () => {
+  it('ia_find_snapshots closest mode returns a non-200 fallback capture with its statuscode', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(cdxRows(['20190102065701', 'http://www.google.com:80/foo', '404']));
+
+    const result = await runToolContract(iaFindSnapshots, {
+      url: 'www.google.com/foo',
+      mode: 'closest',
+      timestamp: '20190102',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      snapshots: [{ timestamp: '20190102065701', statuscode: '404' }],
+    });
+    expect(contentText(result)).toContain('**Status:** 404');
+    expect(calls(isReplay)).toHaveLength(0);
+  });
+
+  it('ia_get_snapshot reports a replay 404 without Memento-Datetime as no_snapshot_available after one request', async () => {
+    routeReplay(
+      () =>
+        new Response('<html><body>Wayback Machine has not archived that URL.</body></html>', {
+          status: 404,
+        }),
+    );
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, {
+        url: 'thisurldoesnotexistinwaybackmachine99999.com',
+        timestamp: '20200601000000',
+      }),
+    );
+
+    const recovery = hint(iaGetSnapshot.errors, 'no_snapshot_available');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining('20200601000000'),
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery } },
+      },
+    });
+    const data = (result.structuredContent as { error: { data: object } }).error.data;
+    expect(data).not.toHaveProperty('body');
+    expect(data).not.toHaveProperty('responseBody');
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      'CDX history',
+      isCdx,
+      (signal: AbortSignal) =>
+        runToolContract(
+          iaFindSnapshots,
+          { url: 'example.com', mode: 'history' },
+          { context: { signal } },
+        ),
+    ],
+    [
+      'the replay fetch',
+      isReplay,
+      (signal: AbortSignal) =>
+        runToolContract(
+          iaGetSnapshot,
+          { url: 'example.com', timestamp: '20200104000551' },
+          { context: { signal } },
+        ),
+    ],
+  ] as const)(
+    'keeps a caller cancellation during %s a cancellation after one request',
+    async (_label, match, run) => {
+      http.route({ match, respond: hang });
+      const controller = new AbortController();
+      const pending = run(controller.signal);
+
+      await vi.waitFor(() => expect(calls(match)).toHaveLength(1));
+      controller.abort();
+      const result = await pending;
+
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.RequestCancelled },
+      });
+      expect(
+        (result.structuredContent as { error: { data?: { reason?: string } } }).error.data?.reason,
+      ).toBeUndefined();
+      expect(calls(match)).toHaveLength(1);
+    },
+  );
+});
+
+describe('Wayback timeouts and network errors surface under the declared reason', () => {
+  /** IA_REQUEST_TIMEOUT_MS at its default. */
+  const REQUEST_TIMEOUT_MS = 30_000;
+
+  /** Runs a tool under fake timers to completion, reporting the fake time it took. */
+  const runTimed = async (run: () => Promise<ToolResult>) => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const pending = run();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    return { result, elapsedMs: Date.now() - start };
+  };
+
+  const history = () => runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history' });
+  const findClosest = () =>
+    runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'closest',
+      timestamp: '20200101',
+    });
+  const getClosest = () =>
+    runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200101' });
+  const getExact = () =>
+    runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000551' });
+
+  const expectDeclared = (result: ToolResult, reason: string, recovery: string) => {
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason, recovery: { hint: recovery } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    expect(contentText(result)).not.toContain('not retryable');
+  };
+
+  describe.each([
+    ['headers never arrive', hang],
+    ['the body stalls', stall('[["timestamp"')],
+  ])('when %s', (_label, respond) => {
+    it('CDX history answers cdx_unavailable after one request, within one request timeout', async () => {
+      routeCdx(respond);
+
+      const { result, elapsedMs } = await runTimed(history);
+
+      expectDeclared(result, 'cdx_unavailable', hint(iaFindSnapshots.errors, 'cdx_unavailable'));
+      expect(calls(isCdx)).toHaveLength(1);
+      expect(elapsedMs).toBeLessThanOrEqual(REQUEST_TIMEOUT_MS);
+    });
+
+    it('the Availability API answers availability_unavailable after one request, with no fallback', async () => {
+      routeAvailability(respond);
+
+      const { result, elapsedMs } = await runTimed(findClosest);
+
+      expectDeclared(
+        result,
+        'availability_unavailable',
+        hint(iaFindSnapshots.errors, 'availability_unavailable'),
+      );
+      expect(calls(isAvailability)).toHaveLength(1);
+      expect(calls(isCdx)).toHaveLength(0);
+      expect(elapsedMs).toBeLessThanOrEqual(REQUEST_TIMEOUT_MS);
+    });
+
+    it('ia_get_snapshot answers an Availability timeout as content_fetch_failed after one request', async () => {
+      routeAvailability(respond);
+
+      const { result } = await runTimed(getClosest);
+
+      expectDeclared(
+        result,
+        'content_fetch_failed',
+        hint(iaGetSnapshot.errors, 'content_fetch_failed'),
+      );
+      expect(calls(isAvailability)).toHaveLength(1);
+      expect(calls(isCdx)).toHaveLength(0);
+      expect(calls(isReplay)).toHaveLength(0);
+    });
+
+    it('the replay fetch answers content_fetch_failed after one request', async () => {
+      routeReplay(respond);
+
+      const { result, elapsedMs } = await runTimed(getExact);
+
+      expectDeclared(
+        result,
+        'content_fetch_failed',
+        hint(iaGetSnapshot.errors, 'content_fetch_failed'),
+      );
+      expect(calls(isReplay)).toHaveLength(1);
+      expect(elapsedMs).toBeLessThanOrEqual(REQUEST_TIMEOUT_MS);
+    });
+  });
+
+  it('the replay fetch answers on the lookup path too, after one replay request', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(cdxRows(['20200101231916', 'https://example.com/', '200']));
+    routeReplay(hang);
+
+    const { result } = await runTimed(getClosest);
+
+    expectDeclared(
+      result,
+      'content_fetch_failed',
+      hint(iaGetSnapshot.errors, 'content_fetch_failed'),
+    );
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it.each([
+    ['CDX history', 'cdx_unavailable', isCdx, history, iaFindSnapshots],
+    [
+      'the Availability API',
+      'availability_unavailable',
+      isAvailability,
+      findClosest,
+      iaFindSnapshots,
+    ],
+    ['ia_get_snapshot’s lookup', 'content_fetch_failed', isAvailability, getClosest, iaGetSnapshot],
+    ['the replay fetch', 'content_fetch_failed', isReplay, getExact, iaGetSnapshot],
+  ] as const)(
+    'a refused connection to %s surfaces as %s after four attempts',
+    async (_label, reason, match, run, def) => {
+      http.route({ match, respond: refused });
+
+      const { result } = await runTimed(run);
+
+      expectDeclared(result, reason, hint(def.errors, reason));
+      expect(calls(match)).toHaveLength(4);
+      expect(http.calls).toHaveLength(4);
+    },
+  );
+
+  it.each([
+    ['CDX history', 'cdx_unavailable', isCdx, history, iaFindSnapshots],
+    [
+      'the Availability API',
+      'availability_unavailable',
+      isAvailability,
+      findClosest,
+      iaFindSnapshots,
+    ],
+    ['ia_get_snapshot’s lookup', 'content_fetch_failed', isAvailability, getClosest, iaGetSnapshot],
+    ['the replay fetch', 'content_fetch_failed', isReplay, getExact, iaGetSnapshot],
+  ] as const)(
+    'a connection dropped mid-body by %s surfaces as %s after four attempts',
+    async (_label, reason, match, run, def) => {
+      http.route({ match, respond: dropped('[["timestamp"') });
+
+      const { result } = await runTimed(run);
+
+      expectDeclared(result, reason, hint(def.errors, reason));
+      expect(calls(match)).toHaveLength(4);
+      expect(http.calls).toHaveLength(4);
+    },
+  );
+
+  it('a CDX fallback dropped mid-body surfaces as cdx_unavailable after one request', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(dropped('[["timestamp"'));
+
+    const { result } = await runTimed(findClosest);
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(FALLBACK_MESSAGE),
+        data: { reason: 'cdx_unavailable' },
+      },
+    });
+    expect(calls(isCdx)).toHaveLength(1);
+  });
+
+  it('a replay 504 is retried as before and surfaces as content_fetch_failed', async () => {
+    routeReplay(() => new Response('Gateway Timeout', { status: 504 }));
+
+    const result = await runWithRetries(getExact);
+
+    expectDeclared(
+      result,
+      'content_fetch_failed',
+      hint(iaGetSnapshot.errors, 'content_fetch_failed'),
+    );
+    expect(calls(isReplay)).toHaveLength(4);
+    const data = (result.structuredContent as { error: { data: object } }).error.data;
+    expect(data).not.toHaveProperty('body');
+    expect(data).not.toHaveProperty('responseBody');
+  });
+});
+
+describe('ia_get_snapshot on an archived error capture', () => {
+  const recovery = () => hint(iaGetSnapshot.errors, 'no_snapshot_available');
+
+  it.each([
+    [503, 'https://httpstat.us/503', '20190419141856', 'Fri, 19 Apr 2019 14:18:56 GMT'],
+    [
+      429,
+      'http://ipv4.google.com:80/sorry/index',
+      '20190511051439',
+      'Sat, 11 May 2019 05:14:39 GMT',
+    ],
+    [500, 'https://httpstat.us/500', '20190419141857', 'Fri, 19 Apr 2019 14:18:57 GMT'],
+    [404, 'http://google.com:80/foo', '20190102065701', 'Wed, 02 Jan 2019 06:57:01 GMT'],
+  ])(
+    'answers an archived %i on the exact path as no_snapshot_available after one request',
+    async (status, url, timestamp, mementoDatetime) => {
+      routeReplay(archivedError(status, mementoDatetime));
+
+      const result = await runWithRetries(() => runToolContract(iaGetSnapshot, { url, timestamp }));
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: expect.stringMatching(new RegExp(`${timestamp}.*HTTP ${status}`)),
+          data: { reason: 'no_snapshot_available', recovery: { hint: recovery() } },
+        },
+      });
+      const text = contentText(result);
+      expect(text).toContain(timestamp);
+      expect(text).toContain(`Recovery: ${recovery()}`);
+      const data = (result.structuredContent as { error: { data: object } }).error.data;
+      expect(data).not.toHaveProperty('body');
+      expect(data).not.toHaveProperty('responseBody');
+      expect(calls(isReplay)).toHaveLength(1);
+    },
+  );
+
+  it('names the capture from Memento-Datetime, not the requested timestamp', async () => {
+    routeReplay(archivedError(404, 'Wed, 02 Jan 2019 06:57:01 GMT'));
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'http://google.com:80/foo',
+      timestamp: '20190102000000',
+    });
+
+    expect((result.structuredContent as { error: { message: string } }).error.message).toMatch(
+      /20190102065701.*HTTP 404/,
+    );
+  });
+
+  it('names the raw Memento-Datetime when it is not an HTTP date', async () => {
+    routeReplay(archivedError(503, 'not-a-date'));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, {
+        url: 'https://httpstat.us/503',
+        timestamp: '20190419141856',
+      }),
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        message: expect.stringContaining('at not-a-date is an archived HTTP 503'),
+        data: { reason: 'no_snapshot_available' },
+      },
+    });
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it('answers an archived 404 reached through the closest lookup as no_snapshot_available', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(cdxRows(['20190102065701', 'http://www.google.com:80/foo', '404']));
+    routeReplay(archivedError(404, 'Wed, 02 Jan 2019 06:57:01 GMT'));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'www.google.com/foo', timestamp: '20190102' }),
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringMatching(/20190102065701.*HTTP 404/),
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery() } },
+      },
+    });
+    const data = (result.structuredContent as { error: { data: object } }).error.data;
+    expect(data).not.toHaveProperty('body');
+    expect(data).not.toHaveProperty('responseBody');
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it('answers an archived 503 reached through the closest lookup after one replay request', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(cdxRows(['20190419141856', 'https://httpstat.us/503', '503']));
+    routeReplay(archivedError(503, 'Fri, 19 Apr 2019 14:18:56 GMT'));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'httpstat.us/503', timestamp: '2019' }),
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'no_snapshot_available' } },
+    });
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+});
+
+describe('ia_get_snapshot on a replay 4xx without Memento-Datetime', () => {
+  /** About 500 bytes of Wayback playback HTML, as the error body of a refused replay. */
+  const PLAYBACK = `<!DOCTYPE html><html lang="en"><head><title>Wayback Machine</title></head><body>${'<div class="playback">'.repeat(20)}</body></html>`;
+  /** Wayback's own answer: the status, its playback page, and no Memento-Datetime. */
+  const refused = (status: number) => () =>
+    new Response(PLAYBACK, { status, headers: { 'content-type': 'text/html' } });
+
+  const errorOf = (result: ToolResult) =>
+    (result.structuredContent as { error: { code: number; message: string; data: object } }).error;
+
+  const expectNoBody = (result: ToolResult) => {
+    expect(errorOf(result).data).not.toHaveProperty('body');
+    expect(errorOf(result).data).not.toHaveProperty('responseBody');
+    expect(JSON.stringify(result.structuredContent)).not.toContain('playback');
+    expect(contentText(result)).not.toContain('playback');
+  };
+
+  const EXCLUDED_HINT = /no capture of (it|this URL) can be read/i;
+
+  it('answers an excluded site (403) on the exact path as no_snapshot_available with its own hint', async () => {
+    routeReplay(refused(403));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, {
+        url: 'https://excluded.example.com/',
+        timestamp: '20230101000000',
+      }),
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining(
+          'The Wayback Machine does not serve captures of https://excluded.example.com/',
+        ),
+        data: {
+          reason: 'no_snapshot_available',
+          recovery: { hint: expect.stringMatching(EXCLUDED_HINT) },
+        },
+      },
+    });
+    const declared = hint(iaGetSnapshot.errors, 'no_snapshot_available');
+    expect(contentText(result)).toMatch(EXCLUDED_HINT);
+    expect(contentText(result)).not.toContain(declared);
+    expectNoBody(result);
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it('answers an excluded site reached through the closest lookup the same way', async () => {
+    routeAvailability(() =>
+      Response.json({
+        archived_snapshots: {
+          closest: {
+            url: 'http://web.archive.org/web/20230101000000/https://excluded.example.com/',
+            timestamp: '20230101000000',
+            status: '200',
+            available: true,
+          },
+        },
+      }),
+    );
+    routeReplay(refused(403));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'excluded.example.com', timestamp: '2023' }),
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining('does not serve captures of excluded.example.com'),
+        data: {
+          reason: 'no_snapshot_available',
+          recovery: { hint: expect.stringMatching(EXCLUDED_HINT) },
+        },
+      },
+    });
+    expectNoBody(result);
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it.each([410, 451])(
+    'answers a replay %i as a URL the Wayback Machine does not serve',
+    async (status) => {
+      routeReplay(refused(status));
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000551' }),
+      );
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: expect.stringContaining(
+            `does not serve captures of example.com (HTTP ${status})`,
+          ),
+          data: {
+            reason: 'no_snapshot_available',
+            recovery: { hint: expect.stringMatching(EXCLUDED_HINT) },
+          },
+        },
+      });
+      expectNoBody(result);
+      expect(calls(isReplay)).toHaveLength(1);
+    },
+  );
+
+  it.each([400, 401, 402, 405, 409, 415, 418, 422])(
+    'answers a replay %i as no_snapshot_available naming the status, after one request',
+    async (status) => {
+      routeReplay(refused(status));
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000551' }),
+      );
+
+      const recovery = hint(iaGetSnapshot.errors, 'no_snapshot_available');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: expect.stringContaining(`HTTP ${status}`),
+          data: { reason: 'no_snapshot_available', recovery: { hint: recovery } },
+        },
+      });
+      expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expectNoBody(result);
+      expect(calls(isReplay)).toHaveLength(1);
+    },
+  );
+
+  it.each([408, 425])(
+    'retries a replay %i like a 5xx and surfaces content_fetch_failed',
+    async (status) => {
+      routeReplay(refused(status));
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000551' }),
+      );
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: {
+            reason: 'content_fetch_failed',
+            recovery: { hint: hint(iaGetSnapshot.errors, 'content_fetch_failed') },
+          },
+        },
+      });
+      expectNoBody(result);
+      expect(calls(isReplay)).toHaveLength(4);
+    },
+  );
+});
+
+describe('CDX and Availability API 4xx answers', () => {
+  /** What a lookup API sends with a refusal: an archive.org error page, which must stay off the wire. */
+  const PAGE = '<!DOCTYPE html><html><body>lookup-error-page-marker</body></html>';
+  const refusedWith = (status: number) => () =>
+    new Response(PAGE, { status, headers: { 'content-type': 'text/html' } });
+
+  const errorOf = (result: ToolResult) =>
+    (result.structuredContent as { error: { code: number; message: string; data: object } }).error;
+
+  const expectNoBody = (result: ToolResult) => {
+    expect(errorOf(result).data).not.toHaveProperty('body');
+    expect(errorOf(result).data).not.toHaveProperty('responseBody');
+    expect(JSON.stringify(result.structuredContent)).not.toContain('lookup-error-page-marker');
+    expect(contentText(result)).not.toContain('lookup-error-page-marker');
+  };
+
+  const EXCLUDED_HINT = /no capture of (it|this URL) can be read/i;
+
+  /** The excluded-site answer: no_snapshot_available, naming the URL, with the cannot-be-read hint. */
+  const expectNotServed = (result: ToolResult, url: string, status: number) => {
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining(
+          `The Wayback Machine does not serve captures of ${url} (HTTP ${status}`,
+        ),
+        data: {
+          reason: 'no_snapshot_available',
+          recovery: { hint: expect.stringMatching(EXCLUDED_HINT) },
+        },
+      },
+    });
+    expect(contentText(result)).toMatch(EXCLUDED_HINT);
+    expect(contentText(result)).not.toMatch(/did not complete|retry later/i);
+    expectNoBody(result);
+  };
+
+  it.each([403, 410, 451])(
+    'ia_find_snapshots history answers a CDX %i as a URL the Wayback Machine does not serve, after one request',
+    async (status) => {
+      routeCdx(refusedWith(status));
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaFindSnapshots, { url: 'excluded.example.com', mode: 'history' }),
+      );
+
+      expect(calls(isCdx)).toHaveLength(1);
+      expectNotServed(result, 'excluded.example.com', status);
+    },
+  );
+
+  it('ia_find_snapshots closest answers a CDX fallback 403 the same way, not as cdx_unavailable', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(refusedWith(403));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaFindSnapshots, {
+        url: 'excluded.example.com',
+        mode: 'closest',
+        timestamp: '2023',
+      }),
+    );
+
+    expect(calls(isCdx)).toHaveLength(1);
+    expectNotServed(result, 'excluded.example.com', 403);
+  });
+
+  it('ia_get_snapshot with a short timestamp answers a CDX fallback 403 the same way, with no replay', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(refusedWith(403));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'excluded.example.com', timestamp: '2023' }),
+    );
+
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(calls(isReplay)).toHaveLength(0);
+    expectNotServed(result, 'excluded.example.com', 403);
+  });
+
+  it('ia_find_snapshots closest answers an Availability 403 the same way, with no fallback', async () => {
+    routeAvailability(refusedWith(403));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaFindSnapshots, {
+        url: 'excluded.example.com',
+        mode: 'closest',
+        timestamp: '2023',
+      }),
+    );
+
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(0);
+    expectNotServed(result, 'excluded.example.com', 403);
+  });
+
+  it.each([400, 404])(
+    'ia_find_snapshots history answers a CDX %i as cdx_unavailable that a retry cannot fix, after one request',
+    async (status) => {
+      routeCdx(refusedWith(status));
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history', from: 'abc' }),
+      );
+
+      expect(calls(isCdx)).toHaveLength(1);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining(`HTTP ${status}`),
+          data: {
+            reason: 'cdx_unavailable',
+            status,
+            retryable: false,
+            recovery: { hint: expect.stringMatching(/will not help.*from, to, and resume_key/) },
+          },
+        },
+      });
+      expect(contentText(result)).not.toContain(hint(iaFindSnapshots.errors, 'cdx_unavailable'));
+      expectNoBody(result);
+    },
+  );
+
+  it('ia_find_snapshots closest answers a CDX fallback 400 without promising a retry', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(refusedWith(400));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'closest',
+        timestamp: '2023',
+      }),
+    );
+
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(FALLBACK_MESSAGE),
+        data: {
+          reason: 'cdx_unavailable',
+          retryable: false,
+          recovery: { hint: expect.stringContaining('history mode') },
+        },
+      },
+    });
+    expect(contentText(result)).not.toMatch(/retry later/i);
+    expectNoBody(result);
+  });
+
+  it.each([
+    ['ia_find_snapshots', 'availability_unavailable', iaFindSnapshots],
+    ['ia_get_snapshot', 'content_fetch_failed', iaGetSnapshot],
+  ] as const)(
+    '%s answers an Availability 400 as %s that a retry cannot fix, after one request',
+    async (_name, reason, def) => {
+      routeAvailability(refusedWith(400));
+
+      const result = await runWithRetries(() =>
+        def === iaFindSnapshots
+          ? runToolContract(iaFindSnapshots, {
+              url: 'example.com',
+              mode: 'closest',
+              timestamp: '2023',
+            })
+          : runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '2023' }),
+      );
+
+      expect(calls(isAvailability)).toHaveLength(1);
+      expect(calls(isCdx)).toHaveLength(0);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: {
+            reason,
+            retryable: false,
+            recovery: { hint: expect.stringMatching(/will not help.*url and timestamp/) },
+          },
+        },
+      });
+      expect(contentText(result)).not.toContain(hint(def.errors, reason));
+      expectNoBody(result);
+    },
+  );
+});
+
+describe('Wayback log level for an upstream non-2xx', () => {
+  const page = (status: number) => () =>
+    new Response('<!DOCTYPE html><html><body>refusal page</body></html>', {
+      status,
+      headers: { 'content-type': 'text/html' },
+    });
+
+  let error: ReturnType<typeof vi.spyOn>;
+  let debug: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    error = vi.spyOn(logger, 'error');
+    debug = vi.spyOn(logger, 'debug');
+  });
+
+  afterEach(() => {
+    error.mockRestore();
+    debug.mockRestore();
+  });
+
+  /** The fetch's own records of an HTTP `status` answer, by level. */
+  const statusRecords = (status: number) => {
+    const pattern = new RegExp(`^Fetch failed for .* with status ${status}\\.$`);
+    const matching = (spy: typeof error) =>
+      spy.mock.calls.filter(([message]) => typeof message === 'string' && pattern.test(message));
+    return { error: matching(error).length, debug: matching(debug).length };
+  };
+
+  const getExact = () =>
+    runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000551' }),
+    );
+  const history = () =>
+    runWithRetries(() => runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history' }));
+
+  it.each([403, 410, 451, 404])(
+    'logs a replay %i, an expected refusal, at debug and never at error',
+    async (status) => {
+      routeReplay(page(status));
+
+      const result = await getExact();
+
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshot_available' } },
+      });
+      expect(statusRecords(status)).toEqual({ error: 0, debug: 1 });
+    },
+  );
+
+  it.each([403, 410, 451])(
+    'logs a CDX %i, the URL not being served, at debug and never at error',
+    async (status) => {
+      routeCdx(page(status));
+
+      const result = await history();
+
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshot_available' } },
+      });
+      expect(statusRecords(status)).toEqual({ error: 0, debug: 1 });
+    },
+  );
+
+  it('logs an Availability 403 at debug and never at error', async () => {
+    routeAvailability(page(403));
+
+    await runWithRetries(() =>
+      runToolContract(iaFindSnapshots, {
+        url: 'excluded.example.com',
+        mode: 'closest',
+        timestamp: '2023',
+      }),
+    );
+
+    expect(statusRecords(403)).toEqual({ error: 0, debug: 1 });
+  });
+
+  it('keeps a CDX 404, a refusal of the query rather than the URL, at error', async () => {
+    routeCdx(page(404));
+
+    await history();
+
+    expect(statusRecords(404)).toEqual({ error: 1, debug: 0 });
+  });
+
+  it.each([400, 503])('keeps a replay %i at error', async (status) => {
+    routeReplay(page(status));
+
+    await getExact();
+
+    expect(statusRecords(status).debug).toBe(0);
+    expect(statusRecords(status).error).toBe(calls(isReplay).length);
   });
 });
 

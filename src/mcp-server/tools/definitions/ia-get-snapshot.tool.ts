@@ -5,7 +5,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWaybackService } from '@/services/wayback/wayback-service.js';
+import {
+  getWaybackService,
+  NOT_SERVED,
+  NOT_SERVED_HINT,
+  notServedMessage,
+} from '@/services/wayback/wayback-service.js';
 
 export const iaGetSnapshot = tool('ia_get_snapshot', {
   title: 'Get Wayback Machine Snapshot Content',
@@ -72,9 +77,15 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     {
       reason: 'no_snapshot_available',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No capture exists near the requested timestamp for this URL.',
+      when:
+        'No capture exists near the requested timestamp for this URL, the capture there is an ' +
+        'archived error page — the HTTP 4xx or 5xx the site itself returned when it was ' +
+        'captured — or the Wayback Machine refused the replay request with an HTTP 4xx, as it ' +
+        'does for a site excluded from the archive; or the closest-capture lookup answered ' +
+        'HTTP 403, 410, or 451, the Wayback Machine declining to serve the URL at all.',
       recovery:
-        'Use ia_find_snapshots in history mode to discover what snapshots actually exist for this URL.',
+        'Use ia_find_snapshots in history mode to discover what snapshots actually exist for this URL; ' +
+        'status_filter "200" lists only captures with readable content.',
       severity: 'warning',
     },
     {
@@ -82,7 +93,9 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when:
         'The archived page could not be fetched, or its nearest capture could not be looked up — ' +
-        'the Wayback Machine is temporarily unreachable.',
+        'the Wayback Machine answered HTTP 5xx after retries or 429, refused the lookup with ' +
+        'another 4xx, sent an unreadable lookup response, did not answer within the request ' +
+        'timeout, or could not be reached.',
       recovery: 'The Wayback Machine is temporarily unavailable; retry in a few seconds.',
     },
   ],
@@ -99,9 +112,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     const isExactTimestamp = /^\d{14}$/.test(timestamp);
 
     // Two upstream failures map onto declared contract entries so callers receive the
-    // reason and recovery hint: on the exact-timestamp path a 404 means no capture at
-    // that timestamp, and a ServiceUnavailable from the lookup or the page fetch (after
-    // retries) means the Wayback Machine is unreachable.
+    // reason and recovery hint: a NotFound from the page fetch means no readable capture
+    // there — none at all, or an archived error page — and a ServiceUnavailable from the
+    // lookup or the page fetch means the Wayback Machine is unreachable or refused the
+    // request. The lookup's own no_snapshot_available passes through as thrown.
     let fetching = false;
     try {
       const resolved = isExactTimestamp
@@ -126,11 +140,26 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         resolved_status: content.status,
       };
     } catch (err) {
-      if (isExactTimestamp && err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+      if (fetching && err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        const { captureTimestamp, status } = err.data ?? {};
+        const refusal = captureTimestamp === undefined && typeof status === 'number' ? status : 0;
+        if (NOT_SERVED.has(refusal)) {
+          throw ctx.fail(
+            'no_snapshot_available',
+            notServedMessage(input.url, refusal),
+            { recovery: { hint: NOT_SERVED_HINT } },
+            { cause: err },
+          );
+        }
         throw ctx.fail(
           'no_snapshot_available',
-          `No capture found at ${input.url} for timestamp ${timestamp}.`,
-          { ...ctx.recoveryFor('no_snapshot_available') },
+          captureTimestamp !== undefined
+            ? `The capture of ${input.url} at ${captureTimestamp} is an archived HTTP ${status} ` +
+                'error page — the site returned that error when it was captured, so the capture holds no copy of the page itself.'
+            : refusal && refusal !== 404
+              ? `The Wayback Machine refused the replay request for ${input.url} at ${timestamp} with HTTP ${refusal}.`
+              : `No capture found at ${input.url} for timestamp ${timestamp}.`,
+          ctx.recoveryFor('no_snapshot_available'),
           { cause: err },
         );
       }
@@ -142,7 +171,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         throw ctx.fail(
           'content_fetch_failed',
           fetching
-            ? `Could not fetch the archived page for ${input.url} near ${timestamp}.`
+            ? `Could not fetch the archived page for ${input.url} near ${timestamp}: ${err.message}`
             : err.message,
           {
             ...ctx.recoveryFor('content_fetch_failed'),

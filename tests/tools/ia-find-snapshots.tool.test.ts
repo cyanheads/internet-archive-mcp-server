@@ -218,7 +218,7 @@ describe('iaFindSnapshots', () => {
       });
     });
 
-    it('passes collapse="" as undefined to service (uncollapsed)', async () => {
+    it('passes collapse="" as undefined to service, which applies its timestamp:8 default', async () => {
       mockService.fetchHistory.mockResolvedValue({
         records: [
           {

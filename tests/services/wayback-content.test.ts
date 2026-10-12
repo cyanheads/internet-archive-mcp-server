@@ -24,6 +24,11 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
 
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { WaybackService } from '@/services/wayback/wayback-service.js';
+import {
+  CPU_TIMED_TEST_TIMEOUT_MS,
+  cpuMsPerCall,
+  expectLinearScaling,
+} from '../helpers/cpu-time.js';
 
 const SNAPSHOT = 'https://web.archive.org/web/20120601000000/https://www.nasa.gov';
 
@@ -259,33 +264,25 @@ describe('fetchContent scan time (#8)', () => {
     ['meta charset= then spaces', (n) => `<meta charset=${' '.repeat(n - 14)}`],
   ];
 
-  /** Best per-call time over three batches of roughly 320k characters each. */
-  const perCallMs = async (html: string): Promise<number> => {
+  /** CPU ceiling for one 160k-character call: about 10× the slowest case measured (2.8 ms). */
+  const LINEAR_160K_MAX_CPU_MS = 30;
+
+  /** One fetchContent call over `html`, as a thunk to time. */
+  const fetchOver = (html: string) => {
     const svc = buildService();
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
-    const reps = Math.max(1, Math.round(320_000 / html.length));
-    let best = Number.POSITIVE_INFINITY;
-    for (let batch = 0; batch < 3; batch++) {
-      const start = performance.now();
-      for (let i = 0; i < reps; i++) {
-        fetchWithTimeout.mockResolvedValueOnce(served(html));
-        await svc.fetchContent(SNAPSHOT, ctx, 100);
-      }
-      best = Math.min(best, (performance.now() - start) / reps);
-    }
-    return best;
+    return () => {
+      fetchWithTimeout.mockResolvedValueOnce(served(html));
+      return svc.fetchContent(SNAPSHOT, ctx, 100);
+    };
   };
 
   it.each(WORST_CASES)(
     'scans %s in linear time',
     async (_name, build) => {
-      const t5k = await perCallMs(build(5_000));
-      const t80k = await perCallMs(build(80_000));
-      // Linear is ×16 across the span, quadratic ×256; headroom for per-call overhead and load.
-      expect(t80k / Math.max(t5k, 0.005)).toBeLessThan(64);
-      expect(t80k).toBeLessThan(250);
+      await expectLinearScaling((n) => fetchOver(build(n)), LINEAR_160K_MAX_CPU_MS);
     },
-    120_000,
+    CPU_TIMED_TEST_TIMEOUT_MS,
   );
 
   it.each([
@@ -295,13 +292,11 @@ describe('fetchContent scan time (#8)', () => {
     ['<script>', '<script>'],
     ['<a"', '<a"'],
   ])(
-    'strips 40,000 repetitions of %s within 1 s',
+    'strips 40,000 repetitions of %s within 1 s of CPU',
     async (_name, unit) => {
-      const start = performance.now();
-      await fetchContent(served(unit.repeat(40_000)));
-      expect(performance.now() - start).toBeLessThan(1_000);
+      expect(await cpuMsPerCall(fetchOver(unit.repeat(40_000)))).toBeLessThan(1_000);
     },
-    60_000,
+    CPU_TIMED_TEST_TIMEOUT_MS,
   );
 });
 
@@ -500,7 +495,12 @@ describe('fetchContent guessed charset (#25)', () => {
   });
 });
 
-describe('fetchContent byte ceiling (#28)', () => {
+/**
+ * Each case streams and decodes about 4 MiB: a few hundred milliseconds on an idle machine,
+ * but past Vitest's 5 s default when other processes hold the cores. Nothing here asserts
+ * on time, so the wall-clock timeout only needs room never to decide the result.
+ */
+describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
   const CEILING = 4 * 1024 * 1024;
   const CHUNK = 64 * 1024;
 
