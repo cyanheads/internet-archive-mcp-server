@@ -421,5 +421,28 @@ describe('iaSearchItems', () => {
       expect(text).toContain('A, B');
       expect(text).toContain('c1, c2');
     });
+
+    it('renders list-valued title and date, and names a cut creator list', () => {
+      const output = {
+        items: [
+          {
+            identifier: 'listy',
+            title: ['Part One', 'Part Two'],
+            date: ['2012-06-26T00:00:00Z', '2012-08-14T00:00:00Z'],
+            creator: ['A', 'B'],
+            creator_count: 409,
+          },
+        ],
+        total_found: 1,
+        page: 1,
+        rows: 50,
+      };
+      const text = iaSearchItems.format!(output)
+        .map((b) => (b as { type: string; text: string }).text)
+        .join('');
+      expect(text).toContain('## Part One, Part Two');
+      expect(text).toContain('**Date:** 2012-06-26T00:00:00Z, 2012-08-14T00:00:00Z');
+      expect(text).toContain('**Creator:** A, B (2 of 409; ia_get_item lists all)');
+    });
   });
 });
