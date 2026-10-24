@@ -242,6 +242,68 @@ describe('ia_search_items input validation', () => {
   });
 });
 
+describe('ia_search_items Gregorian date bounds', () => {
+  it.each([
+    [{ date_from: '1950', date_to: '1959' }, '1950-01-01 TO 1959-12-31'],
+    [{ date_to: '2000-02' }, '* TO 2000-02-29'],
+    [{ date_to: '1900-02' }, '* TO 1900-02-28'],
+    [{ date_from: ' 2024-02 ' }, '2024-02-01 TO *'],
+    [{ date_from: '0001', date_to: '9999' }, '0001-01-01 TO 9999-12-31'],
+    [{ date_from: '0000-02-29' }, '0000-02-29 TO *'],
+  ])('expands partial bounds %j', async (bounds, range) => {
+    routeSearch(1, [{ identifier: 'date-match' }]);
+    const result = await runToolContract(iaSearchItems, { query: 'tesla', ...bounds });
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([`tesla AND date:[${range}]`]);
+    expect(result.structuredContent).toMatchObject({ items: [{ identifier: 'date-match' }] });
+    expect(contentText(result)).toContain('date-match');
+  });
+
+  it.each([
+    'yesterday',
+    '2024-00',
+    '2024-13',
+    '2024-02-30',
+    '1900-02-29',
+    '2024-04-31',
+    '2024-1',
+    '2024-01-01T00:00:00Z',
+  ])('rejects impossible or unsupported date %s before HTTP on both surfaces', async (value) => {
+    http.route({
+      match: () => true,
+      respond: () => Response.json({ response: { numFound: 0, docs: [] } }),
+    });
+    for (const field of ['date_from', 'date_to']) {
+      expect(iaSearchItems.input.safeParse({ query: 'tesla', [field]: value }).success).toBe(true);
+      const result = await runToolContract(iaSearchItems, { query: 'tesla', [field]: value });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'invalid_date_range', field },
+        },
+      });
+      expect(contentText(result)).toContain(field);
+      expect(contentText(result)).toContain('YYYY-MM-DD');
+      expect(contentText(result)).toContain('Recovery:');
+    }
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it.each([
+    [{ date_from: ' 2024-02-29 ', date_to: '2023-01-01' }, 'date:[2024-02-29 TO 2023-01-01]'],
+    [{ date_from: ' ', date_to: '' }, undefined],
+    [{}, undefined],
+  ])('preserves full dates, reversed ranges and absent bounds: %j', async (bounds, clause) => {
+    routeSearch(0);
+    const result = await runToolContract(iaSearchItems, { query: 'tesla', ...bounds });
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([clause ? `tesla AND ${clause}` : 'tesla']);
+    expect(result.structuredContent).toMatchObject({ items: [], total_found: 0 });
+    expect(contentText(result)).toContain('No items matched');
+  });
+});
+
 describe('ia_search_items sort order sent upstream', () => {
   it.each([
     ['the default', {}, ['downloads desc', 'identifier asc']],
@@ -660,7 +722,7 @@ describe('ia_search_items Advanced Search error bodies', () => {
           data: { reason: 'invalid_query', recovery: { hint: hint('invalid_query') } },
         },
       });
-      expect(contentText(result)).toContain(upstream);
+      expect(contentText(result)).toContain(upstream.replaceAll('[', '\\[').replaceAll(']', '\\]'));
       expect(contentText(result)).toContain(`Recovery: ${hint('invalid_query')}`);
       expect(contentText(result)).not.toContain('No items matched');
       expect(http.calls).toHaveLength(1);

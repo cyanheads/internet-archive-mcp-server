@@ -5,7 +5,12 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { invalidParams, type McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  invalidParams,
+  type McpError,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, getUserAgent } from '@/config/server-config.js';
@@ -81,15 +86,33 @@ function solrEscape(value: string): string {
 }
 
 /**
- * Validate and return a Solr date range boundary.
- * Accepts YYYY-MM-DD strings or undefined (returns "*").
- * Rejects anything that doesn't match the expected date format to prevent range injection.
+ * Expand a real Gregorian year, month or date to the appropriate inclusive Solr bound.
+ * Blank values leave that side unbounded; impossible dates fail before any HTTP request.
  */
-function sanitizeDateRange(value: string | undefined): string {
-  if (!value) return '*';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  // Fall back to wildcard for anything that doesn't look like a date
-  return '*';
+function dateBoundary(
+  value: string | undefined,
+  field: 'date_from' | 'date_to',
+  ctx: Context,
+): string {
+  const text = value?.trim();
+  if (!text) return '*';
+  const match = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(text);
+  const year = Number(match?.[1]);
+  const month = Number(match?.[2] ?? (field === 'date_from' ? 1 : 12));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = month === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  const day = Number(match?.[3] ?? (field === 'date_from' ? 1 : days));
+  if (!match || month < 1 || month > 12 || day < 1 || day > days) {
+    throw validationError(
+      `${field} must be a real Gregorian date in YYYY, YYYY-MM, or YYYY-MM-DD format.`,
+      {
+        reason: 'invalid_date_range',
+        field,
+        ...ctx.recoveryFor('invalid_date_range'),
+      },
+    );
+  }
+  return `${match[1]}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
 /** Parameters for the search method. */
@@ -128,6 +151,8 @@ export class ArchiveSearchService {
    * A caller cancellation or caller-side deadline propagates as the fetch threw it.
    */
   search(params: SearchParams, ctx: Context): Promise<SearchResult> {
+    const from = dateBoundary(params.dateFrom, 'date_from', ctx);
+    const to = dateBoundary(params.dateTo, 'date_to', ctx);
     return withRetry(
       async () => {
         // Build the Solr query string, appending metadata filters as needed.
@@ -137,9 +162,7 @@ export class ArchiveSearchService {
         if (params.collection) q += ` AND collection:"${solrEscape(params.collection)}"`;
         if (params.creator) q += ` AND creator:"${solrEscape(params.creator)}"`;
         if (params.language) q += ` AND language:"${solrEscape(params.language)}"`;
-        if (params.dateFrom || params.dateTo) {
-          const from = sanitizeDateRange(params.dateFrom);
-          const to = sanitizeDateRange(params.dateTo);
+        if (from !== '*' || to !== '*') {
           q += ` AND date:[${from} TO ${to}]`;
         }
 

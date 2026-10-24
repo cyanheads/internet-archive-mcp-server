@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
 
 /** The complete Advanced Search mediatype vocabulary. Solr matches it exactly and case-sensitively. */
@@ -90,11 +91,15 @@ export const iaSearchItems = tool('ia_search_items', {
     date_from: z
       .string()
       .optional()
-      .describe('Start of date range filter in YYYY-MM-DD format. Example: "1900-01-01".'),
+      .describe(
+        'Inclusive start of date range: YYYY, YYYY-MM, or YYYY-MM-DD. A year or month starts on its first day; blank means no lower bound. Must be a real Gregorian date.',
+      ),
     date_to: z
       .string()
       .optional()
-      .describe('End of date range filter in YYYY-MM-DD format. Example: "1999-12-31".'),
+      .describe(
+        'Inclusive end of date range: YYYY, YYYY-MM, or YYYY-MM-DD. A year or month ends on its last day; blank means no upper bound. Must be a real Gregorian date.',
+      ),
     language: z
       .string()
       .optional()
@@ -213,7 +218,20 @@ export const iaSearchItems = tool('ia_search_items', {
       ),
   },
 
+  enrichmentTrailer: {
+    notice: { render: (value) => escapeMarkdownInline(String(value)) },
+  },
+
   errors: [
+    {
+      reason: 'invalid_date_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'date_from or date_to is not a real Gregorian year, month, or date.',
+      recovery:
+        'Set the named date_from or date_to field to YYYY, YYYY-MM, or YYYY-MM-DD with a real Gregorian date, or omit it to leave that side unbounded.',
+      severity: 'warning',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_mediatype',
       code: JsonRpcErrorCode.InvalidParams,
@@ -360,19 +378,21 @@ export const iaSearchItems = tool('ia_search_items', {
       '',
     ];
     for (const item of result.items) {
-      lines.push(`## ${item.title ? listText(item.title) : item.identifier}`);
-      lines.push(`**Identifier:** ${item.identifier}`);
-      if (item.mediatype) lines.push(`**Media Type:** ${item.mediatype}`);
+      const title = item.title ? listText(item.title) : item.identifier;
+      lines.push(`${/[\r\n]/.test(title) ? '' : '## '}${escapeMarkdownInline(title)}`);
+      lines.push(`**Identifier:** ${escapeMarkdownInline(item.identifier)}`);
+      if (item.mediatype) lines.push(`**Media Type:** ${escapeMarkdownInline(item.mediatype)}`);
       if (item.creator) {
         const cut =
           item.creator_count != null
             ? ` (${Array.isArray(item.creator) ? item.creator.length : 1} of ${item.creator_count}; ia_get_item lists all)`
             : '';
-        lines.push(`**Creator:** ${listText(item.creator)}${cut}`);
+        lines.push(`**Creator:** ${escapeMarkdownInline(listText(item.creator))}${cut}`);
       }
-      if (item.date) lines.push(`**Date:** ${listText(item.date)}`);
+      if (item.date) lines.push(`**Date:** ${escapeMarkdownInline(listText(item.date))}`);
       if (item.downloads != null) lines.push(`**Downloads:** ${item.downloads.toLocaleString()}`);
-      if (item.collection) lines.push(`**Collection:** ${listText(item.collection)}`);
+      if (item.collection)
+        lines.push(`**Collection:** ${escapeMarkdownInline(listText(item.collection))}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];
