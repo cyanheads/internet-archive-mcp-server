@@ -10,7 +10,7 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   createFetchMock,
   createInMemoryStorage,
@@ -266,6 +266,252 @@ describe('Metadata and download handling that stays as it was', () => {
       error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_text_file' } },
     });
     expect(calls(isDownload)).toHaveLength(0);
+  });
+});
+
+describe('ia_get_text conditional Range continuation transport', () => {
+  const bytes = new TextEncoder().encode('A📜Б\ufeffCDE');
+  const etag = '"stable"';
+  const initial = () =>
+    new Response(bytes, { headers: { etag, 'content-length': String(bytes.length) } });
+  const validRange: FetchMockResponder = (request) => {
+    const start = Number(request.headers.get('range')?.slice(6, -1));
+    return new Response(bytes.subarray(start), {
+      status: 206,
+      headers: {
+        etag,
+        'content-length': String(bytes.length - start),
+        'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+      },
+    });
+  };
+
+  /** Keep production tenant state across contract-runner requests (the runner creates a context per call). */
+  const session = (state = createMockContext().state) => {
+    const definition = {
+      ...iaGetText,
+      handler: (
+        input: Parameters<typeof iaGetText.handler>[0],
+        ctx: Parameters<typeof iaGetText.handler>[1],
+      ) => {
+        Object.assign(ctx, { state });
+        return iaGetText.handler(input, ctx);
+      },
+    };
+    return (input: Record<string, unknown>) =>
+      runToolContract(definition, { identifier: ID, ...input });
+  };
+
+  beforeEach(() =>
+    routeMetadata(() =>
+      Response.json({
+        metadata: {},
+        files: [{ name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' }],
+      }),
+    ),
+  );
+
+  it('follows tokens beyond the second page with both surfaces and conditional identity requests', async () => {
+    routeDownload(inSequence(initial, validRange));
+    const run = session();
+    const expected = new TextDecoder().decode(bytes);
+    let continuation: string | undefined;
+    for (let offset = 0; offset < expected.length; offset += 2) {
+      const result = await run({ max_chars: 2, ...(continuation && { continuation }) });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        text: expected.slice(offset, offset + 2),
+        char_offset: offset,
+        max_chars: 2,
+        has_more: offset + 2 < expected.length,
+      });
+      continuation = (result.structuredContent as { next_continuation?: string }).next_continuation;
+      if (continuation) expect(contentText(result)).toContain(continuation);
+      expect(iaGetText.output.parse(result.structuredContent).text).toBe(
+        expected.slice(offset, offset + 2),
+      );
+    }
+    expect(continuation).toBeUndefined();
+    const downloads = calls(isDownload);
+    expect(downloads).toHaveLength(Math.ceil(expected.length / 2));
+    expect(downloads.map(({ request }) => request.headers.get('accept-encoding'))).toEqual(
+      downloads.map(() => 'identity'),
+    );
+    expect(downloads.slice(1).map(({ request }) => request.headers.get('if-range'))).toEqual(
+      downloads.slice(1).map(() => etag),
+    );
+    expect(downloads[1]?.request.headers.get('range')).toBe('bytes=1-');
+  });
+
+  it.each([
+    ['ignored range', () => initial(), 'range_unavailable'],
+    [
+      'wrong start',
+      () =>
+        new Response(bytes, {
+          status: 206,
+          headers: { etag, 'content-range': `bytes 0-${bytes.length - 1}/${bytes.length}` },
+        }),
+      'range_unavailable',
+    ],
+    [
+      'wrong total',
+      () =>
+        new Response(bytes, { status: 206, headers: { etag, 'content-range': 'bytes 1-98/99' } }),
+      'invalid_continuation',
+    ],
+    [
+      'changed validator',
+      () =>
+        new Response(bytes, {
+          status: 206,
+          headers: {
+            etag: '"changed"',
+            'content-range': `bytes 1-${bytes.length - 1}/${bytes.length}`,
+          },
+        }),
+      'invalid_continuation',
+    ],
+    [
+      'gzip representation',
+      () =>
+        new Response(bytes, {
+          status: 206,
+          headers: {
+            etag,
+            'content-encoding': 'gzip',
+            'content-range': `bytes 1-${bytes.length - 1}/${bytes.length}`,
+          },
+        }),
+      'range_unavailable',
+    ],
+    [
+      'unsatisfiable range',
+      () =>
+        new Response(null, {
+          status: 416,
+          headers: { etag, 'content-range': `bytes */${bytes.length}` },
+        }),
+      'range_unavailable',
+    ],
+    [
+      'missing Content-Range',
+      () => new Response(bytes, { status: 206, headers: { etag } }),
+      'range_unavailable',
+    ],
+    [
+      'mismatched Content-Length',
+      () =>
+        new Response(bytes, {
+          status: 206,
+          headers: {
+            etag,
+            'content-length': '999',
+            'content-range': `bytes 1-${bytes.length - 1}/${bytes.length}`,
+          },
+        }),
+      'range_unavailable',
+    ],
+    [
+      'early EOF',
+      () =>
+        new Response(null, {
+          status: 206,
+          headers: { etag, 'content-range': `bytes 1-${bytes.length - 1}/${bytes.length}` },
+        }),
+      'range_unavailable',
+    ],
+  ] as const)(
+    'rejects %s before decoding and follows offset recovery',
+    async (_label, respond, reason) => {
+      routeDownload(inSequence(initial, respond, initial));
+      const run = session();
+      const first = await run({ max_chars: 2 });
+      const token = (first.structuredContent as { next_continuation: string }).next_continuation;
+      const result = await run({ max_chars: 2, continuation: token });
+      expect(result.isError).toBe(true);
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason,
+          char_offset: 2,
+          retryable: false,
+          recovery: { hint: expect.stringContaining('char_offset 2') },
+        },
+      });
+      expect(contentText(result)).toContain('char_offset 2');
+      const recovered = await run({ max_chars: 2, char_offset: 2 });
+      expect(recovered.structuredContent).toMatchObject({
+        text: new TextDecoder().decode(bytes).slice(2, 4),
+        char_offset: 2,
+      });
+      expect(calls(isDownload)).toHaveLength(3);
+    },
+  );
+
+  it('rejects altered or unknown references and ambiguous pagination without any upstream request', async () => {
+    http.reset();
+    http.route({ match: () => true, respond: () => new Response('unexpected request') });
+    const run = session();
+    for (const continuation of ['modified', '00000000-0000-0000-0000-000000000000']) {
+      const result = await run({ continuation });
+      expect(errorOf(result).data.reason).toBe('invalid_continuation');
+      expect(contentText(result)).toContain('char_offset 0');
+    }
+    const ambiguous = await run({ continuation: 'opaque', char_offset: 0 });
+    expect(errorOf(ambiguous).data.reason).toBe('ambiguous_pagination');
+    expect(contentText(ambiguous)).toContain('Supply continuation alone');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it.each([undefined, 'W/"weak"'])(
+    'preserves offset success without a strong ETag (%s), disclosing the next offset on both surfaces',
+    async (validator) => {
+      routeDownload(() => new Response(bytes, { headers: validator ? { etag: validator } : {} }));
+      const result = await session()({ max_chars: 2, continuation: '   ' });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        text: 'A\ud83d',
+        notice: expect.stringContaining('char_offset 2'),
+      });
+      expect(result.structuredContent).not.toHaveProperty('next_continuation');
+      expect(contentText(result)).toContain('char_offset 2');
+    },
+  );
+
+  it('preserves the successful page and next-offset recovery on both surfaces when cursor storage is unavailable', async () => {
+    routeDownload(initial);
+    const ctx = createMockContext();
+    vi.spyOn(ctx.state, 'set').mockRejectedValue(
+      new McpError(JsonRpcErrorCode.ServiceUnavailable, 'Storage unavailable'),
+    );
+    const run = session(ctx.state);
+    const result = await run({ max_chars: 2 });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      text: 'A\ud83d',
+      char_offset: 0,
+      notice: expect.stringContaining('char_offset 2'),
+    });
+    expect(result.structuredContent).not.toHaveProperty('next_continuation');
+    expect(contentText(result)).toContain('char_offset 2');
+    const next = await run({ char_offset: 2, max_chars: 2 });
+    expect(next.structuredContent).toMatchObject({ text: '\udcdcБ', char_offset: 2 });
+  });
+
+  it('uses offset success when neither the response nor manifest supplies a byte length', async () => {
+    http.reset();
+    routeMetadata(() =>
+      Response.json({ metadata: {}, files: [{ name: FILE, format: 'DjVuTXT' }] }),
+    );
+    routeDownload(() => new Response(bytes, { headers: { etag } }));
+    const result = await session()({ max_chars: 2 });
+    expect(result.structuredContent).toMatchObject({
+      text: 'A\ud83d',
+      notice: expect.stringContaining('byte length'),
+    });
+    expect(contentText(result)).toContain('char_offset 2');
+    expect(result.structuredContent).not.toHaveProperty('next_continuation');
   });
 });
 

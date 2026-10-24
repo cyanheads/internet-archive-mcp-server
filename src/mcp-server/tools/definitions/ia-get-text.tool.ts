@@ -5,17 +5,14 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
 
 export const iaGetText = tool('ia_get_text', {
   title: 'Get Internet Archive Item Text',
   description:
-    'Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) from the ' +
-    'Internet Archive, with length-aware truncation and a continuation pointer for pagination. ' +
-    'Suited for public-domain books, documents, scanned periodicals, and transcripts. ' +
-    'Use max_chars and char_offset to page through long documents. To confirm the item has a ' +
-    'text file first, call ia_get_item with format "DjVuTXT"; its response also gives the mediatype.',
+    'Retrieve readable OCR DjVuTXT or plain text from an Internet Archive item, including public-domain books, documents, scanned periodicals, and transcripts. Set max_chars for page size, then pass next_continuation as continuation with the same identifier and omit char_offset. Direct char_offset access remains available. To confirm a text file exists, call ia_get_item with format "DjVuTXT".',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -41,14 +38,26 @@ export const iaGetText = tool('ia_get_text', {
       .number()
       .int()
       .min(0)
-      .default(0)
+      .optional()
       .describe(
-        'Character offset to start reading from (default 0). ' +
-          'To read the next page, add max_chars to the previous char_offset.',
+        'Character offset to start reading from (default 0). For sequential pages use next_continuation as continuation instead. Omit char_offset when using continuation.',
+      ),
+    continuation: z
+      .string()
+      .trim()
+      .optional()
+      .describe(
+        'Opaque next_continuation from the previous page. Omit char_offset when using it; blank is omitted.',
       ),
   }),
 
   output: z.object({
+    next_continuation: z
+      .string()
+      .optional()
+      .describe(
+        'Opaque next-page token; use as continuation with the same identifier and omit char_offset. Expires after one hour.',
+      ),
     text: z.string().describe('The text slice starting at char_offset up to max_chars characters.'),
     char_offset: z.number().describe('Character offset used for this response.'),
     max_chars: z
@@ -60,7 +69,7 @@ export const iaGetText = tool('ia_get_text', {
     has_more: z
       .boolean()
       .describe(
-        'True when there is more text beyond this slice. Increment char_offset by max_chars to read the next page.',
+        'True when there is more text beyond this slice. Use next_continuation, or add max_chars to char_offset if no token is available.',
       ),
     source_file: z.string().describe('Filename of the source text file fetched from the item.'),
     source_file_bytes: z
@@ -78,12 +87,32 @@ export const iaGetText = tool('ia_get_text', {
       .string()
       .optional()
       .describe(
-        'Set when max_chars exceeded the server maximum (IA_MAX_SNAPSHOT_CHARS) and was served at it, ' +
-          'naming the char_offset of the next page, or saying the page reaches the end of the document.',
+        'Explains a max_chars clamp or why efficient continuation is unavailable, with the next char_offset or end-of-document status.',
       ),
   },
 
   errors: [
+    {
+      reason: 'invalid_continuation',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A continuation is unknown, expired, belongs to another item, or its file changed.',
+      recovery:
+        'Omit continuation and restart with char_offset 0, or use the offset named in the error.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'range_unavailable',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The download ignored or returned an invalid conditional byte range.',
+      recovery: 'Omit continuation and retry with the char_offset named in the error.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'ambiguous_pagination',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Both a nonblank continuation and char_offset were supplied.',
+      recovery: 'Supply continuation alone, or omit continuation and provide char_offset.',
+    },
     {
       reason: 'item_not_found',
       code: JsonRpcErrorCode.NotFound,
@@ -131,9 +160,13 @@ export const iaGetText = tool('ia_get_text', {
     const ceiling = getServerConfig().maxSnapshotChars;
     // The page size is what bounds a call's memory and upstream read, so it never exceeds the ceiling.
     const maxChars = Math.min(input.max_chars ?? ceiling, ceiling);
-    const charOffset = input.char_offset;
+    const continuation = input.continuation || undefined;
+    if (continuation && input.char_offset !== undefined) throw ctx.fail('ambiguous_pagination');
+    const charOffset = input.char_offset ?? 0;
 
-    const result = await svc.getTextContent(input.identifier, maxChars, charOffset, ctx);
+    const result = continuation
+      ? await svc.getTextContent(input.identifier, maxChars, charOffset, ctx, continuation)
+      : await svc.getTextContent(input.identifier, maxChars, charOffset, ctx);
 
     ctx.log.info('Text content retrieved', {
       identifier: input.identifier,
@@ -143,23 +176,27 @@ export const iaGetText = tool('ia_get_text', {
       hasMore: result.hasMore,
     });
 
+    const notices: string[] = [];
+    if (result.continuationNotice) notices.push(result.continuationNotice);
     if (input.max_chars !== undefined && input.max_chars > ceiling) {
-      ctx.enrich.notice(
+      notices.push(
         `max_chars ${input.max_chars.toLocaleString('en-US')} is above this server's maximum of ` +
           `${ceiling.toLocaleString('en-US')} characters per call, so this page holds up to ` +
           `${ceiling.toLocaleString('en-US')}. ` +
           (result.hasMore
-            ? `Continue from char_offset ${(charOffset + maxChars).toLocaleString('en-US')}.`
+            ? `Continue from char_offset ${(result.charOffset + maxChars).toLocaleString('en-US')}.`
             : 'This page reaches the end of the document.'),
       );
     }
+    if (notices.length) ctx.enrich.notice(notices.join(' '));
 
     return {
       text: result.text,
-      char_offset: charOffset,
+      char_offset: result.charOffset,
       max_chars: maxChars,
       has_more: result.hasMore,
       source_file: result.sourceFile,
+      ...(result.nextContinuation && { next_continuation: result.nextContinuation }),
       ...(result.sourceFileBytes !== undefined && { source_file_bytes: result.sourceFileBytes }),
     };
   },
@@ -171,12 +208,13 @@ export const iaGetText = tool('ia_get_text', {
         ? ''
         : ` | **File Size:** ${result.source_file_bytes.toLocaleString()} bytes`;
     const lines: string[] = [
-      `**Source:** ${result.source_file}${fileSize}`,
+      ...(result.next_continuation ? [`**Next continuation:** ${result.next_continuation}`] : []),
+      `**Source:** ${escapeMarkdownInline(result.source_file)}${fileSize}`,
       `**Max Chars:** ${result.max_chars.toLocaleString()} | **Offset:** ${result.char_offset.toLocaleString()}${result.has_more ? ` — more follows (next offset: ${nextOffset.toLocaleString()})` : ' — end of document'}`,
       '',
       '---',
       '',
-      result.text,
+      escapeMarkdownInline(result.text),
     ];
     return [{ type: 'text', text: lines.join('\n') }];
   },

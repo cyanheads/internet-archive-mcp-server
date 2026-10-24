@@ -3,7 +3,7 @@
  * @module services/archive-metadata/archive-metadata-service
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   forbidden,
@@ -24,7 +24,52 @@ import {
   transportError,
   transportFailure,
 } from '../upstream-errors.js';
+import { readTextPage } from './read-text-page.js';
 import type { ArchiveFile, ArchiveItem, ArchiveItemMetadata, TextContent } from './types.js';
+
+/** Cursor lifetime in seconds; records contain identity and decoder positions, never text. */
+const CURSOR_TTL = 3_600;
+const TextCursorSchema = z.object({
+  version: z.literal(1),
+  identifier: z.string(),
+  file: z.string(),
+  md5: z.string().optional(),
+  size: z.string().optional(),
+  etag: z.string(),
+  totalBytes: z.number().int().nonnegative(),
+  nextCharOffset: z.number().int().nonnegative(),
+  checkpoint: z.object({
+    byteOffset: z.number().int().nonnegative(),
+    skip: z.number().int().min(0).max(1),
+  }),
+  expiresAt: z.number(),
+});
+type TextCursor = z.infer<typeof TextCursorSchema>;
+
+const storageUnavailable = (err: unknown): boolean =>
+  err instanceof McpError &&
+  (err.code === JsonRpcErrorCode.ServiceUnavailable || err.code === JsonRpcErrorCode.Timeout);
+
+const continuationError = (
+  ctx: Context,
+  reason: 'invalid_continuation' | 'range_unavailable',
+  charOffset: number,
+) =>
+  new McpError(
+    JsonRpcErrorCode.ValidationError,
+    reason === 'invalid_continuation'
+      ? 'The continuation is expired, unavailable, or no longer matches this file.'
+      : 'The text download did not honor the conditional identity byte range.',
+    {
+      reason,
+      retryable: false,
+      char_offset: charOffset,
+      ...ctx.recoveryFor(reason),
+      recovery: {
+        hint: `Omit continuation and retry with char_offset ${charOffset}; restart from char_offset 0 if the file changed.`,
+      },
+    },
+  );
 
 const METADATA_BASE = 'https://archive.org/metadata';
 const DOWNLOAD_BASE = 'https://archive.org/download';
@@ -143,7 +188,9 @@ export class ArchiveMetadataService {
    * character after the page has arrived, so memory per call is bounded by the page size
    * and upstream reads stop at the page's end. `hasMore` comes from that one-character
    * lookahead. `sourceFileBytes` is the manifest `size`, omitted when the manifest has none.
-   * Throws `item_not_found`, `no_text_file`, `download_forbidden`, or `archive_unavailable`;
+   * `continuation` resumes a validated representation using a tenant-scoped, one-hour byte checkpoint.
+   * Throws `invalid_continuation` or `range_unavailable` for an unusable resume, plus
+   * `item_not_found`, `no_text_file`, `download_forbidden`, or `archive_unavailable`;
    * the metadata request and the download each retry a first timeout once (see `retry`).
    */
   async getTextContent(
@@ -151,12 +198,39 @@ export class ArchiveMetadataService {
     maxChars: number,
     charOffset: number,
     ctx: Context,
+    continuation?: string,
   ): Promise<TextContent> {
+    let cursor: TextCursor | undefined;
+    if (continuation) {
+      if (!/^[0-9a-f-]{36}$/.test(continuation))
+        throw continuationError(ctx, 'invalid_continuation', 0);
+      try {
+        cursor = (await ctx.state.get(`ia-text/${continuation}`, TextCursorSchema)) ?? undefined;
+      } catch (err) {
+        if (ctx.signal.aborted) throw ctx.signal.reason;
+        if (err instanceof Error && err.name === 'AbortError') throw err;
+        if (!storageUnavailable(err)) throw err;
+        throw continuationError(ctx, 'invalid_continuation', 0);
+      }
+      if (
+        cursor?.version !== 1 ||
+        cursor.identifier !== identifier ||
+        cursor.expiresAt <= Date.now()
+      ) {
+        throw continuationError(
+          ctx,
+          'invalid_continuation',
+          cursor?.identifier === identifier ? cursor.nextCharOffset : 0,
+        );
+      }
+      charOffset = cursor.nextCharOffset;
+    }
     // Step 1: locate the text file
     const item = await this.getItem(identifier, ctx);
 
     const textFile = findBestTextFile(item.files);
     if (!textFile) {
+      if (cursor) throw continuationError(ctx, 'invalid_continuation', charOffset);
       throw notFound(
         `No readable text file found for item "${identifier}". ` +
           `The item exists but has no DjVuTXT or plain-text file in its manifest.`,
@@ -166,6 +240,14 @@ export class ArchiveMetadataService {
 
     const size = Number(textFile.size);
     const sourceFileBytes = Number.isSafeInteger(size) && size >= 0 ? size : undefined;
+    if (
+      cursor &&
+      (cursor.file !== textFile.name ||
+        cursor.md5 !== textFile.md5 ||
+        cursor.size !== textFile.size)
+    ) {
+      throw continuationError(ctx, 'invalid_continuation', charOffset);
+    }
 
     // Step 2: stream the page out of the text file
     const download = textDownload(textFile.name);
@@ -178,11 +260,20 @@ export class ArchiveMetadataService {
       let response: Response;
       try {
         response = await fetchWithTimeout(textFile.downloadUrl, this.timeoutMs, ctx, {
-          headers: this.headers,
+          headers: {
+            ...this.headers,
+            'Accept-Encoding': 'identity',
+            ...(cursor && {
+              Range: `bytes=${cursor.checkpoint.byteOffset}-`,
+              'If-Range': cursor.etag,
+            }),
+          },
           signal: ctx.signal,
           expectedStatuses: [401, 403],
         });
       } catch (err) {
+        if (cursor && statusOf(err) === 416)
+          throw continuationError(ctx, 'range_unavailable', charOffset);
         if (
           err instanceof McpError &&
           (err.code === JsonRpcErrorCode.Forbidden || err.code === JsonRpcErrorCode.Unauthorized)
@@ -200,9 +291,95 @@ export class ArchiveMetadataService {
         throw statusError(err, download, ctx);
       }
 
-      const page = await readTextPage(response, charOffset, maxChars).catch((err: unknown) => {
+      const etag = response.headers.get('etag');
+      const encoding = response.headers.get('content-encoding');
+      let totalBytes = Number(response.headers.get('content-length'));
+      if (cursor) {
+        const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(
+          response.headers.get('content-range') ?? '',
+        );
+        const valid =
+          response.status === 206 &&
+          (!encoding || encoding === 'identity') &&
+          range &&
+          Number(range[1]) === cursor.checkpoint.byteOffset &&
+          Number(range[3]) === cursor.totalBytes &&
+          Number(range[2]) === cursor.totalBytes - 1 &&
+          (response.headers.get('content-length') === null ||
+            totalBytes === cursor.totalBytes - cursor.checkpoint.byteOffset);
+        if (etag !== cursor.etag || (range && Number(range[3]) !== cursor.totalBytes)) {
+          await response.body?.cancel();
+          throw continuationError(ctx, 'invalid_continuation', charOffset);
+        }
+        if (!valid) {
+          await response.body?.cancel();
+          throw continuationError(ctx, 'range_unavailable', charOffset);
+        }
+        totalBytes = cursor.totalBytes;
+      }
+      const page = await readTextPage(
+        response,
+        cursor ? 0 : charOffset,
+        maxChars,
+        cursor?.checkpoint,
+      ).catch((err: unknown) => {
         throw bodyReadError(err, download.name);
       });
+      if (
+        cursor &&
+        !page.hasMore &&
+        cursor.checkpoint.byteOffset + page.bytesRead !== cursor.totalBytes
+      ) {
+        throw continuationError(ctx, 'range_unavailable', charOffset);
+      }
+
+      let nextContinuation: string | undefined;
+      let continuationNotice: string | undefined;
+      if (page.hasMore) {
+        if (response.headers.get('content-length') === null && !cursor)
+          totalBytes = sourceFileBytes ?? NaN;
+        if (
+          !etag ||
+          !/^"[^"\r\n]*"$/.test(etag) ||
+          (encoding && encoding !== 'identity') ||
+          !Number.isSafeInteger(totalBytes) ||
+          totalBytes < 0 ||
+          (!cursor && response.status !== 200)
+        ) {
+          continuationNotice = `Efficient continuation is unavailable because the download lacks a stable identity validator or byte length. Continue with char_offset ${charOffset + maxChars}.`;
+        } else {
+          const token = crypto.randomUUID();
+          const record: TextCursor = {
+            version: 1,
+            identifier,
+            file: textFile.name,
+            ...(textFile.md5 !== undefined && { md5: textFile.md5 }),
+            ...(textFile.size !== undefined && { size: textFile.size }),
+            etag,
+            totalBytes,
+            nextCharOffset: charOffset + maxChars,
+            checkpoint: page.checkpoint,
+            expiresAt: Date.now() + CURSOR_TTL * 1_000,
+          };
+          try {
+            await ctx.state.set(`ia-text/${token}`, record, { ttl: CURSOR_TTL });
+            nextContinuation = token;
+          } catch (err) {
+            if (ctx.signal.aborted) throw ctx.signal.reason;
+            if (err instanceof Error && err.name === 'AbortError') throw err;
+            /**
+             * The in-memory provider reports quota exhaustion as InternalError. This seam writes
+             * only a generated JSON cursor; schema/programmer failures still propagate.
+             */
+            if (
+              !storageUnavailable(err) &&
+              !(err instanceof McpError && err.code === JsonRpcErrorCode.InternalError)
+            )
+              throw err;
+            continuationNotice = `Efficient continuation is unavailable because cursor storage could not be reached. Continue with char_offset ${charOffset + maxChars}.`;
+          }
+        }
+      }
 
       ctx.log.debug('Text content fetched', {
         identifier,
@@ -219,6 +396,8 @@ export class ArchiveMetadataService {
         charOffset,
         maxChars,
         sourceFile: textFile.name,
+        ...(nextContinuation && { nextContinuation }),
+        ...(continuationNotice && { continuationNotice }),
         ...(sourceFileBytes !== undefined && { sourceFileBytes }),
       };
     });
@@ -322,52 +501,6 @@ function readItemBody(text: string, ctx: Context): Record<string, unknown> {
 /** `archive_unavailable` with the calling definition's recovery hint, as error `data` fields. */
 function unavailable(ctx: Context): Record<string, unknown> {
   return { reason: 'archive_unavailable', ...ctx.recoveryFor('archive_unavailable') };
-}
-
-/**
- * The `[charOffset, charOffset + maxChars)` slice of a UTF-8 body decoded as `Response.text()`
- * would (BOM stripped, malformed bytes replaced), counted in UTF-16 code units. The body is
- * decoded chunk by chunk — a multi-byte sequence split across chunks decodes intact — and only
- * the page plus one lookahead code unit is kept. Once that lookahead arrives the upstream body
- * is cancelled rather than drained, so retained text never exceeds `maxChars + 1` code units
- * and the read stops at the page's end.
- */
-async function readTextPage(
-  response: Response,
-  charOffset: number,
-  maxChars: number,
-): Promise<{ bytesRead: number; hasMore: boolean; text: string }> {
-  const reader = response.body?.getReader();
-  if (!reader) return { text: '', hasMore: false, bytesRead: 0 };
-  /**
-   * The BOM is stripped here rather than by the decoder: streaming decoders disagree on it
-   * across runtimes when the first chunk ends inside a character.
-   */
-  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
-  const end = charOffset + maxChars;
-  const kept: string[] = [];
-  let atStart = true;
-  let decoded = 0;
-  let bytesRead = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    let chunk = done ? decoder.decode() : decoder.decode(value, { stream: true });
-    if (atStart && chunk.length > 0) {
-      atStart = false;
-      if (chunk.charCodeAt(0) === 0xfeff) chunk = chunk.slice(1);
-    }
-    if (value) bytesRead += value.byteLength;
-    const chunkStart = decoded;
-    decoded += chunk.length;
-    if (decoded > charOffset) {
-      kept.push(chunk.slice(Math.max(0, charOffset - chunkStart), end + 1 - chunkStart));
-    }
-    if (decoded > end) {
-      await reader.cancel();
-      return { text: kept.join('').slice(0, maxChars), hasMore: true, bytesRead };
-    }
-    if (done) return { text: kept.join(''), hasMore: false, bytesRead };
-  }
 }
 
 /** Find the best text file from the manifest, preferring DjVuTXT then plain text. */

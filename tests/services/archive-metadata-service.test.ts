@@ -7,10 +7,11 @@
  * @module tests/services/archive-metadata-service.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchWithTimeout = vi.fn();
@@ -272,6 +273,25 @@ const textManifest = (size?: string): Response =>
 describe('ArchiveMetadataService.getTextContent streamed page read', () => {
   beforeEach(rejectUnstagedFetches);
 
+  it('characterizes replacement followed by a reconsumed ASCII byte at a page boundary', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(textManifest());
+    fetchWithTimeout.mockResolvedValueOnce(
+      new Response(new Uint8Array([0xef, 0xbb, 0xbf, 0xe2, 0x41, 0x42])),
+    );
+    const result = await buildService().getTextContent('a-volume', 1, 1, createMockContext());
+    expect(result.text).toBe('A');
+    expect(result.hasMore).toBe(true);
+  });
+
+  it('offers an opaque continuation when a stable representation has another page', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(textManifest('6'));
+    fetchWithTimeout.mockResolvedValueOnce(
+      new Response('abcdef', { headers: { etag: '"stable"' } }),
+    );
+    const result = await buildService().getTextContent('a-volume', 2, 0, createMockContext());
+    expect(result).toHaveProperty('nextContinuation', expect.any(String));
+  });
+
   /** Stage the manifest and one streamed download, then read one page. */
   const readPage = async (
     chunks: readonly Uint8Array[] | ((index: number) => Uint8Array | undefined),
@@ -490,6 +510,203 @@ const declaredRecovery = (
   if (!entry) throw new Error(`contract declares no ${reason}`);
   return entry.recovery;
 };
+
+describe('ArchiveMetadataService continuation checkpoints', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  /** Real tenant-scoped state is shared by successive calls; downloads emulate conditional Range. */
+  const source = (bytes: Uint8Array) => {
+    const starts: number[] = [];
+    const reads: number[] = [];
+    fetchWithTimeout.mockImplementation(
+      async (url: string, _timeout: number, _ctx: unknown, options: RequestInit) => {
+        if (url.includes('/metadata/')) return textManifest(String(bytes.length));
+        const headers = new Headers(options.headers);
+        const range = headers.get('range');
+        const start = range ? Number(range.slice(6, -1)) : 0;
+        starts.push(start);
+        const { response, stats } = streamedDownload((n) =>
+          bytes.subarray(start + n, start + n + 1).length
+            ? bytes.subarray(start + n, start + n + 1)
+            : undefined,
+        );
+        reads.push(0);
+        const index = reads.length - 1;
+        const reader = response.body!.getReader();
+        const body = new ReadableStream<Uint8Array>(
+          {
+            async pull(controller) {
+              const result = await reader.read();
+              reads[index] = stats.pulls;
+              if (result.done) controller.close();
+              else controller.enqueue(result.value);
+            },
+            cancel: () => reader.cancel(),
+          },
+          { highWaterMark: 0 },
+        );
+        return new Response(body, {
+          status: range ? 206 : 200,
+          headers: {
+            etag: '"stable"',
+            'content-length': String(bytes.length - start),
+            ...(range && { 'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}` }),
+          },
+        });
+      },
+    );
+    return { starts, reads };
+  };
+
+  it('walks successive pages across surrogate, malformed, BOM and truncated units with bounded overlap', async () => {
+    const bytes = new Uint8Array([
+      0xef,
+      0xbb,
+      0xbf,
+      ...new TextEncoder().encode('A📜Б\ufeff'),
+      0xe2,
+      0x41,
+      0xed,
+      0xa0,
+      0x80,
+      0xf0,
+      0x9f,
+    ]);
+    const expected = new TextDecoder().decode(bytes);
+    const { starts, reads } = source(bytes);
+    const ctx = createMockContext({ errors: iaGetText.errors });
+    const svc = buildService();
+    let token: string | undefined;
+    let offset = 0;
+    for (let n = 0; n < expected.length; n++) {
+      const page = await svc.getTextContent('a-volume', 1, 0, ctx, token);
+      expect(page.text, `page ${n}`).toBe(expected.slice(offset, offset + 1));
+      expect(page.charOffset).toBe(offset);
+      expect(page.hasMore).toBe(offset + 1 < expected.length);
+      token = page.nextContinuation;
+      offset++;
+    }
+    expect(token).toBeUndefined();
+    expect(starts.slice(1).every((start) => start > 0)).toBe(true);
+    expect(reads.reduce((a, b) => a + b, 0)).toBeLessThan(bytes.length * 4);
+    const records = await ctx.state.list('ia-text/');
+    expect(records.items.length).toBe(expected.length - 1);
+    for (const record of records.items) {
+      expect(record.value).not.toHaveProperty('text');
+      expect(record.value).not.toHaveProperty('document');
+    }
+  });
+
+  it('matches whole-file UTF-8 decoding over randomized malformed bytes and changing page sizes', async () => {
+    const random = seededRandom(37);
+    for (let fixture = 0; fixture < 30; fixture++) {
+      const bytes = new Uint8Array(Array.from({ length: 100 }, () => Math.floor(random() * 256)));
+      source(bytes);
+      const expected = new TextDecoder().decode(bytes);
+      const ctx = createMockContext();
+      const svc = buildService();
+      let token: string | undefined;
+      let offset = 0;
+      do {
+        const count = 1 + Math.floor(random() * 7);
+        const page = await svc.getTextContent('a-volume', count, 0, ctx, token);
+        expect(page.text).toBe(expected.slice(offset, offset + count));
+        expect(page.hasMore).toBe(offset + count < expected.length);
+        offset += count;
+        token = page.nextContinuation;
+      } while (token);
+      expect(offset).toBeGreaterThanOrEqual(expected.length);
+    }
+  });
+
+  it('expires serialized real-state records and rejects another tenant or item before downloading', async () => {
+    vi.useFakeTimers();
+    try {
+      source(new TextEncoder().encode('abcdef'));
+      const svc = buildService();
+      const ctx = createMockContext({ tenantId: 'tenant-a' });
+      const other = createMockContext({ tenantId: 'tenant-b' });
+      const shared = createInMemoryStorage();
+      for (const tenant of [ctx, other]) {
+        tenant.state.get = async <T>(key: string, schema?: z.ZodType<T>): Promise<T | null> => {
+          const value = await shared.get<T>(key, tenant);
+          return value === null ? null : schema ? schema.parse(value) : value;
+        };
+        tenant.state.set = (key, value, options) => shared.set(key, value, tenant, options);
+      }
+      const first = await svc.getTextContent('a-volume', 2, 0, ctx);
+      const token = first.nextContinuation!;
+      const before = fetchWithTimeout.mock.calls.length;
+      await expect(svc.getTextContent('a-volume', 2, 0, other, token)).rejects.toMatchObject({
+        data: { reason: 'invalid_continuation' },
+      });
+      await expect(svc.getTextContent('other-item', 2, 0, ctx, token)).rejects.toMatchObject({
+        data: { reason: 'invalid_continuation' },
+      });
+      await vi.advanceTimersByTimeAsync(3_600_001);
+      await expect(ctx.state.get(`ia-text/${token}`)).resolves.toBeNull();
+      await expect(svc.getTextContent('a-volume', 2, 0, ctx, token)).rejects.toMatchObject({
+        data: { reason: 'invalid_continuation' },
+      });
+      expect(fetchWithTimeout.mock.calls.length).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    [new McpError(JsonRpcErrorCode.ServiceUnavailable, 'Storage unavailable'), true],
+    [new TypeError('programmer bug'), false],
+    [new McpError(JsonRpcErrorCode.ValidationError, 'Bad stored schema'), false],
+    [new DOMException('Cancelled', 'AbortError'), false],
+  ])('degrades storage writes only on operational errors (%s)', async (error, degrades) => {
+    source(new TextEncoder().encode('abcdef'));
+    const ctx = createMockContext();
+    vi.spyOn(ctx.state, 'set').mockRejectedValue(error);
+    const pending = buildService().getTextContent('a-volume', 2, 0, ctx);
+    if (degrades)
+      await expect(pending).resolves.toMatchObject({
+        text: 'ab',
+        continuationNotice: expect.stringContaining('char_offset 2'),
+      });
+    else await expect(pending).rejects.toBe(error);
+  });
+
+  it('preserves the page when the real in-memory provider reaches its capacity', async () => {
+    source(new TextEncoder().encode('abcdef'));
+    const ctx = createMockContext();
+    const storage = createInMemoryStorage({ maxEntries: 1 });
+    await storage.set('occupied', true, ctx);
+    // Delegate only this write to a real full provider; its quota is the behavior under test.
+    vi.spyOn(ctx.state, 'set').mockImplementation((key, value, options) =>
+      storage.set(key, value, ctx, options),
+    );
+    const page = await buildService().getTextContent('a-volume', 2, 0, ctx);
+    expect(page.text).toBe('ab');
+    expect(page.nextContinuation).toBeUndefined();
+    expect(page.continuationNotice).toContain('char_offset 2');
+  });
+
+  it.each([
+    [[], 'text file removed'],
+    [[{ name: 'renamed.txt', format: 'Text', size: '6' }], 'selected file changed'],
+    [
+      [{ name: 'volume_djvu.txt', format: 'DjVuTXT', size: '6', md5: 'changed' }],
+      'checksum changed',
+    ],
+  ])('rejects a changed manifest (%s) before a ranged download', async (files) => {
+    source(new TextEncoder().encode('abcdef'));
+    const ctx = createMockContext();
+    const svc = buildService();
+    const first = await svc.getTextContent('a-volume', 2, 0, ctx);
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    const before = fetchWithTimeout.mock.calls.length;
+    await expect(
+      svc.getTextContent('a-volume', 2, 0, ctx, first.nextContinuation),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_continuation', char_offset: 2 } });
+    expect(fetchWithTimeout.mock.calls.length).toBe(before + 1);
+  });
+});
 
 describe('ArchiveMetadataService service-thrown reasons carry the caller’s recovery hint', () => {
   beforeEach(rejectUnstagedFetches);

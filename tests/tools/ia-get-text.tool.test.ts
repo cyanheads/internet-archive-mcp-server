@@ -210,6 +210,36 @@ describe('iaGetText', () => {
   });
 
   describe('output fields', () => {
+    it('forwards an opaque continuation and reports its resumed offset and next token on both surfaces', async () => {
+      mockService.getTextContent.mockResolvedValue({
+        text: 'page',
+        hasMore: true,
+        charOffset: 120,
+        maxChars: 50_000,
+        sourceFile: 'book.txt',
+        nextContinuation: 'next-token',
+      });
+      const result = await runToolContract(iaGetText, {
+        identifier: 'book',
+        continuation: ' previous-token ',
+        max_chars: 100_000,
+      });
+      expect(mockService.getTextContent).toHaveBeenCalledWith(
+        'book',
+        50_000,
+        0,
+        expect.anything(),
+        'previous-token',
+      );
+      expect(result.structuredContent).toMatchObject({
+        char_offset: 120,
+        next_continuation: 'next-token',
+        notice: expect.stringContaining('char_offset 50,120'),
+      });
+      expect(contentText(result)).toContain('next-token');
+      expect(contentText(result)).toContain('50,120');
+    });
+
     it('reports source_file_bytes from the manifest size on both surfaces, and no total_chars', async () => {
       mockService.getTextContent.mockResolvedValue({
         text: 'Volume text.',

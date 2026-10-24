@@ -42,10 +42,14 @@ export interface ArchiveItem {
 export interface TextContent {
   /** Character offset used for this slice. */
   charOffset: number;
+  /** Why efficient continuation is unavailable; offset pagination remains usable. */
+  continuationNotice?: string;
   /** True when the file holds text past the end of this slice. */
   hasMore: boolean;
   /** Maximum characters returned in this slice. */
   maxChars: number;
+  /** Opaque tenant-scoped token for the next page, when available. */
+  nextContinuation?: string;
   /** Name of the source file fetched. */
   sourceFile: string;
   /** Size of the source file in bytes, from the manifest; absent when the manifest has none. */
