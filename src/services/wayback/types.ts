@@ -31,6 +31,10 @@ export interface ClosestSnapshot {
 
 /** Paginated CDX history result. */
 export interface CdxHistoryResult {
+  /** True only when an exact collapsed lookahead proves no further captures remain. */
+  complete?: boolean;
+  /** Continuation limitations, including legacy collapsed paging. */
+  notice?: string;
   /** CDX records for this page. */
   records: CdxRecord[];
   /** Opaque resume key for fetching the next page, if more records exist. */

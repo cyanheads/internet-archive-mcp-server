@@ -297,7 +297,7 @@ describe('iaGetSnapshot', () => {
     expect(result.replay_url).toBe(served);
     expect(result.resolved_timestamp).toBe('20200104000551');
     const text = (iaGetSnapshot.format!(result)[0] as { text: string }).text;
-    expect(text).toContain(`**Replay URL:** ${served}`);
+    expect(text).toContain(`**Replay URL:** [${served}](<${served}>)`);
     expect(text).toContain('**Resolved Timestamp:** 20200104000551');
   });
 

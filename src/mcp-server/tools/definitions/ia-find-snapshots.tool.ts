@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getWaybackService } from '@/services/wayback/wayback-service.js';
 
 const WAYBACK_WEB = 'https://web.archive.org/web';
@@ -106,7 +107,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .optional()
       .describe(
         'Opaque pagination key from a previous history mode response. Pass this to continue from ' +
-          'where the last page left off.',
+          'where the last page left off. Server cursors expire after one hour and bind the URL and original filters; omit filters on continuation or repeat their original values. Page size may change. Wildcard and legacy raw continuations can omit collapsed captures.',
       ),
   }),
 
@@ -156,10 +157,28 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     notice: z
       .string()
       .optional()
-      .describe('Set when the list was capped: how to continue, naming resume_key.'),
+      .describe('Pagination guidance, cap disclosure, or limitations of legacy raw continuation.'),
   },
 
   errors: [
+    {
+      reason: 'invalid_resume_key',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The server history cursor is malformed, expired, or unavailable for this caller.',
+      recovery:
+        'Restart history mode without resume_key using the original URL and filters; server cursors expire after one hour.',
+      severity: 'warning',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'resume_key_conflict',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'An explicit URL or filter conflicts with the server history cursor.',
+      recovery:
+        'Keep the original URL and omit collapse, from, to, and status_filter when continuing with resume_key, or restart without resume_key to change the query.',
+      severity: 'warning',
+      thrownBy: 'service',
+    },
     {
       reason: 'missing_timestamp',
       code: JsonRpcErrorCode.InvalidParams,
@@ -243,7 +262,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     }
 
     // history mode
-    const collapseParam = input.collapse === '' ? undefined : (input.collapse ?? 'timestamp:8');
+    const collapseParam = input.collapse || undefined;
     const limit = Math.min(input.limit, LIMIT_CAP);
 
     const histResult = await svc.fetchHistory(
@@ -262,7 +281,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     if (histResult.records.length === 0) {
       throw ctx.fail(
         'no_snapshots',
-        `No snapshots found for "${input.url}" with the specified filters.`,
+        `No snapshots found for "${input.url}" with the specified filters.${histResult.notice ? ` ${histResult.notice}` : ''}`,
         ctx.recoveryFor('no_snapshots'),
       );
     }
@@ -274,7 +293,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     });
 
     const shown = histResult.records.length;
-    if (shown >= limit) {
+    if (shown >= limit && !histResult.complete) {
       const clamped =
         limit < input.limit
           ? `limit ${input.limit} is above the cap of ${LIMIT_CAP.toLocaleString('en-US')} per call, so this page holds ${shown.toLocaleString('en-US')} captures. `
@@ -282,10 +301,14 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       ctx.enrich.truncated({
         shown,
         cap: limit,
-        guidance: histResult.resumeKey
-          ? `${clamped}Pass this response's resume_key as resume_key for the next page.`
-          : `${clamped}Narrow from and to to list the captures past it.`,
+        guidance:
+          (histResult.resumeKey
+            ? `${clamped}Pass this response's resume_key as resume_key for the next page.`
+            : `${clamped}Narrow from and to to list the captures past it.`) +
+          (histResult.notice ? ` ${histResult.notice}` : ''),
       });
+    } else if (histResult.notice) {
+      ctx.enrich.notice(histResult.notice);
     }
 
     const snapshots = histResult.records.map((r) => ({
@@ -307,19 +330,20 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
   format: (result) => {
     const lines: string[] = [];
     for (const snap of result.snapshots) {
-      lines.push(`## ${snap.timestamp}`);
-      lines.push(`**Replay URL:** ${snap.replay_url}`);
-      if (snap.statuscode) lines.push(`**Status:** ${snap.statuscode}`);
-      if (snap.mimetype) lines.push(`**MIME:** ${snap.mimetype}`);
-      if (snap.original_url) lines.push(`**Original URL:** ${snap.original_url}`);
-      if (snap.digest) lines.push(`**Digest:** ${snap.digest}`);
-      if (snap.length) lines.push(`**Length:** ${snap.length}`);
+      lines.push(`## ${escapeMarkdownInline(snap.timestamp)}`);
+      lines.push(`**Replay URL:** ${markdownLink(snap.replay_url, snap.replay_url)}`);
+      if (snap.statuscode) lines.push(`**Status:** ${escapeMarkdownInline(snap.statuscode)}`);
+      if (snap.mimetype) lines.push(`**MIME:** ${escapeMarkdownInline(snap.mimetype)}`);
+      if (snap.original_url)
+        lines.push(`**Original URL:** ${markdownLink(snap.original_url, snap.original_url)}`);
+      if (snap.digest) lines.push(`**Digest:** ${escapeMarkdownInline(snap.digest)}`);
+      if (snap.length) lines.push(`**Length:** ${escapeMarkdownInline(snap.length)}`);
       lines.push('');
     }
     if (result.resume_key) {
       lines.push(`---`);
       lines.push(
-        `**Resume Key:** ${result.resume_key} _(pass as resume_key to get the next page)_`,
+        `**Resume Key:** ${escapeMarkdownInline(result.resume_key)} _(pass as resume_key to get the next page)_`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];

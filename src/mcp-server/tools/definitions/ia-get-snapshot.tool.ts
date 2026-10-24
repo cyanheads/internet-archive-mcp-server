@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import {
   getWaybackService,
   NOT_SERVED,
@@ -188,12 +189,12 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
 
   format: (result) => {
     const lines: string[] = [
-      `**Replay URL:** ${result.replay_url}`,
-      `**Resolved Timestamp:** ${result.resolved_timestamp} | **Status:** ${result.resolved_status}`,
+      `**Replay URL:** ${markdownLink(result.replay_url, result.replay_url)}`,
+      `**Resolved Timestamp:** ${escapeMarkdownInline(result.resolved_timestamp)} | **Status:** ${escapeMarkdownInline(result.resolved_status)}`,
       '',
       '---',
       '',
-      result.text,
+      escapeMarkdownInline(result.text),
     ];
     return [{ type: 'text', text: lines.join('\n') }];
   },

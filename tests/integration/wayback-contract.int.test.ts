@@ -14,6 +14,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createFetchMock,
   createInMemoryStorage,
+  createMockContext,
   type FetchMockResponder,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
@@ -176,7 +177,7 @@ describe('ia_find_snapshots closest mode', () => {
     expect(result.structuredContent).toMatchObject({
       snapshots: [{ timestamp: '20200101004937', replay_url: replayUrl, statuscode: '200' }],
     });
-    expect(contentText(result)).toContain(`**Replay URL:** ${replayUrl}`);
+    expect(contentText(result)).toContain(`**Replay URL:** [${replayUrl}](<${replayUrl}>)`);
     expect(calls(isCdx)).toHaveLength(0);
   });
 
@@ -198,7 +199,7 @@ describe('ia_find_snapshots closest mode', () => {
     });
     const text = contentText(result);
     expect(text).toContain('## 20200101231916');
-    expect(text).toContain(`**Replay URL:** ${replayUrl}`);
+    expect(text).toContain(`**Replay URL:** [${replayUrl}](<${replayUrl}>)`);
     expect(text).toContain('**Status:** 200');
     expect(calls(isAvailability)).toHaveLength(1);
     const cdx = new URL(calls(isCdx)[0]?.request.url ?? '');
@@ -455,11 +456,11 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
     const result = await history({ limit: 20_000 });
 
     expect(result.isError).toBeFalsy();
-    expect(sentLimits()).toEqual(['10000']);
+    expect(sentLimits()).toEqual(['10001']);
     const out = historyOf(result);
     expect(out.snapshots).toHaveLength(10_000);
     expect(out).toMatchObject({
-      resume_key: RESUME_KEY,
+      resume_key: expect.stringMatching(/^ia-history-v1\//),
       truncated: true,
       shown: 10_000,
       cap: 10_000,
@@ -468,7 +469,7 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
     expect(out.notice).toContain('resume_key');
     const text = contentText(result);
     expect(text).toContain('limit 20000 is above the cap of 10,000 per call');
-    expect(text).toContain(`**Resume Key:** ${RESUME_KEY}`);
+    expect(text).toContain(`**Resume Key:** ${out.resume_key}`);
   });
 
   it('returns the same captures and resume_key as limit 10000', async () => {
@@ -477,9 +478,10 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
     const capped = historyOf(await history({ limit: 20_000 }));
     const atCap = historyOf(await history({ limit: 10_000 }));
 
-    expect(sentLimits()).toEqual(['10000', '10000']);
+    expect(sentLimits()).toEqual(['10001', '10001']);
     expect(capped.snapshots).toEqual(atCap.snapshots);
-    expect(capped.resume_key).toBe(atCap.resume_key);
+    expect(capped.resume_key).toMatch(/^ia-history-v1\//);
+    expect(atCap.resume_key).toMatch(/^ia-history-v1\//);
     expect(atCap).toMatchObject({ truncated: true, cap: 10_000 });
     expect(atCap.notice).toContain('resume_key');
     expect(atCap.notice).not.toContain('above the cap');
@@ -490,7 +492,7 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
 
     const result = await history({ limit: 150_000 });
 
-    expect(sentLimits()).toEqual(['10000']);
+    expect(sentLimits()).toEqual(['10001']);
     expect(historyOf(result)).toMatchObject({ truncated: true, shown: 10_000, cap: 10_000 });
   });
 
@@ -499,7 +501,7 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
 
     const result = await history({ limit: 20_000 });
 
-    expect(sentLimits()).toEqual(['10000']);
+    expect(sentLimits()).toEqual(['10001']);
     const out = historyOf(result);
     expect(out.snapshots).toHaveLength(42);
     expect(out).not.toHaveProperty('truncated');
@@ -512,9 +514,14 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
 
     const result = await history({});
 
-    expect(sentLimits()).toEqual(['100']);
+    expect(sentLimits()).toEqual(['101']);
     const out = historyOf(result);
-    expect(out).toMatchObject({ truncated: true, shown: 100, cap: 100, resume_key: RESUME_KEY });
+    expect(out).toMatchObject({
+      truncated: true,
+      shown: 100,
+      cap: 100,
+      resume_key: expect.stringMatching(/^ia-history-v1\//),
+    });
     expect(out.notice).toContain('resume_key');
     expect(contentText(result)).toContain('resume_key');
   });
@@ -557,6 +564,187 @@ describe('ia_find_snapshots history-mode limit above the 10,000 cap', () => {
     expect(withLimit.structuredContent).toEqual(without.structuredContent);
     expect(calls(isCdx)).toHaveLength(0);
   });
+});
+
+describe('ia_find_snapshots collapsed cursor contract', () => {
+  const header = ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'];
+  const rows = [
+    '19991231000000',
+    '20000101000000',
+    '20000201000000',
+    '20000301000000',
+    '20010101000000',
+  ].map((timestamp, i) => [
+    timestamp,
+    '200',
+    'text/html',
+    'http://example.com/',
+    `D${i}`,
+    String(i),
+  ]);
+  type History = {
+    snapshots: { timestamp: string; digest: string }[];
+    resume_key?: string;
+    notice?: string;
+  };
+  const out = (result: ToolResult) => result.structuredContent as History;
+
+  it('does not claim truncation when lookahead proves a final page exactly fills the limit', async () => {
+    routeCdx(() => Response.json([header, rows[0]]));
+    const result = await runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      limit: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(out(result).snapshots).toHaveLength(1);
+    expect(result.structuredContent).not.toHaveProperty('truncated');
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(contentText(result)).not.toContain('captures past it');
+  });
+
+  it('preserves no_snapshots when a previously valid cursor reaches an empty index range', async () => {
+    const shared = createMockContext();
+    const definition = {
+      ...iaFindSnapshots,
+      handler: (
+        input: Parameters<typeof iaFindSnapshots.handler>[0],
+        ctx: Parameters<typeof iaFindSnapshots.handler>[1],
+      ) => iaFindSnapshots.handler(input, { ...ctx, state: shared.state }),
+    };
+    let empty = false;
+    routeCdx(() => Response.json(empty ? [header] : [header, ...rows.slice(0, 2)]));
+    const first = await runToolContract(definition, {
+      url: 'example.com',
+      mode: 'history',
+      limit: 1,
+    });
+    empty = true;
+    const result = await runToolContract(definition, {
+      url: 'example.com',
+      mode: 'history',
+      resume_key: out(first).resume_key,
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshots' } },
+    });
+    expect(contentText(result)).toContain('No snapshots found');
+    expect(contentText(result)).toContain('Recovery:');
+  });
+
+  it('walks three pages without loss, inherits filters and allows a different page size on both surfaces', async () => {
+    const shared = createMockContext();
+    const definition = {
+      ...iaFindSnapshots,
+      handler: (
+        input: Parameters<typeof iaFindSnapshots.handler>[0],
+        ctx: Parameters<typeof iaFindSnapshots.handler>[1],
+      ) => iaFindSnapshots.handler(input, { ...ctx, state: shared.state }),
+    };
+    routeCdx((request) => {
+      const qp = new URL(request.url).searchParams;
+      const from = qp.get('from') ?? '';
+      const selected = rows.filter((row) => row[0]! >= from);
+      const limit = Number(qp.get('limit'));
+      return Response.json([
+        header,
+        ...selected.slice(0, limit),
+        ...(selected.length > limit ? [[], ['RAW_SKIPS_BOUNDARY']] : []),
+      ]);
+    });
+    const base = { url: 'example.com', mode: 'history' };
+    const first = await runToolContract(definition, {
+      ...base,
+      collapse: 'timestamp:6',
+      from: '1999',
+      to: '2002',
+      status_filter: '200',
+      limit: 2,
+    });
+    const second = await runToolContract(definition, {
+      ...base,
+      resume_key: out(first).resume_key,
+      limit: 1,
+    });
+    const third = await runToolContract(definition, {
+      ...base,
+      resume_key: out(second).resume_key,
+      limit: 10,
+    });
+    expect([first, second, third].every((r) => !r.isError)).toBe(true);
+    expect(
+      [...out(first).snapshots, ...out(second).snapshots, ...out(third).snapshots].map((r) => [
+        r.timestamp,
+        r.digest,
+      ]),
+    ).toEqual(rows.map((r) => [r[0], r[4]]));
+    expect(out(third).resume_key).toBeUndefined();
+    for (const result of [first, second, third])
+      for (const row of out(result).snapshots) {
+        expect(contentText(result)).toContain(row.timestamp);
+        expect(contentText(result)).toContain(row.digest);
+      }
+    expect(contentText(first)).toContain(out(first).resume_key);
+    const paging = calls(isCdx).map((c) => Object.fromEntries(new URL(c.request.url).searchParams));
+    expect(paging[1]).toMatchObject({
+      from: '20000201000000',
+      to: '2002',
+      filter: 'statuscode:200',
+      collapse: 'timestamp:6',
+      limit: '2',
+    });
+    expect(paging[2]).toMatchObject({
+      from: '20000301000000',
+      collapse: 'timestamp:6',
+      limit: '11',
+    });
+    expect(paging.every((p) => !Object.hasOwn(p, 'resumeKey'))).toBe(true);
+    const conflict = await runToolContract(definition, {
+      ...base,
+      resume_key: out(first).resume_key,
+      collapse: 'timestamp:8',
+    });
+    expect(conflict.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.ValidationError, data: { reason: 'resume_key_conflict' } },
+    });
+    expect(contentText(conflict)).toContain('Recovery:');
+    expect(contentText(conflict)).toContain('omit collapse');
+    expect(calls(isCdx)).toHaveLength(3);
+  });
+
+  it.each(['ia-history-v1/not-a-uuid', 'ia-history-v1/00000000-0000-4000-8000-000000000000'])(
+    'rejects invalid server cursor %s without HTTP',
+    async (resume_key) => {
+      http.route({ match: () => true, respond: () => Response.json([header, rows[0]]) });
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'history',
+        resume_key,
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.ValidationError, data: { reason: 'invalid_resume_key' } },
+      });
+      expect(contentText(result)).toContain('one hour');
+      expect(contentText(result)).toContain('Restart history mode');
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([{ page: [] }, { page: [rows[0]] }])(
+    'keeps omission notice on a final or empty raw continuation',
+    async ({ page }) => {
+      routeCdx(() => Response.json([header, ...page]));
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com/*',
+        mode: 'history',
+        resume_key: 'RAW',
+        limit: 10,
+      });
+      expect(contentText(result)).toContain('can omit captures');
+      expect(JSON.stringify(result.structuredContent)).toContain('can omit captures');
+      expect(new URL(calls(isCdx)[0]!.request.url).searchParams.get('resumeKey')).toBe('RAW');
+    },
+  );
 });
 
 describe('ia_find_snapshots history-mode collapse', () => {
@@ -619,7 +807,7 @@ describe('ia_get_snapshot', () => {
     });
     expect(calls(isReplay)[0]?.request.url).toBe(replayUrl);
     const text = contentText(result);
-    expect(text).toContain(`**Replay URL:** ${replayUrl}`);
+    expect(text).toContain(`**Replay URL:** [${replayUrl}](<${replayUrl}>)`);
     expect(text).toContain('**Resolved Timestamp:** 20200101231916');
     expect(text).toContain('Hello world › more');
   });
@@ -877,7 +1065,7 @@ describe('ia_get_snapshot', () => {
       resolved_timestamp: '20200104000551',
     });
     const text = contentText(result);
-    expect(text).toContain(`**Replay URL:** ${served}`);
+    expect(text).toContain(`**Replay URL:** [${served}](<${served}>)`);
     expect(text).toContain('**Resolved Timestamp:** 20200104000551');
   });
 

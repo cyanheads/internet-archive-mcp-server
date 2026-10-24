@@ -3,13 +3,14 @@
  * @module services/wayback/wayback-service
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   JsonRpcErrorCode,
   McpError,
   notFound,
   serviceUnavailable,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
@@ -93,6 +94,21 @@ const WAYBACK_ORIGIN = 'https://web.archive.org';
 const WAYBACK_FETCH_BASE = `${WAYBACK_ORIGIN}/web`;
 const CDX_FIELDS = 'timestamp,statuscode,mimetype,original,digest,length';
 
+/** Cursor keys use the tenant-scoped store; expiry is in seconds. */
+const HISTORY_CURSOR_PREFIX = 'ia-history-v1/';
+const HISTORY_CURSOR_TTL = 3_600;
+const HISTORY_DEADLINE_MS = 45_000;
+const LEGACY_HISTORY_NOTICE =
+  'CDX raw continuation can omit captures when collapse is enabled. For complete paging on a stable index, restart with an exact URL and timestamp:N collapse (N=1–14).';
+const HistoryCursor = z.object({
+  url: z.string(),
+  collapse: z.string(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  statusFilter: z.string().optional(),
+  nextTimestamp: z.string().regex(/^\d{14}$/),
+});
+
 /** CDX rows read around the requested timestamp when the Availability API has no answer. */
 const CDX_CLOSEST_WINDOW = 10;
 
@@ -155,7 +171,97 @@ export class WaybackService {
    * Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429 or a
    * timeout (after one request), an HTML page, or an unparseable body.
    */
-  fetchHistory(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
+  async fetchHistory(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
+    let query = params;
+    let originalBounds = params.from;
+    const token = params.resumeKey;
+    const serverCursor = token?.startsWith(HISTORY_CURSOR_PREFIX);
+    if (token && serverCursor) {
+      const id = token.slice(HISTORY_CURSOR_PREFIX.length);
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ||
+        !ctx.state
+      ) {
+        throw validationError('resume_key is not a usable history cursor.', {
+          reason: 'invalid_resume_key',
+          ...ctx.recoveryFor('invalid_resume_key'),
+        });
+      }
+      const stored = await ctx.state.get(token, HistoryCursor);
+      if (!stored)
+        throw validationError('resume_key has expired or is unavailable for this caller.', {
+          reason: 'invalid_resume_key',
+          ...ctx.recoveryFor('invalid_resume_key'),
+        });
+      for (const field of ['url', 'collapse', 'from', 'to', 'statusFilter'] as const) {
+        if (params[field] !== undefined && params[field] !== stored[field]) {
+          throw validationError(
+            `resume_key conflicts with ${field === 'statusFilter' ? 'status_filter' : field}.`,
+            { reason: 'resume_key_conflict', ...ctx.recoveryFor('resume_key_conflict') },
+          );
+        }
+      }
+      originalBounds = stored.from;
+      query = { ...stored, limit: params.limit, from: stored.nextTimestamp };
+    }
+    const collapse = query.collapse ?? 'timestamp:8';
+    const exact = !query.url.includes('*');
+    const eligible =
+      exact &&
+      /^timestamp:(?:[1-9]|1[0-4])$/.test(collapse) &&
+      (!token || serverCursor) &&
+      !!ctx.state;
+    if (!eligible) {
+      const result = await this.historyPage(query, ctx);
+      return { ...result, ...((token || result.resumeKey) && { notice: LEGACY_HISTORY_NOTICE }) };
+    }
+    // Both the lookahead and a storage-outage fallback share this total deadline.
+    const bounded = {
+      ...ctx,
+      signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(HISTORY_DEADLINE_MS)]),
+    };
+    const limit = query.limit ?? 100;
+    const result = await this.historyPage({ ...query, limit: limit + 1 }, bounded);
+    const lookahead = result.records[limit];
+    if (!lookahead)
+      return {
+        ...result,
+        ...(result.resumeKey ? { notice: LEGACY_HISTORY_NOTICE } : { complete: true }),
+      };
+    const key = `${HISTORY_CURSOR_PREFIX}${crypto.randomUUID()}`;
+    // Preserve original bounds in the cursor, separately from the inclusive seek bound.
+    const cursor = {
+      url: query.url,
+      collapse,
+      ...(originalBounds && { from: originalBounds }),
+      ...(query.to && { to: query.to }),
+      ...(query.statusFilter && { statusFilter: query.statusFilter }),
+      nextTimestamp: lookahead.timestamp,
+    };
+    try {
+      await bounded.state.set(key, cursor, { ttl: HISTORY_CURSOR_TTL });
+    } catch (error) {
+      bounded.signal.throwIfAborted();
+      // Generated cursor values are JSON-safe; a typed storage failure can degrade to
+      // the legacy path. Re-query at the original limit so its raw key loses no extra row.
+      if (
+        !(error instanceof McpError) ||
+        ![
+          JsonRpcErrorCode.InternalError,
+          JsonRpcErrorCode.ConfigurationError,
+          JsonRpcErrorCode.ServiceUnavailable,
+          JsonRpcErrorCode.Timeout,
+        ].includes(error.code)
+      )
+        throw error;
+      const raw = await this.historyPage(query, bounded);
+      return { ...raw, notice: `History cursor storage is unavailable. ${LEGACY_HISTORY_NOTICE}` };
+    }
+    return { records: result.records.slice(0, limit), resumeKey: key };
+  }
+
+  /** One CDX page, retaining the raw trailer for legacy paging and storage fallback. */
+  private historyPage(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
     return this.retry('fetchHistory', CDX_API, ctx, async () => {
       const qp = new URLSearchParams({
         url: params.url,

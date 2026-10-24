@@ -7,10 +7,15 @@
  * @module tests/services/wayback-service.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createInMemoryStorage,
+  createMockContext,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchWithTimeout = vi.fn();
@@ -246,6 +251,271 @@ describe('WaybackService.fetchHistory CDX trailer handling', () => {
       expect.anything(),
       expect.anything(),
     );
+  });
+});
+
+describe('WaybackService exact collapsed continuation', () => {
+  it('preserves original-limit raw paging when a legacy context has no state', async () => {
+    const ctx = createMockContext();
+    Reflect.deleteProperty(ctx, 'state');
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]]),
+    );
+    const result = await buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx);
+    expect(result.resumeKey).toBe(RESUME_KEY);
+    expect(result.notice).toContain('can omit captures');
+    expect(requestedUrl(0).searchParams.get('limit')).toBe('1');
+  });
+
+  it.each([
+    new TypeError('programmer error'),
+    new McpError(JsonRpcErrorCode.ValidationError, 'invalid storage input'),
+  ])('propagates non-operational storage error %s without a fallback', async (error) => {
+    const ctx = createMockContext();
+    vi.spyOn(ctx.state, 'set').mockRejectedValue(error);
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+    );
+    await expect(buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx)).rejects.toBe(
+      error,
+    );
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not degrade cancellation during the cursor write to a raw success', async () => {
+    const controller = new AbortController();
+    const ctx = createMockContext({ signal: controller.signal });
+    vi.spyOn(ctx.state, 'set').mockImplementation(async () => {
+      controller.abort();
+      throw new McpError(JsonRpcErrorCode.InternalError, 'storage interrupted');
+    });
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+    );
+    await expect(
+      buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([JsonRpcErrorCode.ServiceUnavailable, JsonRpcErrorCode.Timeout])(
+    'uses one deadline and original-limit fallback after storage error %s',
+    async (code) => {
+      const deadline = new AbortController();
+      const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal);
+      const ctx = createMockContext();
+      vi.spyOn(ctx.state, 'set').mockRejectedValue(new McpError(code, 'store unavailable'));
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+      );
+      fetchWithTimeout.mockImplementationOnce(() =>
+        Promise.resolve(cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]])),
+      );
+      try {
+        const result = await buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx);
+        expect(result.resumeKey).toBe(RESUME_KEY);
+        expect(result.notice).toContain('storage is unavailable');
+        expect([
+          requestedUrl(0).searchParams.get('limit'),
+          requestedUrl(1).searchParams.get('limit'),
+        ]).toEqual(['2', '1']);
+        expect(ctx.signal.aborted).toBe(false);
+        expect(timeout).toHaveBeenCalledWith(45_000);
+        expect(fetchWithTimeout.mock.calls[0]![3].signal).toBe(
+          fetchWithTimeout.mock.calls[1]![3].signal,
+        );
+        deadline.abort();
+        expect(fetchWithTimeout.mock.calls[1]![3].signal.aborted).toBe(true);
+      } finally {
+        timeout.mockRestore();
+      }
+    },
+  );
+
+  it.each(Array.from({ length: 14 }, (_, i) => i + 1))(
+    'uses lookahead for precision %i, without leaking equal-timestamp/trailer rows',
+    async (precision) => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([
+          CDX_HEADER,
+          capture('20000101000000'),
+          capture('20000101000000'),
+          [''],
+          [RESUME_KEY],
+        ]),
+      );
+      const result = await buildService().fetchHistory(
+        { url: 'example.com?q=x', limit: 1, collapse: `timestamp:${precision}` },
+        ctx,
+      );
+      expect(result.records).toHaveLength(1);
+      expect(result.resumeKey).toMatch(/^ia-history-v1\//);
+      const stored = await ctx.state.get(result.resumeKey!);
+      expect(stored).toMatchObject({
+        nextTimestamp: '20000101000000',
+        collapse: `timestamp:${precision}`,
+      });
+    },
+  );
+
+  it.each([
+    { collapse: 'digest' },
+    { collapse: 'timestamp:0' },
+    { url: '*.example.com' },
+    { url: 'example.com/*' },
+    { resumeKey: RESUME_KEY },
+  ])('preserves noneligible/raw continuation %j with notice', async (options) => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]]),
+    );
+    const first = await buildService().fetchHistory(
+      { url: 'example.com', limit: 1, ...options },
+      createMockContext(),
+    );
+    expect(first.resumeKey).toBe(RESUME_KEY);
+    expect(first.notice).toContain('can omit captures');
+    expect(requestedUrl(0).searchParams.get('limit')).toBe('1');
+    fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, capture('20000201000000')]));
+    const final = await buildService().fetchHistory(
+      { url: 'example.com', limit: 5, ...options, resumeKey: first.resumeKey },
+      createMockContext(),
+    );
+    expect(final.notice).toContain('can omit captures');
+    expect(final.resumeKey).toBeUndefined();
+  });
+
+  it('expires tenant-scoped cursors after one hour through the real serialized store', async () => {
+    vi.useFakeTimers();
+    const ctx = createMockContext({ tenantId: 'a', errors: iaFindSnapshots.errors });
+    const other = createMockContext({ tenantId: 'b', errors: iaFindSnapshots.errors });
+    const storage = createInMemoryStorage();
+    for (const context of [ctx, other]) {
+      vi.spyOn(context.state, 'set').mockImplementation((key, value, options) =>
+        storage.set(key, value, context, options),
+      );
+      vi.spyOn(context.state, 'get').mockImplementation(
+        async <T>(key: string, schema?: z.ZodType<T>): Promise<T | null> => {
+          const value = await storage.get<T>(key, context);
+          return value === null || !schema ? value : schema.parse(value);
+        },
+      );
+    }
+    const svc = buildService();
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+    );
+    const first = await svc.fetchHistory({ url: 'example.com', limit: 1 }, ctx);
+    const stored = await ctx.state.get<{ nextTimestamp: string }>(first.resumeKey!);
+    stored!.nextTimestamp = 'mutated';
+    expect(await ctx.state.get(first.resumeKey!)).toMatchObject({
+      nextTimestamp: '20000201000000',
+    });
+    await expect(
+      svc.fetchHistory({ url: 'example.com', resumeKey: first.resumeKey }, other),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_resume_key' } });
+    await vi.advanceTimersByTimeAsync(3_600_001);
+    await expect(
+      svc.fetchHistory({ url: 'example.com', resumeKey: first.resumeKey }, ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_resume_key' },
+    });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back at the original limit when the real store is at capacity, preserving row boundaries', async () => {
+    const ctx = createMockContext();
+    const storage = createInMemoryStorage({ maxEntries: 0 });
+    vi.spyOn(ctx.state, 'set').mockImplementation((key, value, options) =>
+      storage.set(key, value, ctx, options),
+    );
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([
+        CDX_HEADER,
+        capture('20000101000000'),
+        capture('20000201000000'),
+        [],
+        ['WRONG_AFTER_LOOKAHEAD'],
+      ]),
+    );
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]]),
+    );
+    const result = await buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx);
+    expect(result.resumeKey).toBe(RESUME_KEY);
+    expect(result.notice).toContain('storage is unavailable');
+    expect(result.records).toHaveLength(1);
+    expect([
+      requestedUrl(0).searchParams.get('limit'),
+      requestedUrl(1).searchParams.get('limit'),
+    ]).toEqual(['2', '1']);
+  });
+
+  it.each(['url', 'collapse', 'from', 'to', 'statusFilter'] as const)(
+    'rejects explicit conflicting %s without another HTTP request',
+    async (field) => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const svc = buildService();
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+      );
+      const first = await svc.fetchHistory({ url: 'example.com', limit: 1 }, ctx);
+      await expect(
+        svc.fetchHistory(
+          { url: 'example.com', resumeKey: first.resumeKey, [field]: 'conflict' },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'resume_key_conflict' },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps the lookahead and resumes inclusively with omitted filters and changing limit', async () => {
+    const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+    const svc = buildService();
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([
+        CDX_HEADER,
+        capture('20000101000000'),
+        capture('20000201000000'),
+        capture('20000301000000'),
+        [],
+        [RESUME_KEY],
+      ]),
+    );
+    const first = await svc.fetchHistory(
+      {
+        url: 'example.com',
+        limit: 2,
+        collapse: 'timestamp:6',
+        from: '2000',
+        to: '2001',
+        statusFilter: '200',
+      },
+      ctx,
+    );
+    expect(first.records.map((r) => r.timestamp)).toEqual(['20000101000000', '20000201000000']);
+    expect(first.resumeKey).toMatch(/^ia-history-v1\//);
+    expect(requestedUrl(0).searchParams.get('limit')).toBe('3');
+    fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, capture('20000301000000')]));
+    const next = await svc.fetchHistory(
+      { url: 'example.com', limit: 5, resumeKey: first.resumeKey },
+      ctx,
+    );
+    expect(next.records.map((r) => r.timestamp)).toEqual(['20000301000000']);
+    expect(next.resumeKey).toBeUndefined();
+    expect(Object.fromEntries(requestedUrl(1).searchParams)).toMatchObject({
+      from: '20000301000000',
+      to: '2001',
+      filter: 'statuscode:200',
+      collapse: 'timestamp:6',
+      limit: '6',
+    });
+    expect(requestedUrl(1).searchParams.has('resumeKey')).toBe(false);
   });
 });
 
