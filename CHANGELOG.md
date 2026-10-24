@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-24
+
+Text continuation and complete capture paging
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-12 · ⚠️ Breaking · 🛡️ Security
 
 Upstream failures on every tool surface as declared errors; ia_get_text reads one page at a time with a capped max_chars; over-cap rows, max_files, and limit are served at the cap; search rows drop fav- lists and cap creators; the hosted endpoint is listed.
