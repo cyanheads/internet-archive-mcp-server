@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-10-12 20:45:12
+Generated on: 2026-10-24 19:23:11
 
 ```text
 internet-archive-mcp-server/
@@ -159,6 +159,7 @@ internet-archive-mcp-server/
 │   ├── services/
 │   │   ├── archive-metadata/
 │   │   │   ├── archive-metadata-service.ts
+│   │   │   ├── read-text-page.ts
 │   │   │   └── types.ts
 │   │   ├── archive-search/
 │   │   │   ├── archive-search-service.ts
@@ -197,7 +198,8 @@ internet-archive-mcp-server/
 │       ├── ia-get-item.tool.test.ts
 │       ├── ia-get-snapshot.tool.test.ts
 │       ├── ia-get-text.tool.test.ts
-│       └── ia-search-items.tool.test.ts
+│       ├── ia-search-items.tool.test.ts
+│       └── markdown-format.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

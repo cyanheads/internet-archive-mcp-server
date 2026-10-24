@@ -2,10 +2,10 @@
 
 **Server:** internet-archive-mcp-server
 **Version:** 0.4.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
-**Zod:** ^4.6.5
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -250,6 +250,7 @@ src/
       types.ts                          # Search domain types
     archive-metadata/
       archive-metadata-service.ts       # ArchiveMetadataService — Metadata API + downloads
+      read-text-page.ts                 # UTF-16 pages with UTF-8 byte checkpoints
       types.ts                          # Metadata domain types
   mcp-server/
     tools/definitions/

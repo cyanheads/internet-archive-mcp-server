@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
 
 /** Files returned per call. A larger `max_files` is served at this cap. */
@@ -153,6 +154,10 @@ export const iaGetItem = tool('ia_get_item', {
       ),
   },
 
+  enrichmentTrailer: {
+    notice: { render: (value) => escapeMarkdownInline(String(value)) },
+  },
+
   errors: [
     {
       reason: 'item_not_found',
@@ -258,22 +263,28 @@ export const iaGetItem = tool('ia_get_item', {
 
   format: (result) => {
     const lines: string[] = [];
-    lines.push(`# ${result.title ?? result.identifier}`);
-    lines.push(`**Identifier:** ${result.identifier}`);
-    if (result.mediatype) lines.push(`**Media Type:** ${result.mediatype}`);
-    if (result.creator) lines.push(`**Creator:** ${listText(result.creator)}`);
-    if (result.date) lines.push(`**Date:** ${result.date}`);
-    if (result.language) lines.push(`**Language:** ${listText(result.language)}`);
-    if (result.subject) lines.push(`**Subjects:** ${listText(result.subject)}`);
-    if (result.collection) lines.push(`**Collection:** ${listText(result.collection)}`);
-    if (result.licenseurl) lines.push(`**License:** ${result.licenseurl}`);
-    if (result.rights) lines.push(`**Rights:** ${result.rights}`);
+    const title = result.title ?? result.identifier;
+    lines.push(`${/[\r\n]/.test(title) ? '' : '# '}${escapeMarkdownInline(title)}`);
+    lines.push(`**Identifier:** ${escapeMarkdownInline(result.identifier)}`);
+    if (result.mediatype) lines.push(`**Media Type:** ${escapeMarkdownInline(result.mediatype)}`);
+    if (result.creator)
+      lines.push(`**Creator:** ${escapeMarkdownInline(listText(result.creator))}`);
+    if (result.date) lines.push(`**Date:** ${escapeMarkdownInline(result.date)}`);
+    if (result.language)
+      lines.push(`**Language:** ${escapeMarkdownInline(listText(result.language))}`);
+    if (result.subject)
+      lines.push(`**Subjects:** ${escapeMarkdownInline(listText(result.subject))}`);
+    if (result.collection)
+      lines.push(`**Collection:** ${escapeMarkdownInline(listText(result.collection))}`);
+    if (result.licenseurl)
+      lines.push(`**License:** ${markdownLink(result.licenseurl, result.licenseurl)}`);
+    if (result.rights) lines.push(`**Rights:** ${escapeMarkdownInline(result.rights)}`);
     if (result.description) {
       const desc = Array.isArray(result.description)
         ? result.description.join(' ')
         : result.description;
       lines.push('');
-      lines.push(`**Description:** ${desc}`);
+      lines.push(`**Description:** ${escapeMarkdownInline(desc)}`);
     }
     lines.push('');
     const count =
@@ -289,7 +300,9 @@ export const iaGetItem = tool('ia_get_item', {
       ]
         .filter(Boolean)
         .join(', ');
-      lines.push(`- **${f.name}**${meta ? ` (${meta})` : ''}: ${f.download_url}`);
+      lines.push(
+        `- **${escapeMarkdownInline(f.name)}**${meta ? ` (${escapeMarkdownInline(meta)})` : ''}: ${markdownLink(f.download_url, f.download_url)}`,
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

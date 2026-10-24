@@ -10,7 +10,7 @@
 | `ia_get_snapshot` | Fetch the archived content of a URL at a specific Wayback timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the archived text content (HTML stripped to readable text) and the replay URL and timestamp of the capture Wayback served. | `url`, `timestamp` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `ia_search_items` | Search the Internet Archive library (40M+ items) via the Advanced Search / Solr API. Filter by media type, collection, creator, date range, and language. Sort by downloads (the default), date, title, or random, with ties ordered by `identifier`. Returns identifiers, titles, creators (the first 10, with `creator_count` when a record lists more), media types, dates, download counts, collections (without `fav-` favorites lists), `total_found`, and current `page`/applied `rows` for pagination context. At most 200 rows per call — a larger `rows` on page 1 is served as 200 with a continuation notice — within Advanced Search's 10,000-result window. | `query`, `mediatype`, `collection`, `creator`, `date_from`/`date_to`, `language`, `sort`, `rows`, `page` | `readOnlyHint: true`, `openWorldHint: true` |
 | `ia_get_item` | Retrieve metadata and the file manifest for an Archive item by identifier. Returns title, creator, description, subjects, collections, license, language, the full `file_count`, and a page of files (default 50, at most 500 per call — a larger `max_files` is served as 500) with format, size, and direct download URL, optionally filtered to one format. The primary hub for acting on a search result. | `identifier`, `format`, `max_files`, `file_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `ia_get_text` | Retrieve the readable text content of a text item (OCR DjVuTXT or plain-text file) by identifier, with length-aware truncation and continuation pointer. Suited for public-domain books, documents, and transcripts. | `identifier`, `max_chars`, `char_offset` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `ia_get_text` | Retrieve readable OCR DjVuTXT or plain text by identifier. Page by UTF-16 offset or an expiring continuation token; return `has_more`, source-file metadata, and the next token when available. | `identifier`, `max_chars`, `char_offset`, `continuation` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 
 ### Error Contracts
 
@@ -18,12 +18,15 @@
 |:-----|:---------|:-----|:-----|
 | `ia_find_snapshots` | `missing_timestamp` | `InvalidParams` | Closest mode called with no `timestamp`, `""`, or a whitespace-only one; thrown before any Availability or CDX request |
 | `ia_find_snapshots` | `no_snapshots` | `NotFound` | CDX returned zero results for the given URL/filters |
+| `ia_find_snapshots` | `invalid_resume_key` | `ValidationError` | Server cursor is malformed, missing, expired, or unavailable in the current tenant; restart the history query |
+| `ia_find_snapshots` | `resume_key_conflict` | `ValidationError` | Explicit URL, collapse, date bounds, or status filter conflicts with the server cursor's query; retain the cursor's original query or start a new one |
 | `ia_find_snapshots` | `no_snapshot_available` | `NotFound` | Closest mode: neither the Availability API nor the CDX fallback has a capture near the timestamp. Either mode: CDX (history or fallback) or the Availability API answered 403, 410, or 451 — the Wayback Machine does not serve the URL — after one request, with a hint that no capture of it can be read |
 | `ia_find_snapshots` | `cdx_unavailable` | `ServiceUnavailable` | CDX answered HTTP 5xx or a network error after retries, 429 or a request timeout (on headers or body) after one request, another 4xx after one request (`retryable: false`, a hint naming `url`, `from`, `to`, and `resume_key`), or a 200 carrying an HTML page or unparseable body; in closest mode, the CDX fallback failed or ran past its deadline after the Availability API found nothing |
 | `ia_find_snapshots` | `availability_unavailable` | `ServiceUnavailable` | Closest mode: the Availability API answered HTTP 5xx or a network error after retries, 429 or a request timeout after one request, another 4xx after one request (`retryable: false`, a hint naming `url` and `timestamp`), or a 200 carrying an HTML page or unparseable body |
 | `ia_get_snapshot` | `no_snapshot_available` | `NotFound` | Neither the Availability API nor the CDX fallback has a capture near the requested timestamp, the replay returned 404, the replay is an archived error page (a non-2xx carrying `Memento-Datetime`, answered after one request; the message names the capture timestamp and archived status), or the replay answered another 4xx without `Memento-Datetime` (after one request, naming the status). A 403, 410, or 451 from the replay or from either lookup API says the Wayback Machine does not serve the URL and carries a hint that no capture of it can be read |
 | `ia_get_snapshot` | `content_fetch_failed` | `ServiceUnavailable` | Wayback unreachable during the closest-capture lookup or the archived-page fetch: 5xx (504 included), 408, 425, or a network error after retries, 429 answered after one request with a wait hint, a request timeout after one request, a lookup 4xx refusal after one request, or an unreadable lookup response; or the CDX fallback did not complete. Keeps the lookup's own wait, refusal, or history-mode hint when it has one |
 | `ia_search_items` | `invalid_mediatype` | `InvalidParams` | `mediatype` is neither one of the ten canonical media types nor a recognized alias (case-insensitive); thrown before any Advanced Search request, with a recovery listing the ten values |
+| `ia_search_items` | `invalid_date_range` | `ValidationError` | A nonblank date bound is not a real Gregorian `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`; answered before any Advanced Search request, naming the field and accepted formats |
 | `ia_search_items` | `rows_over_cap` | `InvalidParams` | `rows` above 200 with `page` ≥ 2; thrown before any request. Page 1 serves an over-cap `rows` at 200 instead |
 | `ia_search_items` | `page_limit_exceeded` | `InvalidParams` | `page × rows` (the `rows` actually sent, after the 200 cap) exceeds 10,000; thrown before any request, the message naming the last reachable page for that `rows` |
 | `ia_search_items` | `invalid_query` | `InvalidParams` | Advanced Search answered an `error` body that blames the request — an untagged query parse error, `[UNSUPPORTED_SORT]`, `[MALFORMED_QUERY]` (an unquoted URL), or `[UNSUPPORTED_VALUE]` (a `q` past 2,047 characters, filters included); answered after one request, relaying the upstream text on one line |
@@ -32,6 +35,9 @@
 | `ia_get_item` | `archive_unavailable` | `ServiceUnavailable` | Metadata API answered HTTP 5xx, 408, 425, a network error (a connection dropped mid-body included), an HTML page, or an unparseable body after retries; a request timeout (on headers or body) after its second occurrence, a first timeout being retried once; 429 (with a wait hint) after one request; another 4xx after one request with `retryable: false` and a hint to verify the identifier. No upstream body in `data` |
 | `ia_get_text` | `item_not_found` | `NotFound` | As for `ia_get_item` |
 | `ia_get_text` | `no_text_file` | `NotFound` | Item exists but `files[]` contains no DjVuTXT or plain-text file |
+| `ia_get_text` | `ambiguous_pagination` | `ValidationError` | Both a nonblank continuation token and an explicit `char_offset` were supplied |
+| `ia_get_text` | `invalid_continuation` | `ValidationError` | Cursor is invalid, expired, belongs to another item or tenant, or names a changed text file; recovery gives an offset call |
+| `ia_get_text` | `range_unavailable` | `ValidationError` | The text response does not honor the requested byte range; recovery gives an offset call |
 | `ia_get_text` | `download_forbidden` | `Forbidden` | Text file download returned HTTP 401 (login required) or 403 (limited collection), after one request |
 | `ia_get_text` | `archive_unavailable` | `ServiceUnavailable` | The metadata request failed as for `ia_get_item`, or the text file download did: 5xx, 408, 425, or a network error after retries; a request timeout (on headers or a stalled body) after its second occurrence, a first timeout being retried once; 429 (with a wait hint) after one request; another 4xx (404, 410, 451, …) after one request with `retryable: false` and a hint to check the manifest with `ia_get_item`. The recovery says a timed-out download can time out again on retry |
 | `ia://item/{identifier}` | `item_not_found` | `NotFound` | As for `ia_get_item` |
@@ -125,9 +131,9 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 
 | # | Call | Purpose |
 |:--|:-----|:--------|
-| 1 | `GET /cdx/search/cdx?url=&fl=timestamp,statuscode,mimetype,original,digest&collapse=timestamp:8&limit=N&showResumeKey=true[&resumeKey={key}]` | Fetch collapse-by-day capture list, applying date/status filters, with `N` = `limit` capped at 10,000; include resume key if continuing a prior page |
+| 1 | `GET /cdx/search/cdx?url=&fl=timestamp,statuscode,mimetype,original,digest,length&collapse=timestamp:8&limit=N&showResumeKey=true` | For exact-URL timestamp collapse, fetch the applied page size plus one row; a server cursor resumes inclusively at its saved next timestamp through `from`. Legacy raw keys still use `resumeKey` |
 | — | Parse header row; strip it; map rows to objects | Local transform (no extra call) |
-| — | Detect trailing `[[], ["<key>"]]` rows; strip them; expose `resume_key` in output if present | Enables continuation — output schema must include `resume_key?: string` and input must accept `resume_key?: string` |
+| — | Strip trailing `[]` or `[""]` separators and their key; expose a server cursor or legacy key as `resume_key` | Exact-URL timestamp cursors keep the unreturned row for the next page; legacy and wildcard continuation carries an incompleteness notice |
 
 ### `ia_get_snapshot` 
 
@@ -143,6 +149,7 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 | # | Call | Purpose |
 |:--|:-----|:--------|
 | — | Reject `rows` > 200 past page 1 and `page × rows` > 10,000; cap `rows` at 200 on page 1 | Local check, no request |
+| — | Trim date bounds, validate Gregorian dates, and expand year/month bounds to the period's first or last day | Local check, no request; omitted sides use `*`, and both omitted means no date filter |
 | 1 | `GET /advancedsearch.php?q=&fl[]=...&rows=&page=&sort[]=&output=json` | Solr search with field projection |
 | — | Classify an `error` body; drop `fav-` entries from `collection`; cut `creator` to 10 with `creator_count` | Local transform |
 
@@ -158,8 +165,8 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 | # | Call | Purpose |
 |:--|:-----|:--------|
 | 1 | `GET /metadata/{identifier}` | Locate DjVuTXT or plain-text file in `files[]` |
-| 2 | `GET archive.org/download/{identifier}/{filename}` | Stream-decode the text file up to the page's end, then cancel the read |
-| — | Keep `[char_offset, char_offset + max_chars)` plus one lookahead character for `has_more`; report the manifest `size` as `source_file_bytes` | Local pagination |
+| 2 | `GET archive.org/download/{identifier}/{filename}` with identity encoding; conditional byte Range when continuing | Validate the representation and byte range, stream-decode up to the page's end, then cancel the read |
+| — | Keep the requested UTF-16 page plus lookahead; report the manifest `size` as `source_file_bytes` | Save a tenant-scoped decoder checkpoint when a stable validator and cursor storage are available; no document text is stored |
 
 ---
 
@@ -195,11 +202,15 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 
 **`ia_get_text` separate from `ia_get_item`.** `ia_get_item` returns metadata + file manifest, not content. Fetching text content is a distinct, potentially large second request. Keeping it separate lets agents skip it when they only need metadata and file URLs.
 
-**`ia_get_text` reads a page, not the file.** The text file is stream-decoded (a multi-byte character split across chunks decodes intact), only the page plus one lookahead character is kept, and the upstream read is cancelled once that character arrives, so memory per call is bounded by the page size and upstream reads stop at the page's end. Offsets count UTF-16 code units, and `text`/`has_more` are what slicing the whole decoded file returns. `max_chars` is capped at `IA_MAX_SNAPSHOT_CHARS`: a larger value is served at the cap with a notice rather than rejected, since the output `max_chars` reports the applied value and the next offset follows from it. A byte ceiling on the read and a rejection by manifest `size` were both rejected because either would cut off text the tool can serve. An HTTP `Range` request cannot stand in for the stream: a UTF-16 offset has no fixed byte position in UTF-8. The early stop means the decoded length is unknown before the last page, so the output carries `source_file_bytes` (the manifest `size`) instead of a total character count.
+**Text continuation keeps a decoder checkpoint.** Text pages count UTF-16 code units and match slicing the whole decoded file, including BOMs, malformed UTF-8, and a page boundary inside a surrogate pair. An opaque, expiring tenant-scoped cursor binds the item, selected filename, and stable representation validator to a byte checkpoint and intra-character skip. Conditional identity-encoded Range requests resume there; the response status, range, and validator must agree before decoding. No document text is stored. Offset paging remains available when a validator or cursor storage is unavailable, with a notice. Memory stays bounded by the page and lookahead; `max_chars` retains its configured cap and `source_file_bytes` reports manifest bytes rather than a guessed character count.
+
+**Collapsed history uses an unreturned timestamp.** For exact URLs with `timestamp:N` collapse, N=1–14, one extra row identifies where the next page begins. The tenant-scoped expiring cursor retains the query filters and resumes inclusively at that row's timestamp, preserving page boundaries while allowing a different page size. Legacy CDX keys and wildcard histories keep their existing path with an incompleteness notice. A byte offset or CDX raw resume key cannot supply the same collapsed-page guarantee.
+
+**Partial dates expand at the search boundary.** `date_from` uses the first day of a requested year or month, and `date_to` uses its last day under Gregorian leap-year rules. Invalid dates fail before HTTP with `invalid_date_range`; the advertised inputs remain free strings so the error can name the field and recovery. Blank bounds are omitted, and reversed valid ranges retain the upstream empty-result behavior.
 
 **`ia_get_item` pages the manifest in the handler, not the service.** Most items have a few dozen files, but scanned books and collections carry hundreds to thousands (mostly per-page derivatives), which put megabytes on both response surfaces. The handler filters by `format` and slices by `max_files`/`file_offset` so `structuredContent` and `content[]` carry the same page; `ArchiveMetadataService.getItem` keeps returning the full manifest because `ia_get_text` scans every file for its text source. Truncation and the match count go through the enrichment block (`truncated`, `totalCount`, `notice`) rather than a domain field.
 
-**Over-cap `max_files` and `limit` are served at the cap.** Both are workload caps on a read, so a value between the cap and a hard ceiling has one reading — as many as one call allows — and is served at the cap rather than rejected: `max_files` 501–300,000 at 500 (the largest manifest measured holds 288,113 files), history-mode `limit` 10,001–150,000 at 10,000 (CDX's documented per-query maximum; CDX itself receives `limit=10000`). When the cap withholds results the response sets `truncated`/`shown`/`cap` with the applied value and a notice naming the continuation: the next `file_offset`, computed from the files returned, or `resume_key`. Closest mode never reads `limit`. Raising the caps was rejected because responses on a hosted server should stay bounded.
+**Over-cap `max_files` and `limit` are served at the cap.** Both are workload caps on a read, so a value between the cap and a hard ceiling is served at the cap rather than rejected: `max_files` 501–300,000 at 500, history-mode `limit` 10,001–150,000 at 10,000 returned records. Exact-URL timestamp-collapse histories request one additional row for continuation. When the cap withholds results the response sets `truncated`/`shown`/`cap` with the applied value and a notice naming the next `file_offset` or `resume_key`. Closest mode never reads `limit`.
 
 **Metadata API `{}` empty response = not found.** The API returns HTTP 200 with `{}` for unknown identifiers rather than 404, so the service throws `item_not_found` for it. The same goes for any body with neither `metadata` nor `files`: an identifier with a `/` in it addresses a sub-path, which answers `{"error": "Couldn't get 'b' for item a"}` or a bare `{"result": …}` with HTTP 200 — no item, though it would otherwise read as one with no metadata and no files.
 
@@ -242,6 +253,8 @@ Target audience: researchers, journalists, fact-checkers, and any agent that nee
 - A page with no charset declaration that is not valid UTF-8 decodes with Wayback's guessed charset or windows-1252; a wrong guess can still substitute letters in a page that is neither UTF-8 nor windows-1252
 - The CDX `sort=closest` fallback often takes longer than its 25 s deadline for heavily archived URLs; closest mode then reports `cdx_unavailable` and points at history mode
 - `ia_get_snapshot` reads at most the first 4 MiB of a page
+- Text and history cursors expire after one hour and depend on the configured state store; restarting an in-memory deployment invalidates its cursors. A changed text representation invalidates its text cursor. Offset paging and a fresh history query remain available
+- Legacy CDX resume keys and wildcard history paging may omit captures across page boundaries; their responses disclose this limitation
 - `ia_get_text` reports no total character count — a document's length is known only once a page reaches its end (`has_more: false`); `source_file_bytes` gives the file's size in bytes, and UTF-8 text other than ASCII takes more than one byte per character
 - Items in restricted collections return metadata but download URLs may 403 — `ia_get_text` surfaces this in the error rather than failing silently
 - Copyright varies widely by item; the `licenseurl` and rights fields are surfaced as-is without legal interpretation
@@ -270,7 +283,7 @@ GET https://web.archive.org/cdx/search/cdx?url={url}&output=json
   &showResumeKey=true                                         (pagination token)
   &resumeKey={key}                                            (continue from)
   &closest={timestamp}&sort=closest                           (nearest captures first)
-Response: array-of-arrays; row[0] = header; row[N] = data; last two rows = ["", resumeKey] when more exist
+Response: array-of-arrays; row[0] = header; row[N] = data; trailing [] or [""] followed by [resumeKey] when more exist
 Error: empty array or HTTP 503/504 on missing url param or overloaded query
 ```
 
