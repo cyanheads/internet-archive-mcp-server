@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-28
+
+Publish an Internet Archive research guide over MCP and preserve SDK runtime modules in desktop bundles.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-24
 
 Text continuation and complete capture paging

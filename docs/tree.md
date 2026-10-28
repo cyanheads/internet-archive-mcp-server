@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-10-28 07:05:12
+Generated on: 2026-10-28 07:30:29
 
 ```text
 internet-archive-mcp-server/
@@ -28,6 +28,7 @@ internet-archive-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -139,6 +140,9 @@ internet-archive-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── internet-archive-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -189,6 +193,8 @@ internet-archive-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   │   └── ia-item.resource.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── archive-metadata-service.test.ts
 │   │   ├── wayback-content.test.ts
