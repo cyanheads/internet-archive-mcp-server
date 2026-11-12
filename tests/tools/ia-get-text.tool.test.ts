@@ -96,6 +96,7 @@ describe('iaGetText', () => {
       500,
       1000,
       expect.anything(),
+      {},
     );
     expect(result.has_more).toBe(true);
   });
@@ -123,6 +124,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        {},
       );
       expect(result.isError).toBeFalsy();
       const structured = result.structuredContent as { max_chars: number; text: string };
@@ -157,6 +159,7 @@ describe('iaGetText', () => {
           maxChars,
           0,
           expect.anything(),
+          {},
         );
         expect((result.structuredContent as { max_chars: number }).max_chars).toBe(maxChars);
         expect(noticeOf(result)).toBeUndefined();
@@ -204,6 +207,7 @@ describe('iaGetText', () => {
         50_000,
         250_000,
         expect.anything(),
+        {},
       );
       expect(noticeOf(result)).toContain('char_offset 300,000');
     });
@@ -229,7 +233,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
-        'previous-token',
+        { continuation: 'previous-token' },
       );
       expect(result.structuredContent).toMatchObject({
         char_offset: 120,
@@ -293,6 +297,195 @@ describe('iaGetText', () => {
       expect(structured.text).toBe('');
       expect(structured.has_more).toBe(false);
       expect(contentText(result)).toContain('end of document');
+    });
+  });
+
+  describe('text file selection', () => {
+    const noticeOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+    const page = (extra: Record<string, unknown> = {}) => ({
+      text: 'Book I.',
+      hasMore: true,
+      charOffset: 0,
+      maxChars: 50_000,
+      sourceFile: 'Strabo 01 Geography 1-2_djvu.txt',
+      ...extra,
+    });
+
+    it('forwards file to the service exactly as given', async () => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      await runToolContract(iaGetText, {
+        identifier: 'Strabo08Geography17AndIndex',
+        file: 'Strabo 02 Geography 3-5_djvu.txt',
+      });
+
+      expect(mockService.getTextContent).toHaveBeenCalledWith(
+        'Strabo08Geography17AndIndex',
+        50_000,
+        0,
+        expect.anything(),
+        { file: 'Strabo 02 Geography 3-5_djvu.txt' },
+      );
+    });
+
+    it.each([
+      ['empty', ''],
+      ['whitespace-only', '  '],
+    ])('treats an %s file as omitted', async (_label, file) => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      await runToolContract(iaGetText, { identifier: 'strabo', file });
+
+      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({});
+    });
+
+    it('names the readable file count and the format that lists them on both surfaces', async () => {
+      mockService.getTextContent.mockResolvedValue(
+        page({ textFiles: { count: 8, formats: ['DjVuTXT'], unformatted: 0 } }),
+      );
+
+      const result = await runToolContract(iaGetText, {
+        identifier: 'Strabo08Geography17AndIndex',
+      });
+
+      expect(noticeOf(result)).toBe(
+        'This item has 8 readable text files; this page is from the default one, source_file. ia_get_item with format "DjVuTXT" lists them. Pass another one\'s name as file to read it.',
+      );
+      expect(contentText(result)).toContain(noticeOf(result));
+      expect(() => iaGetText.output.parse(result.structuredContent)).not.toThrow();
+    });
+
+    it.each([
+      [
+        'two formats',
+        { count: 3, formats: ['DjVuTXT', 'Text'], unformatted: 0 },
+        'ia_get_item with format "DjVuTXT" or "Text" lists them.',
+      ],
+      [
+        'three formats',
+        { count: 3, formats: ['DjVuTXT', 'Text', 'Closed Caption Text'], unformatted: 0 },
+        'format "DjVuTXT", "Text", or "Closed Caption Text" lists them.',
+      ],
+      [
+        'files with no format besides formatted ones',
+        { count: 3, formats: ['DjVuTXT'], unformatted: 2 },
+        'format "DjVuTXT" lists them, except 2 with no format, listed only in the unfiltered manifest.',
+      ],
+      [
+        'only files with no format',
+        { count: 2, formats: [], unformatted: 2 },
+        'The unfiltered ia_get_item manifest lists them.',
+      ],
+    ])('says how to list the files for %s', async (_label, textFiles, expected) => {
+      mockService.getTextContent.mockResolvedValue(page({ textFiles }));
+
+      const result = await runToolContract(iaGetText, { identifier: 'item' });
+
+      expect(noticeOf(result)).toContain(`This item has ${textFiles.count} readable text files`);
+      expect(noticeOf(result)).toContain(expected);
+    });
+
+    it('keeps an upstream format raw in structuredContent and escapes it in content[]', async () => {
+      mockService.getTextContent.mockResolvedValue(
+        page({ textFiles: { count: 2, formats: ['*Text*'], unformatted: 0 } }),
+      );
+
+      const result = await runToolContract(iaGetText, { identifier: 'item' });
+
+      expect(noticeOf(result)).toContain('format "*Text*" lists them');
+      expect(contentText(result)).toContain('format "\\*Text\\*" lists them');
+      expect(contentText(result)).not.toContain('"*Text*"');
+    });
+
+    it('sends the clamp and file-count notices together', async () => {
+      mockService.getTextContent.mockResolvedValue(
+        page({ textFiles: { count: 8, formats: ['DjVuTXT'], unformatted: 0 } }),
+      );
+
+      const result = await runToolContract(iaGetText, { identifier: 'item', max_chars: 60_000 });
+
+      const notice = noticeOf(result) ?? '';
+      expect(notice).toMatch(/^max_chars 60,000 is above .* Continue from char_offset 50,000\. /);
+      expect(notice).toContain('This item has 8 readable text files');
+      expect(contentText(result)).toContain(notice);
+    });
+
+    it('adds no file-count notice when the service reports no textFiles', async () => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      const result = await runToolContract(iaGetText, { identifier: 'prideprejudice00aust' });
+
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    const STRABO_URL =
+      'https://archive.org/download/Strabo08Geography17AndIndex/Strabo%2002%20Geography%203-5_djvu.txt';
+
+    it('reads the identifier and file a download URL names', async () => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      await runToolContract(iaGetText, { identifier: STRABO_URL });
+
+      expect(mockService.getTextContent).toHaveBeenCalledWith(
+        'Strabo08Geography17AndIndex',
+        50_000,
+        0,
+        expect.anything(),
+        { file: 'Strabo 02 Geography 3-5_djvu.txt' },
+      );
+    });
+
+    it('lets an explicit file win over the file a download URL names', async () => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      await runToolContract(iaGetText, {
+        identifier: STRABO_URL,
+        file: 'Strabo 03 Geography_djvu.txt',
+      });
+
+      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({
+        file: 'Strabo 03 Geography_djvu.txt',
+      });
+    });
+
+    it('reads a details URL as its identifier with the default file', async () => {
+      mockService.getTextContent.mockResolvedValue(page());
+
+      await runToolContract(iaGetText, {
+        identifier: 'archive.org/details/prideprejudice00aust/page/n5/mode/2up',
+      });
+
+      expect(mockService.getTextContent.mock.calls[0]?.[0]).toBe('prideprejudice00aust');
+      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({});
+    });
+
+    it.each([
+      ['a URL on another host', 'https://example.com/foo', 'invalid_identifier'],
+      [
+        'a Wayback Machine URL',
+        'https://web.archive.org/web/2020/https://example.com/',
+        'ia_get_snapshot',
+      ],
+    ])('rejects %s as invalid_identifier with no lookup', async (_label, identifier, hintTerm) => {
+      const result = await runToolContract(iaGetText, { identifier });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_identifier', recovery: { hint: expect.any(String) } },
+        },
+      });
+      expect(contentText(result)).toContain(hintTerm);
+      expect(mockService.getTextContent).not.toHaveBeenCalled();
+    });
+
+    it('declares invalid_file as InvalidParams with a recovery naming the readable formats and download_url', () => {
+      const entry = iaGetText.errors?.find((e) => e.reason === 'invalid_file');
+      expect(entry?.code).toBe(JsonRpcErrorCode.InvalidParams);
+      for (const term of ['DjVuTXT', 'Text', 'Plain Text', 'Metadata', 'download_url']) {
+        expect(entry?.recovery).toContain(term);
+      }
     });
   });
 
@@ -384,6 +577,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        {},
       );
     });
   });

@@ -18,6 +18,10 @@ describe('upstream Markdown syntax', () => {
       replay_url: 'https://example.com/a_(b)',
       resolved_timestamp: '20200101000000',
       resolved_status: '200',
+      char_offset: 0,
+      max_chars: 50,
+      has_more: false,
+      total_chars: text.length,
     };
     expect(iaGetText.format!(document)).toEqual([
       { type: 'text', text: expect.stringContaining('\\*literal\\* \\[label\\](url)') },
@@ -55,6 +59,24 @@ describe('upstream Markdown syntax', () => {
     expect(iaSearchItems.format!(search)).toEqual([
       { type: 'text', text: expect.stringContaining('## \\*title\\*') },
     ]);
+  });
+
+  it('escapes list titles, catalog fields, and descriptions in item Markdown', () => {
+    const item = {
+      identifier: 'a',
+      title: ['*one*', '[two](x)'],
+      publisher: '<i>Press</i>',
+      volume: '*2*',
+      description: ['# heading', '- item'],
+      file_count: 0,
+      files: [],
+    };
+    const [block] = iaGetItem.format!(item) as [{ text: string }];
+    expect(block.text).toMatch(/^# \\\*one\\\*, \\\[two\\\]\(x\)\n/);
+    expect(block.text).toContain('**Publisher:** \\<i>Press\\</i>');
+    expect(block.text).toContain('**Volume:** \\*2\\*');
+    expect(block.text).toContain('**Description:** \\# heading\\\n\\- item');
+    expect(item.title).toEqual(['*one*', '[two](x)']);
   });
 
   it('renders capture URLs as links and escapes opaque resume keys', () => {

@@ -20,19 +20,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchWithTimeout = vi.fn();
 
-/** Pass-through retry by default; a test flips `real` to run the framework's retry loop. */
+/**
+ * Pass-through retry by default — one attempt, on the caller's signal, with no deadline — and
+ * a test flips `real` to run the framework's retry loop.
+ */
 const retryMode = { real: false };
 
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>();
+  type Attempt = Parameters<Parameters<typeof actual.withRetry>[0]>[0];
   return {
     ...actual,
     fetchWithTimeout: (...args: Parameters<typeof fetchWithTimeout>) => fetchWithTimeout(...args),
-    withRetry: <T>(fn: () => Promise<T>, options?: Parameters<typeof actual.withRetry>[1]) =>
-      retryMode.real ? actual.withRetry(fn, options) : fn(),
+    withRetry: <T>(
+      fn: (attempt: Attempt) => Promise<T>,
+      options?: Parameters<typeof actual.withRetry>[1],
+    ) =>
+      retryMode.real
+        ? actual.withRetry(fn, options)
+        : fn({
+            signal: options?.signal ?? new AbortController().signal,
+            remainingMs: Number.POSITIVE_INFINITY,
+          }),
   };
 });
 
+import { getServerConfig } from '@/config/server-config.js';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { WaybackService } from '@/services/wayback/wayback-service.js';
@@ -167,6 +180,18 @@ const upstreamNetworkError = async (): Promise<McpError> => {
 const FALLBACK_INCOMPLETE = {
   message: expect.stringMatching(/Availability API found no capture.*CDX .*did not complete/),
   hint: expect.stringContaining('history mode'),
+};
+
+/** The route a lookup that could not answer names: history mode, then the exact-timestamp read. */
+const NO_LOOKUP_ROUTE =
+  /history mode, passing from and to around the timestamp, then read one with ia_get_snapshot and its exact 14-digit timestamp/;
+
+/** What a lookup says when the Availability API failed and its CDX fallback did not answer either. */
+const LOOKUP_FAILED = {
+  message: expect.stringMatching(
+    /^The closest-capture lookup for \S+ near \d+ did not complete: Availability API .+ The CDX closest-capture check it fell back to did not complete either: /,
+  ),
+  hint: expect.stringMatching(NO_LOOKUP_ROUTE),
 };
 
 /** The URL the service requested on call `n` (0-based). */
@@ -520,8 +545,39 @@ describe('WaybackService exact collapsed continuation', () => {
 });
 
 describe('WaybackService.findClosest resolution', () => {
-  const findClosest = (url: string, timestamp: string, errors = iaFindSnapshots.errors) =>
-    buildService().findClosest(url, timestamp, createMockContext({ errors }));
+  const findClosest = (
+    url: string,
+    timestamp: string | undefined,
+    errors = iaFindSnapshots.errors,
+  ) => buildService().findClosest(url, timestamp, createMockContext({ errors }));
+
+  it('asks both sources for the latest capture when there is no timestamp, naming none', async () => {
+    fetchWithTimeout
+      .mockResolvedValueOnce(availability({ archived_snapshots: {} }))
+      .mockResolvedValueOnce(cdxClosest());
+
+    await expect(findClosest('example.com', undefined, iaGetSnapshot.errors)).rejects.toMatchObject(
+      {
+        code: JsonRpcErrorCode.NotFound,
+        message: 'No snapshot available for example.com.',
+        data: { reason: 'no_snapshot_available', url: 'example.com' },
+      },
+    );
+    expect(requestedUrl(0).searchParams.has('timestamp')).toBe(false);
+    expect(requestedUrl(0).searchParams.get('url')).toBe('example.com');
+    // CDX reads a blank closest as the latest capture.
+    expect(requestedUrl(1).searchParams.get('closest')).toBe('');
+    expect(requestedUrl(1).searchParams.get('sort')).toBe('closest');
+
+    fetchWithTimeout
+      .mockResolvedValueOnce(availability({ archived_snapshots: {} }))
+      .mockRejectedValueOnce(await upstreamError(503));
+    const err = (await findClosest('example.com', undefined, iaGetSnapshot.errors).catch(
+      (e: unknown) => e,
+    )) as McpError;
+    expect(err.message).toMatch(/^The Availability API found no capture of example\.com, and /);
+    expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('undefined');
+  });
 
   it('returns the Availability capture with an https replay URL, in one request', async () => {
     fetchWithTimeout.mockResolvedValueOnce(
@@ -815,8 +871,10 @@ describe('WaybackService upstream 5xx surfaces as a declared reason (#26)', () =
     ).rejects.toBe(cancelled);
   });
 
-  it('maps an Availability 5xx onto availability_unavailable under ia_find_snapshots', async () => {
-    fetchWithTimeout.mockRejectedValueOnce(await upstreamError(503));
+  it('maps an Availability 5xx whose CDX fallback fails too onto availability_unavailable under ia_find_snapshots', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503))
+      .mockRejectedValueOnce(await upstreamError(502));
 
     await expect(
       buildService().findClosest(
@@ -826,13 +884,14 @@ describe('WaybackService upstream 5xx surfaces as a declared reason (#26)', () =
       ),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
+      message: LOOKUP_FAILED.message,
       data: {
         reason: 'availability_unavailable',
         status: 503,
-        recovery: { hint: declaredRecovery(findErrors, 'availability_unavailable') },
+        recovery: { hint: LOOKUP_FAILED.hint },
       },
     });
-    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
   });
 
   it('maps a 5xx from the fallback CDX query onto cdx_unavailable', async () => {
@@ -925,7 +984,7 @@ describe('WaybackService upstream 5xx surfaces as a declared reason (#26)', () =
     expect(err.data).not.toHaveProperty('retryable');
   });
 
-  it('answers an Availability 429 after one request under availability_unavailable', async () => {
+  it('answers an Availability 429 after one request, then one CDX attempt, under availability_unavailable', async () => {
     retryMode.real = true;
     vi.useFakeTimers();
     const limited = await upstreamError(429);
@@ -939,37 +998,43 @@ describe('WaybackService upstream 5xx surfaces as a declared reason (#26)', () =
     const err = (await pending) as McpError;
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
+      message: LOOKUP_FAILED.message,
       data: {
         reason: 'availability_unavailable',
-        recovery: { hint: expect.stringMatching(/wait/) },
+        status: 429,
+        recovery: { hint: expect.stringMatching(/rate-limiting.*wait several minutes, then/) },
       },
     });
     expect(err.data).not.toHaveProperty('retryable');
-    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    expect(requestedUrl(1).hostname).toBe('web.archive.org');
   });
 
   it.each([
     ['an HTML page', '<html><body>Temporarily Offline</body></html>'],
     ['unparseable JSON', '{"url": "example.com", "archived_snap'],
-  ])('maps an Availability 200 carrying %s onto availability_unavailable', async (_name, body) => {
-    fetchWithTimeout.mockResolvedValueOnce(availabilityText(body));
+  ])(
+    'maps an Availability 200 carrying %s, then a failed fallback, onto availability_unavailable',
+    async (_name, body) => {
+      fetchWithTimeout
+        .mockResolvedValueOnce(availabilityText(body))
+        .mockResolvedValueOnce(cdxText('<html><body>Temporarily Offline</body></html>'));
 
-    const err = (await buildService()
-      .findClosest('example.com', '20200101', createMockContext({ errors: findErrors }))
-      .catch((e: unknown) => e)) as McpError;
+      const err = (await buildService()
+        .findClosest('example.com', '20200101', createMockContext({ errors: findErrors }))
+        .catch((e: unknown) => e)) as McpError;
 
-    expect(err).toMatchObject({
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      data: {
-        reason: 'availability_unavailable',
-        recovery: { hint: declaredRecovery(findErrors, 'availability_unavailable') },
-      },
-    });
-    expect(err.code).not.toBe(JsonRpcErrorCode.ValidationError);
-    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
-  });
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: LOOKUP_FAILED.message,
+        data: { reason: 'availability_unavailable', recovery: { hint: LOOKUP_FAILED.hint } },
+      });
+      expect(err.code).not.toBe(JsonRpcErrorCode.ValidationError);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    },
+  );
 
-  it('retries an Availability HTML page as CDX’s HTML case is retried', async () => {
+  it('retries an Availability HTML page as CDX’s HTML case is retried, then falls back once', async () => {
     retryMode.real = true;
     vi.useFakeTimers();
     fetchWithTimeout.mockImplementation(() =>
@@ -983,9 +1048,11 @@ describe('WaybackService upstream 5xx surfaces as a declared reason (#26)', () =
 
     expect(await pending).toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
+      message: LOOKUP_FAILED.message,
       data: { reason: 'availability_unavailable', retryAttempts: 4 },
     });
-    expect(fetchWithTimeout).toHaveBeenCalledTimes(4);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(5);
+    expect(requestedUrl(4).hostname).toBe('web.archive.org');
   });
 });
 
@@ -1082,7 +1149,11 @@ describe('WaybackService timeouts and network errors (#31)', () => {
   });
 
   it('asks the replay fetch, and only it, to capture Memento-Datetime on an error', async () => {
-    fetchWithTimeout.mockResolvedValueOnce(new Response('<p>page</p>'));
+    // Declared, so both runtimes read it as HTML: Node's Response gives a bare string body
+    // text/plain, which routes the capture to its id_ form, while Bun gives it no type.
+    fetchWithTimeout.mockResolvedValueOnce(
+      new Response('<p>page</p>', { headers: { 'content-type': 'text/html' } }),
+    );
     await buildService().fetchContent(
       'https://web.archive.org/web/20200104000551/example.com',
       createMockContext({ errors: iaGetSnapshot.errors }),
@@ -1116,6 +1187,387 @@ describe('WaybackService timeouts and network errors (#31)', () => {
 
     expect(await failure(history)).toBe(deadline);
     expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('WaybackService.findClosest falls back to CDX when the Availability API fails (#53)', () => {
+  const findErrors = iaFindSnapshots.errors;
+  const lookup = (errors = findErrors, ctx = createMockContext({ errors })) =>
+    buildService().findClosest('example.com', '20200101', ctx);
+  const CDX_CAPTURE = () => cdxClosest(['20200101231916', 'https://example.com/', '200']);
+  const RESOLVED = {
+    snapshotUrl: 'https://web.archive.org/web/20200101231916/https://example.com/',
+    timestamp: '20200101231916',
+    status: '200',
+  };
+
+  /** Each failed answer that falls back, as the fetch layer throws or returns it. */
+  const failedAnswers: [string, () => Promise<Response>][] = [
+    ['a 429', async () => Promise.reject(await upstreamError(429))],
+    ['a 500', async () => Promise.reject(await upstreamError(500))],
+    ['a 503', async () => Promise.reject(await upstreamError(503))],
+    ['a 504', async () => Promise.reject(await upstreamError(504))],
+    ['a 408', async () => Promise.reject(await upstreamError(408))],
+    ['a 425', async () => Promise.reject(await upstreamError(425))],
+    ['an HTML page', async () => availabilityText('<html><body>Temporarily Offline</body></html>')],
+    ['unparseable JSON', async () => availabilityText('{"url": "example.com", "archived_snap')],
+  ];
+
+  it.each(failedAnswers)(
+    'resolves through one CDX closest query after %s',
+    async (_label, answer) => {
+      fetchWithTimeout.mockImplementationOnce(answer).mockResolvedValueOnce(CDX_CAPTURE());
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+      expect(requestedUrl(0).hostname).toBe('archive.org');
+      const cdx = requestedUrl(1);
+      expect(cdx.origin + cdx.pathname).toBe('https://web.archive.org/cdx/search/cdx');
+      expect(cdx.searchParams.get('closest')).toBe('20200101');
+    },
+  );
+
+  it.each([
+    ['ia_find_snapshots', iaFindSnapshots.errors],
+    ['ia_get_snapshot', iaGetSnapshot.errors],
+  ] as const)(
+    'answers a 429 whose CDX fallback is empty as no_snapshot_available with the %s hint',
+    async (_name, errors) => {
+      fetchWithTimeout
+        .mockRejectedValueOnce(await upstreamError(429))
+        .mockResolvedValueOnce(cdxClosest());
+
+      await expect(lookup(errors)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: 'No snapshot available for example.com near 20200101.',
+        data: {
+          reason: 'no_snapshot_available',
+          recovery: { hint: declaredRecovery(errors, 'no_snapshot_available') },
+        },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    ['ia_find_snapshots', iaFindSnapshots.errors],
+    ['ia_get_snapshot', iaGetSnapshot.errors],
+  ] as const)(
+    'keeps availability_unavailable, the 429 and its wait, when the CDX fallback fails too, under %s',
+    async (_name, errors) => {
+      const limited = await upstreamError(429, { 'retry-after': '120' });
+      fetchWithTimeout
+        .mockRejectedValueOnce(limited)
+        .mockRejectedValueOnce(await upstreamError(503));
+
+      const err = (await lookup(errors).catch((e: unknown) => e)) as McpError;
+
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: LOOKUP_FAILED.message,
+        data: {
+          reason: 'availability_unavailable',
+          status: 429,
+          retryAfter: '120',
+          recovery: { hint: expect.stringMatching(/rate-limiting.*wait 120 seconds, then list/) },
+        },
+      });
+      expect(err.message).toContain('Availability API returned HTTP 429 (rate limited).');
+      expect(err.message).toContain('CDX API returned HTTP 503.');
+      expect(err.message).not.toMatch(/found no capture/);
+      expect(err.data?.recovery).toMatchObject({ hint: LOOKUP_FAILED.hint });
+      expect(err.data).not.toHaveProperty('retryable');
+      expect(err.cause).toMatchObject({ data: { reason: 'cdx_unavailable', status: 503 } });
+    },
+  );
+
+  it('names the CDX wait when only the fallback was rate-limited, and the Availability status', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503))
+      .mockRejectedValueOnce(await upstreamError(429, { 'retry-after': '60' }));
+
+    const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+    expect(err).toMatchObject({
+      message: LOOKUP_FAILED.message,
+      data: {
+        reason: 'availability_unavailable',
+        status: 503,
+        retryAfter: '60',
+        recovery: { hint: expect.stringMatching(/rate-limiting.*wait 60 seconds, then list/) },
+      },
+    });
+  });
+
+  it('promises no retry only when neither source can answer this request', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503))
+      .mockRejectedValueOnce(await upstreamError(400));
+    const refusedFallback = (await lookup().catch((e: unknown) => e)) as McpError;
+    expect(refusedFallback.data).not.toHaveProperty('retryable');
+    expect(refusedFallback.data?.recovery).toMatchObject({
+      hint: expect.stringMatching(/^Retry later, or list nearby captures/),
+    });
+
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(501))
+      .mockRejectedValueOnce(await upstreamError(400));
+    const refusedBoth = (await lookup().catch((e: unknown) => e)) as McpError;
+    expect(refusedBoth.data).toMatchObject({
+      reason: 'availability_unavailable',
+      retryable: false,
+      recovery: { hint: expect.stringMatching(/^A retry will not help; list nearby captures/) },
+    });
+  });
+
+  it('keeps a 5xx Retry-After when neither source was rate-limited', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503, { 'retry-after': '120' }))
+      .mockRejectedValueOnce(await upstreamError(503));
+
+    const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+    expect(err.data).toMatchObject({
+      reason: 'availability_unavailable',
+      status: 503,
+      retryAfter: '120',
+      recovery: { hint: expect.stringMatching(/^Retry later, or list nearby captures/) },
+    });
+  });
+
+  it('names the first rate-limited answer’s wait when both sources were rate-limited', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(429, { 'retry-after': '120' }))
+      .mockRejectedValueOnce(await upstreamError(429, { 'retry-after': '60' }));
+
+    const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+    expect(err.data).toMatchObject({
+      reason: 'availability_unavailable',
+      status: 429,
+      retryAfter: '120',
+      recovery: { hint: expect.stringMatching(/wait 120 seconds, then list nearby captures/) },
+    });
+  });
+
+  it('passes a caller-side deadline that fires during the CDX fallback through untouched', async () => {
+    const controller = new AbortController();
+    const ctx = createMockContext({ errors: findErrors, signal: controller.signal });
+    const deadline = await upstreamTimeout();
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503))
+      .mockImplementationOnce(async () => {
+        controller.abort(new DOMException('client deadline', 'TimeoutError'));
+        throw deadline;
+      });
+
+    await expect(lookup(findErrors, ctx)).rejects.toBe(deadline);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['a timeout', () => upstreamTimeout()],
+    ['a network error', () => upstreamNetworkError()],
+  ])('never falls back after %s, which is no answer at all', async (_label, failure) => {
+    fetchWithTimeout.mockRejectedValueOnce(await failure());
+
+    await expect(lookup()).rejects.toMatchObject({ data: { reason: 'availability_unavailable' } });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([400, 404, 403, 410, 451])('never falls back after a %i refusal', async (status) => {
+    fetchWithTimeout.mockRejectedValueOnce(await upstreamError(status));
+
+    const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+    expect(err.data?.reason).toBe(
+      [403, 410, 451].includes(status) ? 'no_snapshot_available' : 'availability_unavailable',
+    );
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('never falls back after the caller left, whatever the abort looked like', async () => {
+    const controller = new AbortController();
+    const ctx = createMockContext({ errors: findErrors, signal: controller.signal });
+    fetchWithTimeout.mockImplementationOnce(async () => {
+      controller.abort(new DOMException('client deadline', 'TimeoutError'));
+      throw await upstreamError(503);
+    });
+
+    await expect(lookup(findErrors, ctx)).rejects.toMatchObject({
+      data: { reason: 'availability_unavailable', status: 503 },
+    });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  describe('under one deadline: the request timeout plus 25 s', () => {
+    it('gives the CDX attempt what remains of it when less than 25 s does', async () => {
+      vi.useFakeTimers();
+      fetchWithTimeout
+        .mockImplementationOnce(async () => {
+          vi.setSystemTime(Date.now() + 40_000);
+          throw await upstreamError(503);
+        })
+        .mockResolvedValueOnce(CDX_CAPTURE());
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout.mock.calls.map((c) => c[1])).toEqual([30_000, 15_000]);
+    });
+
+    it('sends no CDX request once it has passed, still reporting the 429 and its wait', async () => {
+      vi.useFakeTimers();
+      fetchWithTimeout.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 55_000);
+        throw await upstreamError(429, { 'retry-after': '60' });
+      });
+
+      const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message:
+          'The closest-capture lookup for example.com near 20200101 did not complete: Availability API returned HTTP 429 (rate limited). No time remained for the CDX closest-capture check within the 55 s lookup deadline.',
+        data: {
+          reason: 'availability_unavailable',
+          status: 429,
+          retryAfter: '60',
+          recovery: { hint: expect.stringMatching(/wait 60 seconds, then list nearby captures/) },
+        },
+      });
+      expect(err.message).not.toMatch(/timed out/);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends no CDX request after an empty answer that used it up, failing as cdx_unavailable', async () => {
+      vi.useFakeTimers();
+      fetchWithTimeout.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 56_000);
+        return availability({ archived_snapshots: {} });
+      });
+
+      await expect(lookup()).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message:
+          'The Availability API found no capture of example.com near 20200101, and no time remained for the CDX closest-capture check within the 55 s lookup deadline.',
+        data: { reason: 'cdx_unavailable', recovery: { hint: FALLBACK_INCOMPLETE.hint } },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    });
+
+    it('still sends the CDX request once the caller has left, so the cancellation stays one', async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const ctx = createMockContext({ errors: findErrors, signal: controller.signal });
+      const cancelled = requestCancelled(
+        'fetch GET https://web.archive.org/cdx/search/cdx was aborted.',
+      );
+      fetchWithTimeout
+        .mockImplementationOnce(async () => {
+          vi.setSystemTime(Date.now() + 56_000);
+          controller.abort();
+          return availability({ archived_snapshots: {} });
+        })
+        .mockRejectedValueOnce(cancelled);
+
+      await expect(lookup(findErrors, ctx)).rejects.toBe(cancelled);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    });
+
+    it('arms the deadline on the Availability retry loop, threading its signal into each attempt', async () => {
+      retryMode.real = true;
+      vi.useFakeTimers();
+      const ctx = createMockContext({ errors: findErrors });
+      fetchWithTimeout.mockRejectedValueOnce(await upstreamError(503)).mockResolvedValueOnce(
+        availability({
+          archived_snapshots: {
+            closest: {
+              url: 'http://web.archive.org/web/20200101231916/https://example.com/',
+              timestamp: '20200101231916',
+              status: '200',
+            },
+          },
+        }),
+      );
+
+      const pending = lookup(findErrors, ctx);
+      await vi.runAllTimersAsync();
+
+      await expect(pending).resolves.toEqual(RESOLVED);
+      const signals = fetchWithTimeout.mock.calls.map(
+        (c) => (c[3] as { signal: AbortSignal }).signal,
+      );
+      expect(signals).toHaveLength(2);
+      for (const signal of signals) expect(signal).not.toBe(ctx.signal);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('adds no request or timer to a healthy Availability answer', async () => {
+      retryMode.real = true;
+      vi.useFakeTimers();
+      const start = Date.now();
+      fetchWithTimeout.mockResolvedValueOnce(
+        availability({
+          archived_snapshots: {
+            closest: {
+              url: 'http://web.archive.org/web/20200101231916/https://example.com/',
+              timestamp: '20200101231916',
+              status: '200',
+            },
+          },
+        }),
+      );
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+      expect(Date.now() - start).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('falls back with what remains when the deadline cuts short the Availability 5xx retries', async () => {
+      retryMode.real = true;
+      vi.useFakeTimers();
+      fetchWithTimeout
+        .mockImplementationOnce(async () => {
+          vi.setSystemTime(Date.now() + 54_800);
+          throw await upstreamError(503);
+        })
+        .mockResolvedValueOnce(CDX_CAPTURE());
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout.mock.calls.map((c) => c[1])).toEqual([30_000, 200]);
+    });
+
+    it('bounds the CDX attempt by a request timeout shorter than 25 s', async () => {
+      const config = getServerConfig();
+      const configured = config.requestTimeoutMs;
+      config.requestTimeoutMs = 10_000;
+      try {
+        fetchWithTimeout
+          .mockRejectedValueOnce(await upstreamError(503))
+          .mockResolvedValueOnce(CDX_CAPTURE());
+
+        await expect(lookup()).resolves.toEqual(RESOLVED);
+        expect(fetchWithTimeout.mock.calls.map((c) => c[1])).toEqual([10_000, 10_000]);
+      } finally {
+        config.requestTimeoutMs = configured;
+      }
+    });
+
+    it('promises a retry, not a refusal, when an empty answer left no time for the CDX check', async () => {
+      vi.useFakeTimers();
+      fetchWithTimeout.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 56_000);
+        return availability({ archived_snapshots: {} });
+      });
+
+      const err = (await lookup().catch((e: unknown) => e)) as McpError;
+
+      expect(err.data).toMatchObject({
+        reason: 'cdx_unavailable',
+        recovery: { hint: expect.stringMatching(/^Retry later, or list nearby captures/) },
+      });
+      expect(err.data).not.toHaveProperty('retryable');
+    });
   });
 });
 

@@ -47,7 +47,10 @@ export interface SnapshotContent {
   replayUrl: string;
   /** HTTP status Wayback replayed the served capture with. */
   status: string;
-  /** Plain text extracted from the archived HTML. */
+  /**
+   * The capture's whole text, read from at most `REPLAY_BYTE_CEILING` bytes: an HTML page
+   * stripped to plain text, or another text type's body as archived.
+   */
   text: string;
   /** Capture timestamp (YYYYMMDDHHMMSS) read from `replayUrl`, when it carries one. */
   timestamp?: string | undefined;

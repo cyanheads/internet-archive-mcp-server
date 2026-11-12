@@ -7,6 +7,7 @@ import { type Context, z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   forbidden,
+  invalidParams,
   JsonRpcErrorCode,
   McpError,
   notFound,
@@ -15,6 +16,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, getUserAgent } from '@/config/server-config.js';
+import { descriptionToText } from '../html-text.js';
 import {
   bodyReadError,
   isHtmlPage,
@@ -74,8 +76,29 @@ const continuationError = (
 const METADATA_BASE = 'https://archive.org/metadata';
 const DOWNLOAD_BASE = 'https://archive.org/download';
 
-/** Text file formats preferred for text extraction, in priority order. */
-const TEXT_FORMATS_PRIORITY = ['DjVuTXT', 'Text', 'Plain Text'];
+/** Readable text formats, lowercased, in the order the default pick prefers them. */
+const TEXT_FORMATS_PRIORITY = ['djvutxt', 'text', 'plain text'];
+
+/** Which file `getTextContent` reads, and from where. */
+export interface TextSelection {
+  /** A `next_continuation` from an earlier page; its cursor names the file. */
+  continuation?: string | undefined;
+  /** A file name exactly as the manifest lists it; omitted, the default pick. */
+  file?: string | undefined;
+}
+
+/** An item's readable text files, when the default pick chose among more than one. */
+export interface TextFileSummary {
+  /** Readable text files in the manifest. */
+  count: number;
+  /** Distinct `format` values of those files, in manifest order; each lists some with ia_get_item. */
+  formats: string[];
+  /** Readable files that list no format, so no `format` filter finds them. */
+  unformatted: number;
+}
+
+/** A page of text, with `textFiles` when no file was named and the item has several. */
+export type TextPage = TextContent & { textFiles?: TextFileSummary };
 
 /**
  * An upstream request: how error messages name it, and what a caller can check when it
@@ -109,10 +132,12 @@ export class ArchiveMetadataService {
   /**
    * Retrieve full metadata and the complete file manifest for an Archive item —
    * `ia_get_text` scans every file, so paging stays in the `ia_get_item` handler.
-   * Throws `item_not_found` (with the caller's recovery hint) when the API returns
-   * `{}`, the item is dark, or the body holds neither metadata nor a file list — the
-   * `error` or `result` the API answers for an identifier with a `/` in it. Any other
-   * failure is `archive_unavailable` (see `retry` and `statusError`).
+   * Each description value is converted from the HTML the Archive stores to plain-text
+   * lines (`descriptionToText`); a value left with no text is dropped, and a description
+   * left with none is omitted. Every other value is relayed as received. Throws `item_not_found` (with the caller's recovery hint)
+   * when the API returns `{}`, the item is dark, or the body holds neither metadata nor
+   * a file list — the `error` or `result` the API answers for an identifier with a `/`
+   * in it. Any other failure is `archive_unavailable` (see `retry` and `statusError`).
    */
   getItem(identifier: string, ctx: Context): Promise<ArchiveItem> {
     return this.retry('getItem', METADATA_API, ctx, async () => {
@@ -150,19 +175,36 @@ export class ArchiveMetadataService {
 
       const meta = raw.metadata as Record<string, unknown> | undefined;
       const rawFiles = (raw.files as unknown[] | undefined) ?? [];
+      const description = meta?.description
+        ? descriptionText(meta.description as string | string[])
+        : undefined;
+      const imageCount = meta?.mediatype === 'texts' ? wholeNumber(meta.imagecount) : undefined;
 
       const metadata: ArchiveItemMetadata = {
         identifier,
-        ...(meta?.title ? { title: meta.title as string } : {}),
+        ...(meta?.title ? { title: meta.title as string | string[] } : {}),
         ...(meta?.creator ? { creator: meta.creator as string | string[] } : {}),
-        ...(meta?.description ? { description: meta.description as string | string[] } : {}),
+        ...(description ? { description } : {}),
         ...(meta?.mediatype ? { mediatype: meta.mediatype as string } : {}),
-        ...(meta?.date ? { date: meta.date as string } : {}),
+        ...(meta?.date ? { date: meta.date as string | string[] } : {}),
         ...(meta?.subject ? { subject: meta.subject as string | string[] } : {}),
         ...(meta?.collection ? { collection: meta.collection as string | string[] } : {}),
         ...(meta?.licenseurl ? { licenseurl: meta.licenseurl as string } : {}),
         ...(meta?.rights ? { rights: meta.rights as string } : {}),
         ...(meta?.language ? { language: meta.language as string | string[] } : {}),
+        ...(meta?.publisher ? { publisher: meta.publisher as string | string[] } : {}),
+        ...(meta?.volume ? { volume: meta.volume as string } : {}),
+        ...(meta?.isbn ? { isbn: meta.isbn as string | string[] } : {}),
+        ...(meta?.['oclc-id'] ? { oclc_id: meta['oclc-id'] as string | string[] } : {}),
+        ...(meta?.lccn ? { lccn: meta.lccn as string | string[] } : {}),
+        ...(meta?.openlibrary_edition
+          ? { openlibrary_edition: meta.openlibrary_edition as string }
+          : {}),
+        ...(meta?.openlibrary_work ? { openlibrary_work: meta.openlibrary_work as string } : {}),
+        ...(imageCount !== undefined ? { image_count: imageCount } : {}),
+        ...(meta?.['access-restricted-item'] === 'true'
+          ? { access_restricted: true as const }
+          : {}),
       };
 
       const files: ArchiveFile[] = rawFiles.map((f) => {
@@ -174,6 +216,7 @@ export class ArchiveMetadataService {
           ...(file.format ? { format: file.format as string } : {}),
           ...(file.size ? { size: file.size as string } : {}),
           ...(file.md5 ? { md5: file.md5 as string } : {}),
+          ...(file.private === 'true' ? { private: true as const } : {}),
         };
       });
 
@@ -188,18 +231,23 @@ export class ArchiveMetadataService {
    * character after the page has arrived, so memory per call is bounded by the page size
    * and upstream reads stop at the page's end. `hasMore` comes from that one-character
    * lookahead. `sourceFileBytes` is the manifest `size`, omitted when the manifest has none.
-   * `continuation` resumes a validated representation using a tenant-scoped, one-hour byte checkpoint.
-   * Throws `invalid_continuation` or `range_unavailable` for an unusable resume, plus
-   * `item_not_found`, `no_text_file`, `download_forbidden`, or `archive_unavailable`;
-   * the metadata request and the download each retry a first timeout once (see `retry`).
+   * The file read is the continuation's, found by name in the manifest; else `file`, which
+   * must be listed and readable text (`isReadableText`) or the call throws `invalid_file`
+   * before any download; else the default pick (`defaultTextFile`), with `textFiles` set when
+   * it chose among several. `continuation` resumes a validated representation using a
+   * tenant-scoped, one-hour byte checkpoint.
+   * Throws `invalid_continuation` (a `file` other than the continuation's included) or
+   * `range_unavailable` for an unusable resume, plus `item_not_found`, `invalid_file`,
+   * `no_text_file`, `download_forbidden`, or `archive_unavailable`; the metadata request and
+   * the download each retry a first timeout once (see `retry`).
    */
   async getTextContent(
     identifier: string,
     maxChars: number,
     charOffset: number,
     ctx: Context,
-    continuation?: string,
-  ): Promise<TextContent> {
+    { continuation, file }: TextSelection = {},
+  ): Promise<TextPage> {
     let cursor: TextCursor | undefined;
     if (continuation) {
       if (!/^[0-9a-f-]{36}$/.test(continuation))
@@ -223,29 +271,46 @@ export class ArchiveMetadataService {
           cursor?.identifier === identifier ? cursor.nextCharOffset : 0,
         );
       }
+      if (file !== undefined && file !== cursor.file) {
+        throw new McpError(
+          JsonRpcErrorCode.ValidationError,
+          `The continuation reads "${cursor.file}", but this call names "${file}".`,
+          {
+            reason: 'invalid_continuation',
+            retryable: false,
+            char_offset: 0,
+            file: cursor.file,
+            ...ctx.recoveryFor('invalid_continuation'),
+            recovery: {
+              hint: `Keep the identifier and file the continuation came from, or omit continuation and pass char_offset 0 to read "${file}".`,
+            },
+          },
+        );
+      }
       charOffset = cursor.nextCharOffset;
     }
     // Step 1: locate the text file
     const item = await this.getItem(identifier, ctx);
 
-    const textFile = findBestTextFile(item.files);
+    const name = cursor?.file ?? file;
+    const readable = name === undefined ? item.files.filter(isReadableText) : undefined;
+    const textFile = readable ? defaultTextFile(readable) : item.files.find((f) => f.name === name);
     if (!textFile) {
       if (cursor) throw continuationError(ctx, 'invalid_continuation', charOffset);
+      if (name !== undefined) throw invalidFile(ctx, identifier, name);
       throw notFound(
-        `No readable text file found for item "${identifier}". ` +
-          `The item exists but has no DjVuTXT or plain-text file in its manifest.`,
+        `Item "${identifier}" has no readable text file: its manifest lists no DjVuTXT, Text, or Plain Text file and no .txt file other than Metadata sidecars.`,
         { reason: 'no_text_file', identifier, ...ctx.recoveryFor('no_text_file') },
       );
+    }
+    if (!cursor && name !== undefined && !isReadableText(textFile)) {
+      throw invalidFile(ctx, identifier, name, textFile);
     }
 
     const size = Number(textFile.size);
     const sourceFileBytes = Number.isSafeInteger(size) && size >= 0 ? size : undefined;
-    if (
-      cursor &&
-      (cursor.file !== textFile.name ||
-        cursor.md5 !== textFile.md5 ||
-        cursor.size !== textFile.size)
-    ) {
+    // The continuation's file was found by name; a changed checksum or size means it changed.
+    if (cursor && (cursor.md5 !== textFile.md5 || cursor.size !== textFile.size)) {
       throw continuationError(ctx, 'invalid_continuation', charOffset);
     }
 
@@ -399,6 +464,7 @@ export class ArchiveMetadataService {
         ...(nextContinuation && { nextContinuation }),
         ...(continuationNotice && { continuationNotice }),
         ...(sourceFileBytes !== undefined && { sourceFileBytes }),
+        ...(readable && readable.length > 1 && { textFiles: textFileSummary(readable) }),
       };
     });
   }
@@ -498,19 +564,82 @@ function readItemBody(text: string, ctx: Context): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * A count the Metadata API sends as a string of digits, as a number; `undefined` for
+ * anything else, a fraction, sign, or unsafe integer included.
+ */
+const wholeNumber = (value: unknown): number | undefined => {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return undefined;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : undefined;
+};
+
+/**
+ * A description value as plain-text lines, each value of a list converted on its own. A list
+ * keeps only the values left holding text; one left with none reads as no description.
+ */
+const descriptionText = (value: string | string[]): string | string[] | undefined => {
+  if (!Array.isArray(value)) return descriptionToText(value);
+  const values = value.map((v) => descriptionToText(v)).filter((v) => v !== '');
+  return values.length > 0 ? values : undefined;
+};
+
 /** `archive_unavailable` with the calling definition's recovery hint, as error `data` fields. */
 function unavailable(ctx: Context): Record<string, unknown> {
   return { reason: 'archive_unavailable', ...ctx.recoveryFor('archive_unavailable') };
 }
 
-/** Find the best text file from the manifest, preferring DjVuTXT then plain text. */
-function findBestTextFile(files: ArchiveFile[]): ArchiveFile | undefined {
-  for (const preferredFormat of TEXT_FORMATS_PRIORITY) {
-    const match = files.find((f) => f.format?.toLowerCase() === preferredFormat.toLowerCase());
+/**
+ * A file `ia_get_text` reads: format DjVuTXT, Text, or Plain Text in any case, or a `.txt`
+ * name whose format is not Metadata — the `*_meta.txt` sidecars holding the request headers
+ * of an upload, which carry none of the item's text.
+ */
+function isReadableText(file: ArchiveFile): boolean {
+  const format = file.format?.toLowerCase();
+  return (
+    (format !== undefined && TEXT_FORMATS_PRIORITY.includes(format)) ||
+    (file.name.endsWith('.txt') && format !== 'metadata')
+  );
+}
+
+/**
+ * The default pick among an item's readable files, in manifest order: the first DjVuTXT, then
+ * Text, then Plain Text, then the first other readable `.txt` file.
+ */
+function defaultTextFile(readable: ArchiveFile[]): ArchiveFile | undefined {
+  for (const format of TEXT_FORMATS_PRIORITY) {
+    const match = readable.find((f) => f.format?.toLowerCase() === format);
     if (match) return match;
   }
-  // Fallback: any .txt file
-  return files.find((f) => f.name.endsWith('.txt'));
+  return readable[0];
+}
+
+/** How many readable files the default pick chose among, and the formats that list them. */
+function textFileSummary(readable: ArchiveFile[]): TextFileSummary {
+  const formats = [...new Set(readable.flatMap((f) => (f.format ? [f.format] : [])))];
+  return {
+    count: readable.length,
+    formats,
+    unformatted: readable.filter((f) => !f.format).length,
+  };
+}
+
+/**
+ * `invalid_file` for a requested name: missing from the manifest, or — when `listed` is the
+ * file it names — not readable text.
+ */
+function invalidFile(ctx: Context, identifier: string, name: string, listed?: ArchiveFile) {
+  const message = !listed
+    ? `Item "${identifier}" lists no file named "${name}".`
+    : listed.format
+      ? `File "${name}" of item "${identifier}" has format "${listed.format}", which is not readable text.`
+      : `File "${name}" of item "${identifier}" lists no format and is not a .txt file, so it is not readable text.`;
+  return invalidParams(message, {
+    reason: 'invalid_file',
+    identifier,
+    file: name,
+    ...ctx.recoveryFor('invalid_file'),
+  });
 }
 
 // --- Init/accessor pattern ---

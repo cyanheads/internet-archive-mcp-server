@@ -156,6 +156,260 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
 
     expect(item.metadata.language).toBe('eng');
   });
+
+  it('passes a list-valued title and date through unchanged', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: { title: ['Afganistan ', 'Афганистанъ '], date: ['6', '7'] },
+        files: [],
+      }),
+    );
+
+    const item = await buildService().getItem('00hamigoog', createMockContext());
+
+    expect(item.metadata.title).toEqual(['Afganistan ', 'Афганистанъ ']);
+    expect(item.metadata.date).toEqual(['6', '7']);
+  });
+
+  it('keeps a single title and date as plain strings', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({ metadata: { title: 'Pride and prejudice', date: '1894' }, files: [] }),
+    );
+
+    const item = await buildService().getItem('prideprejudice00aust', createMockContext());
+
+    expect(item.metadata.title).toBe('Pride and prejudice');
+    expect(item.metadata.date).toBe('1894');
+  });
+
+  it('converts an HTML description to plain-text lines', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: {
+          description:
+            'ELMO SUPER 612R<div>ELMO SUPER 1018R</div><div>See <a href="http://example.com/m">the &amp; manual</a></div><div><br /></div>',
+        },
+        files: [],
+      }),
+    );
+
+    const item = await buildService().getItem(
+      'elmo-612-r-1018-r-users-manual-j',
+      createMockContext(),
+    );
+
+    expect(item.metadata.description).toBe(
+      'ELMO SUPER 612R\nELMO SUPER 1018R\nSee the & manual (http://example.com/m)',
+    );
+  });
+
+  it('converts each value of a list-valued description', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: {
+          description: ['<p>One</p><p>two</p>', 'Plain\n\ntext  ', 'a&nbsp;&amp;&nbsp;b'],
+        },
+        files: [],
+      }),
+    );
+
+    const item = await buildService().getItem('list-desc', createMockContext());
+
+    expect(item.metadata.description).toEqual(['One\ntwo', 'Plain\n\ntext', 'a & b']);
+  });
+
+  it('omits a description that holds no text', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({ metadata: { title: 'x', description: '<div><br /></div>' }, files: [] }),
+    );
+
+    const item = await buildService().getItem('empty-desc', createMockContext());
+
+    expect(item.metadata).not.toHaveProperty('description');
+  });
+
+  it('drops list values that hold no text, keeping the rest as a list', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: { description: ['<p></p>', '<p>Kept</p>', '', '<div><br /></div>'] },
+        files: [],
+      }),
+    );
+
+    const item = await buildService().getItem('sparse-desc', createMockContext());
+
+    expect(item.metadata.description).toEqual(['Kept']);
+  });
+
+  it('omits a list-valued description none of whose values holds text', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({ metadata: { title: 'x', description: ['<p></p>', '  '] }, files: [] }),
+    );
+
+    const item = await buildService().getItem('blank-list-desc', createMockContext());
+
+    expect(item.metadata).not.toHaveProperty('description');
+  });
+
+  it('leaves the title as received, markup and references included', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({ metadata: { title: 'A <b>bold</b> &amp; title' }, files: [] }),
+    );
+
+    const item = await buildService().getItem('markup-title', createMockContext());
+
+    expect(item.metadata.title).toBe('A <b>bold</b> &amp; title');
+  });
+});
+
+describe('ArchiveMetadataService.getItem catalog and access fields', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  /** getItem over one Metadata API body. */
+  const itemFor = async (body: unknown) => {
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody(body));
+    return buildService().getItem('an-item', createMockContext());
+  };
+
+  it('maps publisher, Open Library IDs, and the image count of a texts item', async () => {
+    const item = await itemFor({
+      metadata: {
+        mediatype: 'texts',
+        publisher: 'London : George Allen',
+        openlibrary_edition: 'OL7173379M',
+        openlibrary_work: 'OL66554W',
+        imagecount: '518',
+      },
+      files: [],
+    });
+
+    expect(item.metadata).toEqual({
+      identifier: 'an-item',
+      mediatype: 'texts',
+      publisher: 'London : George Allen',
+      openlibrary_edition: 'OL7173379M',
+      openlibrary_work: 'OL66554W',
+      image_count: 518,
+    });
+  });
+
+  it('relays list-valued publisher, isbn, oclc-id, and lccn as received, and maps volume', async () => {
+    const isbn = ['9780313328770', '0313328773', '031332879X'];
+    const item = await itemFor({
+      metadata: {
+        publisher: ['S.-Peterburg : Izdal V. Berezovskīĭ', 'С.-Петербургъ : Издалъ В. Березовскій'],
+        isbn,
+        'oclc-id': ['1392922', '166588021'],
+        lccn: ['cn 87032552', '11030899'],
+        volume: '2',
+      },
+      files: [],
+    });
+
+    expect(item.metadata).toMatchObject({
+      publisher: ['S.-Peterburg : Izdal V. Berezovskīĭ', 'С.-Петербургъ : Издалъ В. Березовскій'],
+      isbn,
+      oclc_id: ['1392922', '166588021'],
+      lccn: ['cn 87032552', '11030899'],
+      volume: '2',
+    });
+  });
+
+  it('keeps single isbn, oclc-id, and lccn values as plain strings', async () => {
+    const item = await itemFor({
+      metadata: { isbn: '0313328773', 'oclc-id': '85792390', lccn: '35008545' },
+      files: [],
+    });
+
+    expect(item.metadata).toMatchObject({
+      isbn: '0313328773',
+      oclc_id: '85792390',
+      lccn: '35008545',
+    });
+  });
+
+  it('reads access-restricted-item "true" as access_restricted and marks each private file', async () => {
+    const item = await itemFor({
+      metadata: { mediatype: 'texts', 'access-restricted-item': 'true' },
+      files: [
+        { name: 'blackreconstruc00dubo_djvu.txt', format: 'DjVuTXT', private: 'true' },
+        { name: 'blackreconstruc00dubo_meta.xml', format: 'Metadata' },
+      ],
+    });
+
+    expect(item.metadata.access_restricted).toBe(true);
+    expect(item.files).toEqual([
+      expect.objectContaining({ name: 'blackreconstruc00dubo_djvu.txt', private: true }),
+      expect.not.objectContaining({ private: expect.anything() }),
+    ]);
+  });
+
+  it.each([
+    ['"false"', 'false'],
+    ['"1"', '1'],
+    ['an empty string', ''],
+  ])('omits access_restricted when access-restricted-item is %s', async (_label, value) => {
+    const item = await itemFor({ metadata: { 'access-restricted-item': value }, files: [] });
+
+    expect(item.metadata).not.toHaveProperty('access_restricted');
+  });
+
+  it.each([
+    ['the JSON boolean true', true],
+    ['"TRUE"', 'TRUE'],
+  ])('reads access_restricted only from the string "true", not %s', async (_label, value) => {
+    const item = await itemFor({ metadata: { 'access-restricted-item': value }, files: [] });
+
+    expect(item.metadata).not.toHaveProperty('access_restricted');
+  });
+
+  it('marks no file private unless the manifest says "true"', async () => {
+    const item = await itemFor({
+      metadata: {},
+      files: [
+        { name: 'a.txt', private: 'false' },
+        { name: 'b.txt', private: '' },
+        { name: 'c.txt' },
+      ],
+    });
+
+    expect(item.files.map((f) => Object.hasOwn(f, 'private'))).toEqual([false, false, false]);
+  });
+
+  it.each([
+    ['web', 'web', '1255'],
+    ['movies', 'movies', '10801'],
+    ['no mediatype', undefined, '42'],
+  ])(
+    'omits image_count for %s, where imagecount counts something else',
+    async (_l, mediatype, imagecount) => {
+      const item = await itemFor({ metadata: { mediatype, imagecount }, files: [] });
+
+      expect(item.metadata).not.toHaveProperty('image_count');
+    },
+  );
+
+  it.each(['518.5', '-3', '12 pages', ' 518', '', '1e3', '99999999999999999999'])(
+    'omits a texts image count of %j, which is not a whole number',
+    async (imagecount) => {
+      const item = await itemFor({ metadata: { mediatype: 'texts', imagecount }, files: [] });
+
+      expect(item.metadata).not.toHaveProperty('image_count');
+    },
+  );
+
+  it('keeps an image count of 0', async () => {
+    const item = await itemFor({ metadata: { mediatype: 'texts', imagecount: '0' }, files: [] });
+
+    expect(item.metadata.image_count).toBe(0);
+  });
+
+  it('omits every catalog and access field the record lacks', async () => {
+    const item = await itemFor({ metadata: { title: 'Sparse' }, files: [{ name: 'a.pdf' }] });
+
+    expect(item.metadata).toEqual({ identifier: 'an-item', title: 'Sparse' });
+    expect(item.files[0]).not.toHaveProperty('private');
+  });
 });
 
 describe('ArchiveMetadataService.getTextContent text-file selection', () => {
@@ -180,6 +434,180 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  /** The file the default pick downloads from a manifest of `files`. */
+  const defaultPick = async (files: { name: string; format?: string }[]) => {
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
+    return (await buildService().getTextContent('an-item', 10, 0, createMockContext())).sourceFile;
+  };
+
+  const caption = { name: 'film.cc5.txt', format: 'Closed Caption Text' };
+  const plain = { name: 'plain.txt', format: 'Plain Text' };
+  const text = { name: 'info.txt', format: 'Text' };
+  const djvu = { name: 'book_djvu.txt', format: 'DjVuTXT' };
+
+  it.each([
+    ['DjVuTXT over Text, Plain Text, and other .txt files', [caption, plain, text, djvu], djvu],
+    ['Text over Plain Text and other .txt files', [caption, plain, text], text],
+    ['Plain Text over other .txt files', [caption, plain], plain],
+    [
+      'another .txt file when no text format is listed',
+      [{ name: 'a.jpg', format: 'JPEG' }, caption],
+      caption,
+    ],
+    [
+      'a format in any case',
+      [plain, { name: 'lower_djvu.txt', format: 'djvutxt' }],
+      { name: 'lower_djvu.txt' },
+    ],
+    [
+      'the first of several files of one format, in manifest order',
+      [djvu, { name: 'vol2_djvu.txt', format: 'DjVuTXT' }],
+      djvu,
+    ],
+  ])('picks %s by default', async (_label, files, expected) => {
+    expect(await defaultPick(files)).toBe(expected.name);
+  });
+
+  it.each([
+    [
+      'a Text file whose name has no .txt extension',
+      [caption, { name: 'transcript.text', format: 'Text' }],
+      'transcript.text',
+    ],
+    [
+      'the first of several other .txt files, in manifest order',
+      [caption, { name: 'film.cc6.txt', format: 'Closed Caption Text' }],
+      'film.cc5.txt',
+    ],
+  ])('picks %s by default', async (_label, files, expected) => {
+    expect(await defaultPick(files)).toBe(expected);
+  });
+
+  it('answers an item whose only .txt files are Metadata sidecars as no_text_file, with no download', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      jsonBody({
+        metadata: {},
+        files: [
+          { name: 'case.pdf', format: 'Text PDF' },
+          { name: 'case.11.0.pdf_meta.txt', format: 'Metadata', size: '834' },
+          { name: 'case.12.0.pdf_meta.txt', format: 'metadata', size: '702' },
+        ],
+      }),
+    );
+
+    await expect(
+      buildService().getTextContent(
+        'court-case',
+        10,
+        0,
+        createMockContext({ errors: iaGetText.errors }),
+      ),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound, data: { reason: 'no_text_file' } });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  /** A multi-volume item: text volumes among page images, OCR search text, and an upload sidecar. */
+  const volumeManifest = [
+    { name: 'scan_0001.jpg', format: 'JPEG' },
+    { name: 'Vol 01_djvu.txt', format: 'DjVuTXT' },
+    { name: 'Vol 01_hocr_searchtext.txt.gz', format: 'OCR Search Text' },
+    { name: 'Vol 02_djvu.txt', format: 'DjVuTXT' },
+    { name: 'Vol 02.pdf_meta.txt', format: 'Metadata' },
+    { name: 'about.txt', format: 'Text' },
+    { name: 'notes.txt' },
+    { name: 'LICENSE' },
+  ];
+
+  /** Read `file` from the multi-volume item, or its default pick when `file` is omitted. */
+  const readVolume = async (file?: string) => {
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files: volumeManifest }));
+    fetchWithTimeout.mockResolvedValueOnce(new Response('volume text'));
+    return buildService().getTextContent(
+      'strabo',
+      100,
+      0,
+      createMockContext({ errors: iaGetText.errors }),
+      { file },
+    );
+  };
+
+  it('reads the file named by file, downloading only that file, with no textFiles summary', async () => {
+    const result = await readVolume('Vol 02_djvu.txt');
+
+    expect(result.sourceFile).toBe('Vol 02_djvu.txt');
+    expect(result.text).toBe('volume text');
+    expect(result).not.toHaveProperty('textFiles');
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    expect(fetchWithTimeout).toHaveBeenLastCalledWith(
+      'https://archive.org/download/strabo/Vol%2002_djvu.txt',
+      expect.any(Number),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    ['a .txt file whose format is not a text format', 'notes.txt'],
+    ['a Text file', 'about.txt'],
+  ])('reads %s named by file', async (_label, file) => {
+    expect((await readVolume(file)).sourceFile).toBe(file);
+  });
+
+  it.each([
+    [
+      'a name missing from the manifest',
+      'missing_djvu.txt',
+      'Item "strabo" lists no file named "missing_djvu.txt".',
+    ],
+    ['an inherited property name', '__proto__', 'lists no file named "__proto__"'],
+    ['another inherited property name', 'constructor', 'lists no file named "constructor"'],
+    ['a name differing only in case', 'vol 02_djvu.txt', 'lists no file named "vol 02_djvu.txt"'],
+    [
+      'a compressed OCR search-text file',
+      'Vol 01_hocr_searchtext.txt.gz',
+      'has format "OCR Search Text", which is not readable text',
+    ],
+    [
+      'a Metadata sidecar',
+      'Vol 02.pdf_meta.txt',
+      'has format "Metadata", which is not readable text',
+    ],
+    ['an image', 'scan_0001.jpg', 'has format "JPEG"'],
+    ['a file with no format and no .txt name', 'LICENSE', 'lists no format and is not a .txt file'],
+  ])('rejects %s as invalid_file before any download', async (_label, file, message) => {
+    await expect(readVolume(file)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      message: expect.stringContaining(message),
+      data: {
+        reason: 'invalid_file',
+        identifier: 'strabo',
+        file,
+        recovery: { hint: declaredRecovery(iaGetText.errors, 'invalid_file') },
+      },
+    });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('summarizes every readable file the default pick chose among, leaving out sidecars and search text', async () => {
+    const result = await readVolume();
+
+    expect(result.sourceFile).toBe('Vol 01_djvu.txt');
+    expect(result.textFiles).toEqual({ count: 4, formats: ['DjVuTXT', 'Text'], unformatted: 1 });
+  });
+
+  it.each([
+    ['one readable file among sidecars', [djvu, { name: 'x_meta.txt', format: 'Metadata' }]],
+    ['one readable file alone', [djvu]],
+  ])('reports no textFiles summary for %s', async (_label, files) => {
+    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
+
+    const result = await buildService().getTextContent('an-item', 10, 0, createMockContext());
+
+    expect(result).not.toHaveProperty('textFiles');
   });
 });
 
@@ -579,7 +1007,7 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     let token: string | undefined;
     let offset = 0;
     for (let n = 0; n < expected.length; n++) {
-      const page = await svc.getTextContent('a-volume', 1, 0, ctx, token);
+      const page = await svc.getTextContent('a-volume', 1, 0, ctx, { continuation: token });
       expect(page.text, `page ${n}`).toBe(expected.slice(offset, offset + 1));
       expect(page.charOffset).toBe(offset);
       expect(page.hasMore).toBe(offset + 1 < expected.length);
@@ -609,7 +1037,7 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
       let offset = 0;
       do {
         const count = 1 + Math.floor(random() * 7);
-        const page = await svc.getTextContent('a-volume', count, 0, ctx, token);
+        const page = await svc.getTextContent('a-volume', count, 0, ctx, { continuation: token });
         expect(page.text).toBe(expected.slice(offset, offset + count));
         expect(page.hasMore).toBe(offset + count < expected.length);
         offset += count;
@@ -637,15 +1065,16 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
       const first = await svc.getTextContent('a-volume', 2, 0, ctx);
       const token = first.nextContinuation!;
       const before = fetchWithTimeout.mock.calls.length;
-      await expect(svc.getTextContent('a-volume', 2, 0, other, token)).rejects.toMatchObject({
+      const resume = { continuation: token };
+      await expect(svc.getTextContent('a-volume', 2, 0, other, resume)).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
-      await expect(svc.getTextContent('other-item', 2, 0, ctx, token)).rejects.toMatchObject({
+      await expect(svc.getTextContent('other-item', 2, 0, ctx, resume)).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
       await vi.advanceTimersByTimeAsync(3_600_001);
       await expect(ctx.state.get(`ia-text/${token}`)).resolves.toBeNull();
-      await expect(svc.getTextContent('a-volume', 2, 0, ctx, token)).rejects.toMatchObject({
+      await expect(svc.getTextContent('a-volume', 2, 0, ctx, resume)).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
       expect(fetchWithTimeout.mock.calls.length).toBe(before);
@@ -702,9 +1131,138 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
     const before = fetchWithTimeout.mock.calls.length;
     await expect(
-      svc.getTextContent('a-volume', 2, 0, ctx, first.nextContinuation),
+      svc.getTextContent('a-volume', 2, 0, ctx, { continuation: first.nextContinuation }),
     ).rejects.toMatchObject({ data: { reason: 'invalid_continuation', char_offset: 2 } });
     expect(fetchWithTimeout.mock.calls.length).toBe(before + 1);
+  });
+
+  /**
+   * DjVuTXT volumes served by name with conditional Range, under a manifest listing `listed`
+   * (every volume when omitted) in order. Returns the file name of each download, in order.
+   */
+  const volumes = (texts: Record<string, string>, listed = () => Object.keys(texts)) => {
+    const bytes = new Map(Object.entries(texts).map(([n, t]) => [n, new TextEncoder().encode(t)]));
+    const downloads: string[] = [];
+    fetchWithTimeout.mockImplementation(
+      async (url: string, _timeout: number, _ctx: unknown, options: RequestInit) => {
+        if (url.includes('/metadata/')) {
+          const files = listed().map((name) => ({
+            name,
+            format: 'DjVuTXT',
+            size: String(bytes.get(name)?.length),
+          }));
+          return jsonBody({ metadata: {}, files });
+        }
+        const name = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
+        downloads.push(name);
+        const body = bytes.get(name) as Uint8Array;
+        const range = new Headers(options.headers).get('range');
+        const start = range ? Number(range.slice(6, -1)) : 0;
+        return new Response(body.subarray(start), {
+          status: range ? 206 : 200,
+          headers: {
+            etag: '"stable"',
+            'content-length': String(body.length - start),
+            ...(range && { 'content-range': `bytes ${start}-${body.length - 1}/${body.length}` }),
+          },
+        });
+      },
+    );
+    return downloads;
+  };
+
+  it('continues a named non-default file page after page with file omitted', async () => {
+    const downloads = volumes({
+      'Vol 01_djvu.txt': 'first volume',
+      'Vol 02_djvu.txt': 'Глава 📜 two',
+    });
+    const ctx = createMockContext();
+    const svc = buildService();
+    let page = await svc.getTextContent('strabo', 3, 0, ctx, { file: 'Vol 02_djvu.txt' });
+    const pages = [page];
+    while (page.nextContinuation) {
+      page = await svc.getTextContent('strabo', 3, 0, ctx, { continuation: page.nextContinuation });
+      pages.push(page);
+    }
+
+    expect(pages.map((p) => p.text).join('')).toBe('Глава 📜 two');
+    expect(pages).toHaveLength(4);
+    expect(pages.map((p) => p.charOffset)).toEqual([0, 3, 6, 9]);
+    expect(pages.every((p) => p.sourceFile === 'Vol 02_djvu.txt')).toBe(true);
+    expect(pages.some((p) => 'textFiles' in p)).toBe(false);
+    expect(downloads).toEqual(pages.map(() => 'Vol 02_djvu.txt'));
+  });
+
+  it('continues the default pick without a textFiles summary after its first page', async () => {
+    volumes({ 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' });
+    const ctx = createMockContext();
+    const svc = buildService();
+    const first = await svc.getTextContent('strabo', 5, 0, ctx);
+    const second = await svc.getTextContent('strabo', 5, 0, ctx, {
+      continuation: first.nextContinuation,
+    });
+
+    expect(first).toMatchObject({ sourceFile: 'Vol 01_djvu.txt', textFiles: { count: 2 } });
+    expect(second).toMatchObject({ sourceFile: 'Vol 01_djvu.txt', text: ' volu' });
+    expect(second).not.toHaveProperty('textFiles');
+  });
+
+  it('accepts a file naming the file its continuation reads', async () => {
+    volumes({ 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' });
+    const ctx = createMockContext();
+    const svc = buildService();
+    const file = 'Vol 02_djvu.txt';
+    const first = await svc.getTextContent('strabo', 6, 0, ctx, { file });
+    const second = await svc.getTextContent('strabo', 6, 0, ctx, {
+      continuation: first.nextContinuation,
+      file,
+    });
+
+    expect(second).toMatchObject({ text: ' volum', charOffset: 6, sourceFile: file });
+  });
+
+  it('rejects a file other than the continuation reads as invalid_continuation, before any request', async () => {
+    volumes({ 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' });
+    const ctx = createMockContext({ errors: iaGetText.errors });
+    const svc = buildService();
+    const first = await svc.getTextContent('strabo', 6, 0, ctx, { file: 'Vol 02_djvu.txt' });
+    const before = fetchWithTimeout.mock.calls.length;
+
+    await expect(
+      svc.getTextContent('strabo', 6, 0, ctx, {
+        continuation: first.nextContinuation,
+        file: 'Vol 01_djvu.txt',
+      }),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: 'The continuation reads "Vol 02_djvu.txt", but this call names "Vol 01_djvu.txt".',
+      data: {
+        reason: 'invalid_continuation',
+        char_offset: 0,
+        file: 'Vol 02_djvu.txt',
+        recovery: { hint: expect.stringContaining('read "Vol 01_djvu.txt"') },
+      },
+    });
+    expect(fetchWithTimeout.mock.calls.length).toBe(before);
+  });
+
+  it('keeps reading the continuation file after the manifest lists another DjVuTXT file before it', async () => {
+    let listed = ['Vol 02_djvu.txt'];
+    const downloads = volumes(
+      { 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' },
+      () => listed,
+    );
+    const ctx = createMockContext();
+    const svc = buildService();
+    const first = await svc.getTextContent('strabo', 6, 0, ctx);
+    listed = ['Vol 01_djvu.txt', 'Vol 02_djvu.txt'];
+    const second = await svc.getTextContent('strabo', 6, 0, ctx, {
+      continuation: first.nextContinuation,
+    });
+
+    expect(first.sourceFile).toBe('Vol 02_djvu.txt');
+    expect(second).toMatchObject({ text: ' volum', sourceFile: 'Vol 02_djvu.txt' });
+    expect(downloads).toEqual(['Vol 02_djvu.txt', 'Vol 02_djvu.txt']);
   });
 });
 

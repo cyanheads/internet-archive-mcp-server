@@ -249,6 +249,42 @@ describe('iaGetItem', () => {
       expect(text).toContain('s1, s2');
       expect(text).toContain('c1, c2');
     });
+
+    it('puts each value of a list description on its own line, keeping its line breaks', () => {
+      const text = (
+        iaGetItem.format!({
+          identifier: 'x',
+          description: ['First line\nsecond line', 'Third'],
+          file_count: 0,
+          files: [],
+        })[0] as { text: string }
+      ).text;
+      expect(text).toContain('**Description:** First line\\\nsecond line\\\nThird\n');
+    });
+
+    it('renders a converted description as literal text', () => {
+      const text = (
+        iaGetItem.format!({
+          identifier: 'x',
+          description:
+            '-from IMDB <a href="http://www.imdb.com/title/tt0092792/" rel="nofollow"></a>',
+          file_count: 0,
+          files: [],
+        })[0] as { text: string }
+      ).text;
+      expect(text).toContain(
+        '**Description:** -from IMDB \\<a href="http://www.imdb.com/title/tt0092792/" rel="nofollow">\\</a>',
+      );
+    });
+
+    it('renders an image_count of 0, which structuredContent carries', () => {
+      const text = (
+        iaGetItem.format!({ identifier: 'x', image_count: 0, file_count: 0, files: [] })[0] as {
+          text: string;
+        }
+      ).text;
+      expect(text).toContain('**Page Images:** 0');
+    });
   });
 
   describe('assembled result (runToolContract)', () => {
@@ -298,6 +334,59 @@ describe('iaGetItem', () => {
     });
   });
 
+  describe('archive.org item URLs', () => {
+    const errorData = (result: ToolResult) =>
+      (result.structuredContent as { error: { code: number; data: Record<string, unknown> } })
+        .error;
+
+    it('looks up the identifier an archive.org details URL names', async () => {
+      mockService.getItem.mockResolvedValue({
+        ...fullItem,
+        metadata: { ...fullItem.metadata, identifier: 'prideprejudice00aust' },
+      });
+
+      const result = await runToolContract(iaGetItem, {
+        identifier: 'https://archive.org/details/prideprejudice00aust',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.getItem).toHaveBeenCalledWith('prideprejudice00aust', expect.anything());
+      expect((result.structuredContent as { identifier: string }).identifier).toBe(
+        'prideprejudice00aust',
+      );
+    });
+
+    it('rejects a URL that names no item as invalid_identifier, on both surfaces, with no lookup', async () => {
+      const result = await runToolContract(iaGetItem, { identifier: 'https://example.com/foo' });
+
+      const recovery = iaGetItem.errors?.find((e) => e.reason === 'invalid_identifier')?.recovery;
+      expect(errorData(result)).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'invalid_identifier', recovery: { hint: recovery } },
+      });
+      expect(recovery).toContain('prideprejudice00aust');
+      expect(contentText(result)).toContain('identifier is a URL on example.com');
+      expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expect(mockService.getItem).not.toHaveBeenCalled();
+    });
+
+    it('points a Wayback Machine URL to ia_get_snapshot, with no lookup', async () => {
+      const result = await runToolContract(iaGetItem, {
+        identifier: 'https://web.archive.org/web/2020/https://example.com/',
+      });
+
+      expect(errorData(result)).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'invalid_identifier',
+          recovery: { hint: expect.stringContaining('ia_get_snapshot') },
+        },
+      });
+      expect(contentText(result)).toContain('ia_get_snapshot');
+      expect(mockService.getItem).not.toHaveBeenCalled();
+    });
+  });
+
   describe('language (repeatable upstream field)', () => {
     it('returns an array language through output validation and renders it joined', async () => {
       mockService.getItem.mockResolvedValue({
@@ -341,6 +430,207 @@ describe('iaGetItem', () => {
         'b',
       ]);
       expect(iaGetItem.output.parse({ ...base, language: 'a' }).language).toBe('a');
+    });
+  });
+
+  describe('title and date (documented single-valued, sometimes lists upstream)', () => {
+    it('returns a list-valued title and date through output validation and renders every value', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: {
+          identifier: '00hamigoog',
+          title: ['Afganistan ', 'Афганистанъ '],
+          date: ['1908', '1909'],
+        },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: '00hamigoog' });
+
+      expect(result.isError).toBeFalsy();
+      const sc = result.structuredContent as { title: unknown; date: unknown };
+      expect(sc.title).toEqual(['Afganistan ', 'Афганистанъ ']);
+      expect(sc.date).toEqual(['1908', '1909']);
+      const text = contentText(result);
+      expect(text).toMatch(/^# Afganistan , Афганистанъ/);
+      expect(text).toContain('**Date:** 1908, 1909');
+    });
+
+    it('keeps a string title and date unchanged', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: {
+          identifier: 'prideprejudice00aust',
+          title: 'Pride and prejudice',
+          date: '1894',
+        },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'prideprejudice00aust' });
+
+      expect(result.isError).toBeFalsy();
+      const sc = result.structuredContent as { title: unknown; date: unknown };
+      expect(sc.title).toBe('Pride and prejudice');
+      expect(sc.date).toBe('1894');
+      expect(contentText(result)).toMatch(/^# Pride and prejudice\n/);
+      expect(contentText(result)).toContain('**Date:** 1894');
+    });
+
+    it('keeps a list title holding a line break out of the heading', () => {
+      const text = (
+        iaGetItem.format!({
+          identifier: 'x',
+          title: ['First', 'Second\nline'],
+          file_count: 0,
+          files: [],
+        })[0] as { text: string }
+      ).text;
+      expect(text).toMatch(/^First, Second\\\nline\n/);
+    });
+
+    it('accepts both shapes in the declared output schema', () => {
+      const base = { identifier: 'x', file_count: 0, files: [] };
+      expect(
+        iaGetItem.output.parse({ ...base, title: ['a', 'b'], date: ['1', '2'] }),
+      ).toMatchObject({ title: ['a', 'b'], date: ['1', '2'] });
+      expect(iaGetItem.output.parse({ ...base, title: 'a', date: '1' })).toMatchObject({
+        title: 'a',
+        date: '1',
+      });
+    });
+  });
+
+  describe('catalog identifiers, access restriction, and private files', () => {
+    const catalogued = {
+      metadata: {
+        identifier: 'dictionaryofmedi0002unse_x3v6',
+        mediatype: 'texts',
+        publisher: ['Westport, Conn. : Greenwood Press', 'Greenwood'],
+        isbn: ['9780313328770', '0313328773'],
+        oclc_id: '85792390',
+        lccn: ['2006022953', 'cn 87032552'],
+        openlibrary_edition: 'OL10420367M',
+        openlibrary_work: 'OL3939167W',
+        volume: '2',
+        access_restricted: true,
+        image_count: 354,
+      },
+      files: [
+        {
+          name: 'dictionaryofmedi0002unse_x3v6_djvu.txt',
+          format: 'DjVuTXT',
+          private: true,
+          downloadUrl:
+            'https://archive.org/download/dictionaryofmedi0002unse_x3v6/dictionaryofmedi0002unse_x3v6_djvu.txt',
+        },
+        {
+          name: 'dictionaryofmedi0002unse_x3v6_meta.xml',
+          format: 'Metadata',
+          downloadUrl:
+            'https://archive.org/download/dictionaryofmedi0002unse_x3v6/dictionaryofmedi0002unse_x3v6_meta.xml',
+        },
+      ],
+    };
+
+    it('returns every catalog and access field through output validation on both surfaces', async () => {
+      mockService.getItem.mockResolvedValue(catalogued);
+
+      const result = await runToolContract(iaGetItem, {
+        identifier: 'dictionaryofmedi0002unse_x3v6',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        publisher: ['Westport, Conn. : Greenwood Press', 'Greenwood'],
+        isbn: ['9780313328770', '0313328773'],
+        oclc_id: '85792390',
+        lccn: ['2006022953', 'cn 87032552'],
+        openlibrary_edition: 'OL10420367M',
+        openlibrary_work: 'OL3939167W',
+        volume: '2',
+        access_restricted: true,
+        image_count: 354,
+      });
+      const text = contentText(result);
+      for (const line of [
+        '**Publisher:** Westport, Conn. : Greenwood Press, Greenwood',
+        '**Volume:** 2',
+        '**ISBN:** 9780313328770, 0313328773',
+        '**OCLC ID:** 85792390',
+        '**LCCN:** 2006022953, cn 87032552',
+        '**Open Library Edition:** OL10420367M',
+        '**Open Library Work:** OL3939167W',
+        '**Page Images:** 354',
+        '**Access Restricted:** true',
+      ]) {
+        expect(text).toContain(line);
+      }
+    });
+
+    it('marks a private file on both surfaces and leaves a public one unmarked', async () => {
+      mockService.getItem.mockResolvedValue(catalogued);
+
+      const result = await runToolContract(iaGetItem, {
+        identifier: 'dictionaryofmedi0002unse_x3v6',
+      });
+
+      const files = (result.structuredContent as { files: Record<string, unknown>[] }).files;
+      expect(files[0]).toMatchObject({ private: true });
+      expect(files[1]).not.toHaveProperty('private');
+      const text = contentText(result);
+      expect(text).toContain('- **dictionaryofmedi0002unse_x3v6_djvu.txt** (DjVuTXT, private):');
+      expect(text).toContain('- **dictionaryofmedi0002unse_x3v6_meta.xml** (Metadata):');
+    });
+
+    it('omits every field the item lacks on both surfaces', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: 'sparse-id' },
+        files: [{ name: 'a.pdf', downloadUrl: 'https://archive.org/download/sparse-id/a.pdf' }],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'sparse-id' });
+
+      const sc = result.structuredContent as Record<string, unknown>;
+      for (const key of [
+        'publisher',
+        'isbn',
+        'oclc_id',
+        'lccn',
+        'openlibrary_edition',
+        'openlibrary_work',
+        'volume',
+        'access_restricted',
+        'image_count',
+      ]) {
+        expect(sc).not.toHaveProperty(key);
+      }
+      expect((sc.files as Record<string, unknown>[])[0]).not.toHaveProperty('private');
+      const text = contentText(result);
+      for (const label of [
+        'Publisher',
+        'ISBN',
+        'OCLC',
+        'LCCN',
+        'Open Library',
+        'Volume',
+        'Page Images',
+        'Access',
+        'private',
+      ]) {
+        expect(text).not.toContain(label);
+      }
+    });
+
+    it('accepts a single value or a list for publisher, isbn, oclc_id, and lccn', () => {
+      const base = { identifier: 'x', file_count: 0, files: [] };
+      const lists = {
+        publisher: ['a', 'b'],
+        isbn: ['1', '2'],
+        oclc_id: ['3', '4'],
+        lccn: ['5', '6'],
+      };
+      const singles = { publisher: 'a', isbn: '1', oclc_id: '3', lccn: '5' };
+      expect(iaGetItem.output.parse({ ...base, ...lists })).toMatchObject(lists);
+      expect(iaGetItem.output.parse({ ...base, ...singles })).toMatchObject(singles);
     });
   });
 

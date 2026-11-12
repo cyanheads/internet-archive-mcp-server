@@ -10,9 +10,7 @@ import { getArchiveMetadataService } from '@/services/archive-metadata/archive-m
 export const iaItemResource = resource('ia://item/{identifier}', {
   name: 'Internet Archive Item Metadata',
   description:
-    'Metadata snapshot for an Internet Archive item — title, creator, mediatype, description, ' +
-    'subjects, collections, date, license, and file count. Provides stable injectable context for ' +
-    'agents that need to reference an item by URI without fetching the full file manifest.',
+    'Metadata snapshot for an Internet Archive item — title, creator, mediatype, description (converted from HTML to plain text), subjects, collections, date, license, language, publisher, ISBN, OCLC and LCCN numbers, Open Library edition and work IDs, volume, the page-image count of a text item, whether the item is access-restricted, and file count. Provides stable injectable context for agents that need to reference an item by URI without fetching the full file manifest.',
   mimeType: 'application/json',
   params: z.object({
     identifier: z
@@ -33,10 +31,7 @@ export const iaItemResource = resource('ia://item/{identifier}', {
     {
       reason: 'archive_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when:
-        'The Internet Archive Metadata API did not answer within the request timeout, could ' +
-        'not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an ' +
-        'unreadable response.',
+      when: 'The Internet Archive Metadata API did not answer within the request timeout, could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an unreadable response.',
       recovery:
         'The Internet Archive is temporarily unavailable or overloaded; read the resource again in a few minutes.',
       thrownBy: 'service',
@@ -46,22 +41,8 @@ export const iaItemResource = resource('ia://item/{identifier}', {
   async handler(params, ctx) {
     const svc = getArchiveMetadataService();
     const item = await svc.getItem(params.identifier, ctx);
-    const meta = item.metadata;
-
-    return {
-      identifier: meta.identifier,
-      ...(meta.title ? { title: meta.title } : {}),
-      ...(meta.creator ? { creator: meta.creator } : {}),
-      ...(meta.description ? { description: meta.description } : {}),
-      ...(meta.mediatype ? { mediatype: meta.mediatype } : {}),
-      ...(meta.date ? { date: meta.date } : {}),
-      ...(meta.subject ? { subject: meta.subject } : {}),
-      ...(meta.collection ? { collection: meta.collection } : {}),
-      ...(meta.licenseurl ? { licenseurl: meta.licenseurl } : {}),
-      ...(meta.rights ? { rights: meta.rights } : {}),
-      ...(meta.language ? { language: meta.language } : {}),
-      file_count: item.files.length,
-    };
+    // The same metadata fields as ia_get_item, each omitted when absent; the manifest stays out.
+    return { ...item.metadata, file_count: item.files.length };
   },
 
   list: async () => ({

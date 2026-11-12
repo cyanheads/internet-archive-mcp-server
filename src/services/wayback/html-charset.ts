@@ -1,11 +1,12 @@
 /**
- * @fileoverview Decodes an archived HTML body with the charset it declares, following
- * the WHATWG order: byte-order mark, then the `Content-Type` charset, then a `<meta>`
- * declaration near the top of the document. A body that declares none is kept as UTF-8
- * when it is valid UTF-8; otherwise it is decoded with the charset Wayback guessed for
- * the capture (`x-archive-guessed-charset`) when `TextDecoder` knows the label, else as
- * windows-1252. Labels resolve through `TextDecoder`, so `iso-8859-1` and its aliases
- * decode as windows-1252; a label it does not know falls through to the next source.
+ * @fileoverview Decodes an archived body with the charset it declares, following the
+ * WHATWG order: byte-order mark, then the `Content-Type` charset, then — for HTML only —
+ * a `<meta>` declaration near the top of the document. A body that declares none is kept
+ * as UTF-8 when it is valid UTF-8; otherwise it is decoded with the charset Wayback
+ * guessed for the capture (`x-archive-guessed-charset`) when `TextDecoder` knows the
+ * label, else as windows-1252. Labels resolve through `TextDecoder`, so `iso-8859-1` and
+ * its aliases decode as windows-1252; a label it does not know falls through to the next
+ * source.
  * @module services/wayback/html-charset
  */
 
@@ -68,7 +69,7 @@ function metaDecoder(label: string | undefined): TextDecoder | undefined {
 }
 
 /** What the replay response says about a body's charset. */
-export interface HtmlBodySource {
+export interface BodySource {
   /** The `Content-Type` header value. */
   contentType: string | null;
   /** Wayback's `x-archive-guessed-charset` header value. */
@@ -84,7 +85,20 @@ export interface HtmlBodySource {
  * single-byte guess would turn valid UTF-8 into mojibake. Only bytes that are not UTF-8
  * use the guess, or windows-1252 when the guess names no charset `TextDecoder` knows.
  */
-export function decodeHtml(bytes: Uint8Array, source: HtmlBodySource): string {
+export function decodeHtml(bytes: Uint8Array, source: BodySource): string {
+  return decode(bytes, source, true);
+}
+
+/**
+ * Decode a non-HTML text body (plain text, JSON, XML, JavaScript) as `decodeHtml` does,
+ * except that no `<meta>` declaration is read: in such a body that markup is content.
+ */
+export function decodeText(bytes: Uint8Array, source: BodySource): string {
+  return decode(bytes, source, false);
+}
+
+/** The decode both body kinds share; `markup` admits a `<meta>` declaration as a source. */
+function decode(bytes: Uint8Array, source: BodySource, markup: boolean): string {
   const { contentType, guessedCharset, truncated } = source;
   // On a cut body, `stream` drops a character split at the end instead of replacing it,
   // so the split cannot fail the strict UTF-8 check either.
@@ -92,7 +106,7 @@ export function decodeHtml(bytes: Uint8Array, source: HtmlBodySource): string {
   const declared =
     decoderFor(bomEncoding(bytes)) ??
     decoderFor(contentType ? HEADER_CHARSET.exec(contentType)?.[1] : undefined) ??
-    metaDecoder(metaCharset(bytes));
+    (markup ? metaDecoder(metaCharset(bytes)) : undefined);
   if (declared) return declared.decode(bytes, options);
 
   try {

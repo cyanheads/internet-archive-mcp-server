@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { parseItemReference } from '@/services/archive-metadata/item-reference.js';
 import { getArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
 
 /** The complete Advanced Search mediatype vocabulary. Solr matches it exactly and case-sensitively. */
@@ -45,17 +46,16 @@ const MEDIATYPE_BY_SPELLING = new Map<string, string>([
 const listText = (value: string | string[]): string =>
   Array.isArray(value) ? value.join(', ') : value;
 
+/** A collection given as its archive.org details URL, as the identifier it names; any other value as given. */
+const collectionIdentifier = (value: string): string => {
+  const ref = parseItemReference(value);
+  return ref.kind === 'item' && ref.route === 'details' ? ref.identifier : value;
+};
+
 export const iaSearchItems = tool('ia_search_items', {
   title: 'Search Internet Archive Items',
   description:
-    'Search the Internet Archive library (40M+ items) using the Advanced Search (Solr) API. ' +
-    'Filter by media type (texts, audio, movies, software, image, etc.), collection, creator, date ' +
-    'range, and language. Sort by downloads (the default), date, title, or random. Supports ' +
-    'pagination via page/rows. ' +
-    'Returns identifiers, titles, creators (the first 10, with creator_count when a record lists ' +
-    'more), media types, dates, download counts, collections (without fav- favorites lists), ' +
-    'total_found, and current page/rows for pagination context. Use ia_get_item with a returned ' +
-    'identifier to get full metadata and file manifests.',
+    'Search the Internet Archive library (40M+ items) using the Advanced Search (Solr) API. Filter by media type (texts, audio, movies, software, image, etc.), collection, creator, date range, and language. Sort by downloads (the default), date, title, or random. Supports pagination via page/rows. Returns identifiers, titles, creators (the first 10, with creator_count when a record lists more), media types, dates, download counts, collections (without fav- favorites lists), total_found, and current page/rows for pagination context. Use ia_get_item with a returned identifier to get full metadata and file manifests.',
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   input: z.object({
@@ -68,26 +68,26 @@ export const iaSearchItems = tool('ia_search_items', {
         'Must be 2,047 characters or fewer — the longest query Advanced Search accepts, filters included.',
       )
       .describe(
-        'Solr query string. Supports field prefixes such as title:"war and peace", ' +
-          'creator:dickens, subject:history. Plain keywords search all fields. Put a URL in ' +
-          'quotes. At most 2,047 characters, a limit the filters below also count toward.',
+        'Solr query string. Supports field prefixes such as title:"war and peace", creator:dickens, subject:history. Plain keywords search all fields. Put a URL in quotes. At most 2,047 characters, a limit the filters below also count toward.',
       ),
     mediatype: z
       .string()
       .optional()
       .describe(
-        'Filter by media type: texts, movies, audio, software, image, data, web, collection, ' +
-          'etree (live concert recordings), or account. Case-insensitive; text, book, and books ' +
-          'mean texts, movie, video, and videos mean movies, images means image, and collections ' +
-          'means collection. Any other value is rejected.',
+        'Filter by media type: texts, movies, audio, software, image, data, web, collection, etree (live concert recordings), or account. Case-insensitive; text, book, and books mean texts, movie, video, and videos mean movies, images means image, and collections means collection. Any other value is rejected.',
       ),
     collection: z
       .string()
       .optional()
       .describe(
-        'Filter to items within a specific collection identifier, e.g. "gutenberg" or "librivoxaudio".',
+        'Filter to items within a collection, given by identifier, e.g. "gutenberg" or "librivoxaudio", or by its archive.org details URL, e.g. https://archive.org/details/gutenberg.',
       ),
-    creator: z.string().optional().describe('Filter by creator name, e.g. "Charles Dickens".'),
+    creator: z
+      .string()
+      .optional()
+      .describe(
+        'Filter by creator name, e.g. "Charles Dickens". Matches a creator holding every word of the name close together, in any order and case-insensitively, so "Charles Dickens" also finds "Dickens, Charles, 1812-1870" and "Charles John Huffam Dickens". For an exact phrase, put creator:"Charles Dickens" in query instead. Must contain a letter or digit.',
+      ),
     date_from: z
       .string()
       .optional()
@@ -103,16 +103,14 @@ export const iaSearchItems = tool('ia_search_items', {
     language: z
       .string()
       .optional()
-      .describe('Filter by language code or name, e.g. "eng" or "English".'),
+      .describe(
+        'Filter by language: an ISO 639-1, ISO 639-2, or discontinued MARC code, or an English name, e.g. "eng", "en", "English", or "fre". Case-insensitive. A known language matches records under any of its codes and names ("fr" also finds "fre", "fra", and "French"), except a two-letter code that is also an English word (am, an, as, be, he, hi, is, it, my, no, or, so, to), matched only when it is the value given; any other value is matched as given. For a single spelling, put language:"eng" in query instead. Must contain a letter or digit.',
+      ),
     sort: z
       .string()
       .optional()
       .describe(
-        'Sort order in Solr format: a sortable field followed by asc or desc, e.g. ' +
-          '"downloads desc", "date asc", "publicdate desc", "titleSorter asc", or "random". ' +
-          'Default: "downloads desc". Advanced Search has no relevance sort. Except under ' +
-          'random, results tied under the sort are ordered by identifier, so consecutive pages ' +
-          'neither repeat nor skip an item.',
+        'Sort order in Solr format: a sortable field followed by asc or desc, e.g. "downloads desc", "date asc", "publicdate desc", "titleSorter asc", or "random". Default: "downloads desc". Advanced Search has no relevance sort. Except under random, results tied under the sort are ordered by identifier, so consecutive pages neither repeat nor skip an item.',
       ),
     rows: z
       .number()
@@ -121,9 +119,7 @@ export const iaSearchItems = tool('ia_search_items', {
       .max(RESULT_WINDOW)
       .default(50)
       .describe(
-        'Number of results per page (default 50). One call returns at most 200: on page 1 a ' +
-          'larger value (up to 10,000) is served as 200 with a notice naming the next page; on ' +
-          'later pages a value above 200 is rejected.',
+        'Number of results per page (default 50). One call returns at most 200: on page 1 a larger value (up to 10,000) is served as 200 with a notice naming the next page; on later pages a value above 200 is rejected.',
       ),
     page: z
       .number()
@@ -131,8 +127,7 @@ export const iaSearchItems = tool('ia_search_items', {
       .min(1)
       .default(1)
       .describe(
-        'Page number (1-indexed). Combine with rows for pagination. Advanced Search serves only ' +
-          'the first 10,000 results, so page × rows ≤ 10,000 (page 50 at 200 rows, page 200 at 50).',
+        'Page number (1-indexed). Combine with rows for pagination. Advanced Search serves only the first 10,000 results, so page × rows ≤ 10,000 (page 50 at 200 rows, page 200 at 50).',
       ),
   }),
 
@@ -162,8 +157,7 @@ export const iaSearchItems = tool('ia_search_items', {
               .number()
               .optional()
               .describe(
-                'Total creators on the record, present only when creator lists the first 10; ' +
-                  'ia_get_item returns them all.',
+                'Total creators on the record, present only when creator lists the first 10; ia_get_item returns them all.',
               ),
             mediatype: z.string().optional().describe('Media type (texts, audio, movies, etc.).'),
             date: z
@@ -185,8 +179,7 @@ export const iaSearchItems = tool('ia_search_items', {
               ])
               .optional()
               .describe(
-                'Collection(s) this item belongs to, in upstream order. Per-account favorites ' +
-                  'lists (fav-<account>) are left out; omitted when nothing else remains.',
+                'Collection(s) this item belongs to, in upstream order. Per-account favorites lists (fav-<account>) are left out; omitted when nothing else remains.',
               ),
           })
           .describe('A single Internet Archive item.'),
@@ -212,9 +205,7 @@ export const iaSearchItems = tool('ia_search_items', {
       .string()
       .optional()
       .describe(
-        'Guidance when the page came back empty — nothing matched (naming the mediatype filter ' +
-          'applied, if any), or the requested page is past the last page of results — or when ' +
-          'rows was capped, naming the rows and page that continue.',
+        'Guidance when the page came back empty — nothing matched (naming every filter applied), or the requested page is past the last page of results — or when rows was capped, naming the rows and page that continue.',
       ),
   },
 
@@ -240,13 +231,20 @@ export const iaSearchItems = tool('ia_search_items', {
       severity: 'warning',
     },
     {
+      reason: 'invalid_filter',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'creator or language has no letter or digit, so Advanced Search would ignore it and match every item.',
+      recovery:
+        'Give the named creator or language filter a value with at least one letter or digit, or omit it to search without that filter.',
+      severity: 'warning',
+      thrownBy: 'service',
+    },
+    {
       reason: 'page_limit_exceeded',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'page × rows exceeds 10,000, the last result Advanced Search serves.',
       recovery:
-        'Request a page at or below the last reachable one named in the message, or narrow the ' +
-        'query with filters (mediatype, collection, creator, date range) or a different sort so ' +
-        'the results you need fall within the first 10,000.',
+        'Request a page at or below the last reachable one named in the message, or narrow the query with filters (mediatype, collection, creator, date range) or a different sort so the results you need fall within the first 10,000.',
       severity: 'warning',
     },
     {
@@ -254,34 +252,24 @@ export const iaSearchItems = tool('ia_search_items', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'rows is above 200 on a page after the first.',
       recovery:
-        'Keep rows at 200 or fewer on every page, or request page 1, where a larger rows value ' +
-        'is served as 200; pages are rows-sized blocks, so use the same rows on each page.',
+        'Keep rows at 200 or fewer on every page, or request page 1, where a larger rows value is served as 200; pages are rows-sized blocks, so use the same rows on each page.',
       severity: 'warning',
     },
     {
       reason: 'invalid_query',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Advanced Search rejected the query syntax, an unquoted URL, the query length, or the sort field.',
+      when: 'The query ends in a backslash that escapes nothing, or Advanced Search rejected the query syntax, an unquoted URL, the query length, or the sort field.',
       recovery:
-        'Fix the query named in the message: close every parenthesis, quote, and range bracket, ' +
-        'write field prefixes as field:value, put a URL in quotes, keep the query and its ' +
-        'filters within 2,047 characters, and sort by a sortable field such as downloads, ' +
-        'date, publicdate, or titleSorter followed by asc or desc.',
+        'Fix the query named in the message: close every parenthesis, quote, and range bracket, double or drop a trailing backslash, write field prefixes as field:value, put a URL in quotes, keep the query and its filters within 2,047 characters, and sort by a sortable field such as downloads, date, publicdate, or titleSorter followed by asc or desc.',
       severity: 'warning',
       thrownBy: 'service',
     },
     {
       reason: 'search_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when:
-        'Advanced Search failed, rate-limited the request, returned an unreadable response, ' +
-        'timed out, or could not be reached (network error).',
+      when: 'Advanced Search failed, rate-limited the request, returned an unreadable response, timed out, or could not be reached (network error).',
       recovery:
-        'The search backend fails on a bare operator (AND, OR, NOT), an empty field prefix ' +
-        '(title:), a doubled operator (AND AND), or &, %, /, !, or ; inside a word (AT&T, ' +
-        '100%, 1/2): quote such a phrase behind a field prefix (title:"AT&T") or replace the ' +
-        'character with a space. A query with none of these hit a backend fault; try a simpler ' +
-        'query.',
+        'The search backend fails on a bare operator (AND, OR, NOT), an empty field prefix (title:), a doubled operator (AND AND), or &, %, /, !, or ; inside a word (AT&T, 100%, 1/2): quote such a phrase behind a field prefix (title:"AT&T") or replace the character with a space. A query with none of these hit a backend fault; try a simpler query.',
       thrownBy: 'service',
     },
   ],
@@ -304,8 +292,7 @@ export const iaSearchItems = tool('ia_search_items', {
     if (input.rows > ROWS_CAP && input.page > 1) {
       throw ctx.fail(
         'rows_over_cap',
-        `rows ${input.rows} is above the cap of ${ROWS_CAP} per call, which only page 1 serves ` +
-          `at the cap; page ${input.page} needs rows of ${ROWS_CAP} or fewer.`,
+        `rows ${input.rows} is above the cap of ${ROWS_CAP} per call, which only page 1 serves at the cap; page ${input.page} needs rows of ${ROWS_CAP} or fewer.`,
         ctx.recoveryFor('rows_over_cap'),
       );
     }
@@ -313,22 +300,26 @@ export const iaSearchItems = tool('ia_search_items', {
     if (input.page * rows > RESULT_WINDOW) {
       throw ctx.fail(
         'page_limit_exceeded',
-        `Page ${input.page} at ${rows} per page ends at result ${(input.page * rows).toLocaleString('en-US')}, ` +
-          `past the 10,000 results Advanced Search serves; the last reachable page at ${rows} per ` +
-          `page is ${Math.floor(RESULT_WINDOW / rows)}.`,
+        `Page ${input.page} at ${rows} per page ends at result ${(input.page * rows).toLocaleString('en-US')}, past the 10,000 results Advanced Search serves; the last reachable page at ${rows} per page is ${Math.floor(RESULT_WINDOW / rows)}.`,
         ctx.recoveryFor('page_limit_exceeded'),
       );
     }
 
+    const requestedCollection = input.collection?.trim() || undefined;
+    const collection = requestedCollection && collectionIdentifier(requestedCollection);
+    const creator = input.creator?.trim() || undefined;
+    const language = input.language?.trim() || undefined;
+    const dateFrom = input.date_from?.trim() || undefined;
+    const dateTo = input.date_to?.trim() || undefined;
     const result = await svc.search(
       {
         query: input.query,
         mediatype,
-        collection: input.collection?.trim() || undefined,
-        creator: input.creator?.trim() || undefined,
-        dateFrom: input.date_from?.trim() || undefined,
-        dateTo: input.date_to?.trim() || undefined,
-        language: input.language?.trim() || undefined,
+        collection,
+        creator,
+        dateFrom,
+        dateTo,
+        language,
         sort: input.sort?.trim() || undefined,
         rows,
         page: input.page,
@@ -343,24 +334,27 @@ export const iaSearchItems = tool('ia_search_items', {
     });
 
     if (result.items.length === 0) {
+      const applied = Object.entries({
+        mediatype,
+        collection,
+        creator,
+        language,
+        date_from: dateFrom,
+        date_to: dateTo,
+      })
+        .filter((entry): entry is [string, string] => entry[1] !== undefined)
+        .map(([field, value]) => `${field} "${value}"`);
       ctx.enrich.notice(
         result.totalFound > 0
-          ? `Page ${result.page} is past the last page of ${result.totalFound.toLocaleString('en-US')} ` +
-              `results at ${result.rows} per page; request page ` +
-              `${Math.ceil(result.totalFound / result.rows)} or lower.`
-          : `No items matched "${input.query}"${mediatype ? ` with mediatype "${mediatype}"` : ''}. ` +
-              'Try broader search terms, remove filters, or verify the query syntax ' +
-              '(Solr field prefixes: title:, creator:, subject:).',
+          ? `Page ${result.page} is past the last page of ${result.totalFound.toLocaleString('en-US')} results at ${result.rows} per page; request page ${Math.ceil(result.totalFound / result.rows)} or lower.`
+          : `No items matched "${input.query}"${applied.length > 0 ? ` with ${applied.join(', ')}` : ''}. Try broader search terms, remove filters, or verify the query syntax (Solr field prefixes: title:, creator:, subject:).`,
       );
     } else if (rows < input.rows && result.totalFound > result.items.length) {
       const total = result.totalFound;
       ctx.enrich.truncated({
         shown: result.items.length,
         cap: ROWS_CAP,
-        guidance:
-          `rows ${input.rows} is above the cap of ${ROWS_CAP} per call, so this page holds ` +
-          `results 1–${result.items.length} of ${total.toLocaleString('en-US')}. Request ` +
-          `rows: ${ROWS_CAP}, page: 2 for results ${ROWS_CAP + 1}–${Math.min(2 * ROWS_CAP, total)}.`,
+        guidance: `rows ${input.rows} is above the cap of ${ROWS_CAP} per call, so this page holds results 1–${result.items.length} of ${total.toLocaleString('en-US')}. Request rows: ${ROWS_CAP}, page: 2 for results ${ROWS_CAP + 1}–${Math.min(2 * ROWS_CAP, total)}.`,
       });
     }
 

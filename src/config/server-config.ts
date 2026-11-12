@@ -23,7 +23,7 @@ const ServerConfigSchema = z.object({
     .min(1)
     .default(50_000)
     .describe(
-      'Default and maximum characters per ia_get_text page (a larger max_chars is served at it); also the text cap for ia_get_snapshot.',
+      'Default and maximum characters per ia_get_text and ia_get_snapshot page (a larger max_chars is served at it).',
     ),
 });
 

@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getWaybackService } from '@/services/wayback/wayback-service.js';
+import { TIMESTAMP_FORMS, waybackTimestamp } from '@/services/wayback/wayback-timestamp.js';
 
 const WAYBACK_WEB = 'https://web.archive.org/web';
 
@@ -19,15 +20,7 @@ const LIMIT_CEILING = 150_000;
 export const iaFindSnapshots = tool('ia_find_snapshots', {
   title: 'Find Wayback Machine Snapshots',
   description:
-    'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture ' +
-    'to a given timestamp via the Availability API, falling back to a CDX closest-capture query ' +
-    'when the Availability API has no answer (one result). Mode "history" returns the ' +
-    'full capture list via the CDX API — filterable by date range and HTTP status code, ' +
-    'collapsed by default to one capture per day (collapse "timestamp:8"); collapse ' +
-    '"timestamp:14" lists one row per distinct capture second. Use history mode to survey ' +
-    'how a page changed over time; use closest mode when you need the snapshot nearest a specific date. ' +
-    'History mode returns up to limit records (at most 10,000 per call) and supports resume-key ' +
-    'pagination for URLs with very large capture histories.',
+    'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture to a given timestamp via the Availability API, falling back to a CDX closest-capture query when the Availability API finds no capture or answers with a rate limit, a server error, or an unreadable response (one result). Mode "history" returns the full capture list via the CDX API — filterable by date range and HTTP status code, collapsed by default to one capture per day (collapse "timestamp:8"); collapse "timestamp:14" lists one row per distinct capture second. Use history mode to survey how a page changed over time; use closest mode when you need the snapshot nearest a specific date. History mode returns up to limit records (at most 10,000 per call) and supports resume-key pagination for URLs with very large capture histories.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -39,29 +32,25 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     mode: z
       .enum(['closest', 'history'])
       .describe(
-        'Lookup mode: "closest" returns the single nearest snapshot to the given timestamp; ' +
-          '"history" returns the paginated full capture list via the CDX API.',
+        'Lookup mode: "closest" returns the single nearest snapshot to the given timestamp; "history" returns the paginated full capture list via the CDX API.',
       ),
     timestamp: z
       .string()
       .optional()
       .describe(
-        'Target timestamp in YYYYMMDDHHMMSS format (or any prefix thereof). Required for mode=closest. ' +
-          'Example: "20200101" for January 1, 2020.',
+        'Target timestamp, required for mode "closest": 1–14 digits — YYYYMMDDHHMMSS or a prefix of it, such as "20200615" — or an ISO 8601 date or UTC date-time such as "2020-06-15" or "2020-06-15T12:34:56Z". A shorter value names a period and resolves to the capture nearest its end: "2015" can resolve to one from early January 2016.',
       ),
     from: z
       .string()
       .optional()
       .describe(
-        'Start of date range filter in YYYYMMDD format (history mode only). ' +
-          'Example: "20200101".',
+        'Start of the date range (history mode only): 1–14 digits — YYYYMMDDHHMMSS or a prefix of it — or an ISO 8601 date or UTC date-time such as "2020-01-01". A prefix starts at the beginning of the period it names: "2015" is January 1, 2015.',
       ),
     to: z
       .string()
       .optional()
       .describe(
-        'End of date range filter in YYYYMMDD format (history mode only). ' +
-          'Example: "20231231".',
+        'End of the date range (history mode only), in the same forms as from, and inclusive: a prefix ends at the end of the period it names, so "2015" reaches December 31, 2015, and "20231231" the end of that day.',
       ),
     status_filter: z
       .union([
@@ -73,8 +62,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       ])
       .optional()
       .describe(
-        'Filter CDX results to a specific HTTP status code (history mode only). ' +
-          'Must be a 3-digit numeric code. Example: "200" to return only successful captures.',
+        'Filter CDX results to a specific HTTP status code (history mode only). Must be a 3-digit numeric code. Example: "200" to return only successful captures.',
       ),
     limit: z
       .number()
@@ -83,9 +71,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .max(LIMIT_CEILING)
       .default(100)
       .describe(
-        'Maximum number of CDX records to return (history mode only, default 100). One call ' +
-          'returns at most 10,000: a larger value (up to 150,000) is served as 10,000, and the ' +
-          'resume_key continues from there.',
+        'Maximum number of CDX records to return (history mode only, default 100). One call returns at most 10,000: a larger value (up to 150,000) is served as 10,000, and the resume_key continues from there.',
       ),
     collapse: z
       .union([
@@ -97,17 +83,13 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       ])
       .optional()
       .describe(
-        'CDX collapse parameter (history mode only). Format: "timestamp:N" where N is 1–14 ' +
-          '(4=year, 6=month, 8=day, 10=hour, 14=second): consecutive captures sharing the first ' +
-          'N timestamp digits are listed once. Omitted or blank, it is "timestamp:8", one ' +
-          'capture per day. Pass "timestamp:14" for one row per distinct capture second.',
+        'CDX collapse parameter (history mode only). Format: "timestamp:N" where N is 1–14 (4=year, 6=month, 8=day, 10=hour, 14=second): consecutive captures sharing the first N timestamp digits are listed once. Omitted or blank, it is "timestamp:8", one capture per day. Pass "timestamp:14" for one row per distinct capture second.',
       ),
     resume_key: z
       .string()
       .optional()
       .describe(
-        'Opaque pagination key from a previous history mode response. Pass this to continue from ' +
-          'where the last page left off. Server cursors expire after one hour and bind the URL and original filters; omit filters on continuation or repeat their original values. Page size may change. Wildcard and legacy raw continuations can omit collapsed captures.',
+        'Opaque pagination key from a previous history mode response. Pass this to continue from where the last page left off. Server cursors expire after one hour and bind the URL and original filters; omit filters on continuation or repeat their original values. Page size may change. Wildcard and legacy raw continuations can omit collapsed captures.',
       ),
   }),
 
@@ -184,8 +166,15 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'Closest mode was called without a timestamp, or with a blank one.',
       recovery:
-        'Pass timestamp in YYYYMMDDHHMMSS format or any prefix of it (e.g. "20200101"), or use ' +
-        'mode "history" to list captures without one.',
+        'Pass timestamp as 1–14 digits (YYYYMMDDHHMMSS or a prefix of it, e.g. "20200101") or an ISO 8601 date such as "2020-01-01", or use mode "history" to list captures without one.',
+      severity: 'warning',
+    },
+    {
+      reason: 'invalid_timestamp',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'timestamp (closest mode), from, or to (history mode) is not 1–14 digits or an ISO 8601 date or UTC date-time, or names a month, day, hour, minute, or second no Gregorian date and time has.',
+      recovery:
+        'Set the named field to 1–14 digits (YYYYMMDDHHMMSS or a prefix of it, such as "20200615") or an ISO 8601 date or UTC date-time such as "2020-06-15" or "2020-06-15T12:34:56Z".',
       severity: 'warning',
     },
     {
@@ -198,11 +187,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     {
       reason: 'no_snapshot_available',
       code: JsonRpcErrorCode.NotFound,
-      when:
-        'Closest mode: no capture exists near the requested timestamp for this URL. Either ' +
-        'mode: the Wayback Machine does not serve captures of this URL at all — the CDX or ' +
-        'Availability API answered HTTP 403, 410, or 451, as it does for a site excluded from ' +
-        'the archive.',
+      when: 'Closest mode: no capture exists near the requested timestamp for this URL. Either mode: the Wayback Machine does not serve captures of this URL at all — the CDX or Availability API answered HTTP 403, 410, or 451, as it does for a site excluded from the archive.',
       recovery:
         'Try a different timestamp or switch to history mode to discover what snapshots exist.',
       severity: 'warning',
@@ -211,23 +196,15 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     {
       reason: 'cdx_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when:
-        'The Wayback CDX API answered HTTP 5xx after retries or 429, refused the request with ' +
-        'another 4xx, did not answer within the request timeout, could not be reached, or ' +
-        'returned an unreadable response; in closest mode, the CDX closest-capture check ' +
-        'failed or did not complete in time.',
+      when: 'The Wayback CDX API answered HTTP 5xx after retries or 429, refused the request with another 4xx, did not answer within the request timeout, could not be reached, or returned an unreadable response; in closest mode, the Availability API found no capture and the CDX closest-capture check it fell back to failed or did not complete in time.',
       recovery:
-        'The Wayback CDX API is temporarily overloaded or unreachable; retry in a few seconds. ' +
-        'A query that keeps timing out needs a narrower from and to range or a smaller limit.',
+        'The Wayback CDX API is temporarily overloaded or unreachable; retry in a few seconds. A query that keeps timing out needs a narrower from and to range or a smaller limit.',
       thrownBy: 'service',
     },
     {
       reason: 'availability_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when:
-        'The Wayback Availability API answered HTTP 5xx after retries or 429, refused the ' +
-        'request with another 4xx, did not answer within the request timeout, could not be ' +
-        'reached, or returned an unreadable response (closest mode).',
+      when: 'Closest mode: the Wayback Availability API answered HTTP 429, 5xx after retries, or an unreadable response, and the CDX closest-capture check it fell back to failed too or had no time left within the lookup deadline (the request timeout plus 25 s); or the Availability API refused the request with another 4xx, did not answer within the request timeout, or could not be reached, none of which falls back.',
       recovery:
         'Retry in a few seconds, or use history mode with from and to around the timestamp to list nearby captures.',
       thrownBy: 'service',
@@ -237,8 +214,26 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
   async handler(input, ctx) {
     const svc = getWaybackService();
 
+    /**
+     * A timestamp field as every Wayback endpoint reads it, checked before any request:
+     * undefined when blank, rejected when an endpoint would misread it. Each mode reads
+     * only its own fields.
+     */
+    const timestampOf = (field: 'timestamp' | 'from' | 'to'): string | undefined => {
+      const value = input[field]?.trim();
+      if (!value) return;
+      const timestamp = waybackTimestamp(value);
+      if (timestamp === undefined) {
+        throw ctx.fail('invalid_timestamp', `${field} must be ${TIMESTAMP_FORMS}.`, {
+          field,
+          ...ctx.recoveryFor('invalid_timestamp'),
+        });
+      }
+      return timestamp;
+    };
+
     if (input.mode === 'closest') {
-      const ts = input.timestamp?.trim();
+      const ts = timestampOf('timestamp');
       if (!ts) {
         throw ctx.fail(
           'missing_timestamp',
@@ -268,8 +263,8 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     const histResult = await svc.fetchHistory(
       {
         url: input.url,
-        from: input.from?.trim() || undefined,
-        to: input.to?.trim() || undefined,
+        from: timestampOf('from'),
+        to: timestampOf('to'),
         statusFilter: input.status_filter?.trim() || undefined,
         limit,
         collapse: collapseParam,

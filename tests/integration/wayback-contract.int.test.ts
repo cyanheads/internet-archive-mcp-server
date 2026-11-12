@@ -3,9 +3,9 @@
  * ia_get_snapshot — both tools run against the real WaybackService, the real
  * fetchWithTimeout, and the real retry loop, with only the upstream HTTP boundary
  * stubbed. Covers closest resolution (Availability, then CDX), the capture Wayback
- * actually served, charset and text extraction, upstream 5xx, timeout, and network-error
- * reasons, archived error captures, and caller cancellation, on both the
- * structuredContent and content[] surfaces.
+ * actually served, charset and text extraction, routing by the replay's media type,
+ * snapshot paging, upstream 5xx, timeout, and network-error reasons, archived error
+ * captures, and caller cancellation, on both the structuredContent and content[] surfaces.
  * @module tests/integration/wayback-contract.int.test
  */
 
@@ -20,6 +20,7 @@ import {
 } from '@cyanheads/mcp-ts-core/testing';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { initWaybackService } from '@/services/wayback/wayback-service.js';
@@ -57,6 +58,28 @@ const replay =
 const FALLBACK_MESSAGE = /Availability API found no capture.*CDX .*did not complete/;
 const FALLBACK_HINT = 'history mode';
 
+/** What a lookup says when the Availability API failed and its CDX fallback did not answer either. */
+const LOOKUP_FAILED_MESSAGE =
+  /^The closest-capture lookup for \S+ near \d+ did not complete: Availability API .+ The CDX closest-capture check it fell back to did not complete either: /;
+
+/** The route a lookup that could not answer names: history mode, then the exact-timestamp read. */
+const NO_LOOKUP_ROUTE =
+  /history mode, passing from and to around the timestamp, then read one with ia_get_snapshot and its exact 14-digit timestamp/;
+
+/** A responder that answers with `respond()` after `ms`, unless the request's signal aborts first. */
+const answerAfter =
+  (ms: number, respond: () => Response): FetchMockResponder =>
+  (request) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(respond()), ms);
+      request.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(request.signal.reason);
+      });
+    });
+
+const UNAVAILABLE = () => new Response('Service Unavailable', { status: 503 });
+
 /** A 429 exactly as archive.org sent it (no Retry-After). */
 const RATE_LIMITED = () =>
   new Response('<html><body><h1>429 Too Many Requests</h1></body></html>', { status: 429 });
@@ -66,6 +89,11 @@ const hang: FetchMockResponder = (request) =>
   new Promise((_, reject) => {
     request.signal.addEventListener('abort', () => reject(request.signal.reason));
   });
+
+/** The type a body arrives as: JSON from the lookup APIs, an HTML page from a replay. */
+const bodyType = (request: Request) => ({
+  'content-type': isReplay(request) ? 'text/html' : 'application/json',
+});
 
 /** Headers arrive with `head` as the first body bytes; the rest never comes until the request's signal aborts. */
 const stall =
@@ -78,7 +106,7 @@ const stall =
           request.signal.addEventListener('abort', () => controller.error(request.signal.reason));
         },
       }),
-      { headers: { 'content-type': 'application/json' } },
+      { headers: bodyType(request) },
     );
 
 /** A refused connection, as the runtime's `fetch` rejects with it. */
@@ -94,7 +122,7 @@ const refused: FetchMockResponder = () =>
 /** Headers and `head` arrive, then the connection drops, as undici rejects the body read. */
 const dropped =
   (head: string): FetchMockResponder =>
-  () =>
+  (request) =>
     new Response(
       new ReadableStream<Uint8Array>({
         start(controller) {
@@ -102,7 +130,7 @@ const dropped =
           queueMicrotask(() => controller.error(new TypeError('terminated')));
         },
       }),
-      { headers: { 'content-type': 'application/json' } },
+      { headers: bodyType(request) },
     );
 
 /** A replay of an archived error page: the capture's own status, with its Memento-Datetime. */
@@ -225,25 +253,48 @@ describe('ia_find_snapshots closest mode', () => {
     expect(calls(isCdx)).toHaveLength(1);
   });
 
-  it('surfaces availability_unavailable after retrying an Availability 503', async () => {
-    routeAvailability(() => new Response('Service Unavailable', { status: 503 }));
+  it('returns the CDX capture after retrying an Availability 503, on both surfaces', async () => {
+    routeAvailability(UNAVAILABLE);
+    routeCdx(cdxRows(['20200101231916', 'https://www.nasa.gov/', '200']));
 
     const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
 
-    const recovery = hint(iaFindSnapshots.errors, 'availability_unavailable');
+    const replayUrl = 'https://web.archive.org/web/20200101231916/https://www.nasa.gov/';
+    expect(result.structuredContent).toMatchObject({
+      snapshots: [{ timestamp: '20200101231916', replay_url: replayUrl, statuscode: '200' }],
+    });
+    expect(contentText(result)).toContain(`**Replay URL:** [${replayUrl}](<${replayUrl}>)`);
+    expect(calls(isAvailability)).toHaveLength(4);
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(new URL(calls(isCdx)[0]?.request.url ?? '').searchParams.get('closest')).toBe(
+      '20200101',
+    );
+  });
+
+  it('surfaces availability_unavailable naming the lookup when the fallback after four 503s fails too', async () => {
+    routeAvailability(UNAVAILABLE);
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
+
+    const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
+
     expect(result.structuredContent).toMatchObject({
       error: {
         code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
         data: {
           reason: 'availability_unavailable',
+          status: 503,
           retryAttempts: 4,
-          recovery: { hint: recovery },
+          recovery: { hint: expect.stringMatching(NO_LOOKUP_ROUTE) },
         },
       },
     });
-    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    const text = contentText(result);
+    expect(text).toMatch(/closest-capture lookup for nasa\.gov near 20200101 did not complete/);
+    expect(text).toMatch(new RegExp(`Recovery: Retry later, or .*${NO_LOOKUP_ROUTE.source}`));
+    expect(text).not.toMatch(/found no capture/);
     expect(calls(isAvailability)).toHaveLength(4);
-    expect(calls(isCdx)).toHaveLength(0);
+    expect(calls(isCdx)).toHaveLength(1);
   });
 
   it('surfaces cdx_unavailable after one fallback CDX 503, not four', async () => {
@@ -289,17 +340,52 @@ describe('ia_find_snapshots closest mode', () => {
     expect(calls(isCdx)).toHaveLength(1);
   });
 
-  it('answers an Availability 429 after one request with a wait hint', async () => {
+  it('resolves through CDX after one Availability 429', async () => {
     routeAvailability(RATE_LIMITED);
+    routeCdx(cdxRows(['20200101231916', 'https://www.nasa.gov/', '200']));
+
+    const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
+
+    expect(result.structuredContent).toMatchObject({
+      snapshots: [{ timestamp: '20200101231916', statuscode: '200' }],
+    });
+    expect(contentText(result)).toContain('## 20200101231916');
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(1);
+  });
+
+  it('answers an Availability 429 whose CDX fallback is empty as no_snapshot_available', async () => {
+    routeAvailability(RATE_LIMITED);
+    routeCdx(cdxRows());
+
+    const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
+
+    const recovery = hint(iaFindSnapshots.errors, 'no_snapshot_available');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+  });
+
+  it('answers an Availability 429 whose fallback fails with a wait hint, after one request each', async () => {
+    routeAvailability(RATE_LIMITED);
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
 
     const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
 
     expect(result.structuredContent).toMatchObject({
       error: {
         code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
         data: {
           reason: 'availability_unavailable',
-          recovery: { hint: expect.stringContaining('wait') },
+          status: 429,
+          recovery: {
+            hint: expect.stringMatching(/rate-limiting.*wait several minutes, then list/),
+          },
         },
       },
     });
@@ -308,7 +394,7 @@ describe('ia_find_snapshots closest mode', () => {
     );
     expect(contentText(result)).not.toContain('not retryable');
     expect(calls(isAvailability)).toHaveLength(1);
-    expect(calls(isCdx)).toHaveLength(0);
+    expect(calls(isCdx)).toHaveLength(1);
   });
 
   it('answers a CDX fallback 429 after one request with the wait-then-history-mode hint', async () => {
@@ -333,18 +419,21 @@ describe('ia_find_snapshots closest mode', () => {
     expect(calls(isCdx)).toHaveLength(1);
   });
 
-  it('never reports an Availability HTML page as a ValidationError', async () => {
+  it('never reports an Availability HTML page as a ValidationError, falling back once', async () => {
     routeAvailability(() => new Response('<html><body>Temporarily Offline</body></html>'));
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
 
     const result = await runWithRetries(() => runToolContract(iaFindSnapshots, closest));
 
     expect(result.structuredContent).toMatchObject({
       error: {
         code: JsonRpcErrorCode.ServiceUnavailable,
+        message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
         data: { reason: 'availability_unavailable' },
       },
     });
-    expect(calls(isCdx)).toHaveLength(0);
+    expect(calls(isAvailability)).toHaveLength(4);
+    expect(calls(isCdx)).toHaveLength(1);
   });
 
   it('keeps a caller cancellation during the Availability call a cancellation, with no fallback', async () => {
@@ -383,6 +472,81 @@ describe('ia_find_snapshots closest mode', () => {
       error: { code: JsonRpcErrorCode.RequestCancelled },
     });
     expect(calls(isCdx)).toHaveLength(1);
+  });
+
+  describe('under one deadline: the request timeout plus 25 s (#53)', () => {
+    /** Runs the lookup under fake timers to completion, reporting the fake time it took. */
+    const runTimed = async () => {
+      vi.useFakeTimers();
+      const start = Date.now();
+      const pending = runToolContract(iaFindSnapshots, closest);
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      return { result, elapsedMs: Date.now() - start };
+    };
+
+    it('ends at 55 s when each Availability attempt answers 503 just inside the request timeout, never reaching CDX', async () => {
+      routeAvailability(answerAfter(29_900, UNAVAILABLE));
+      routeCdx(hang);
+
+      const { result, elapsedMs } = await runTimed();
+
+      expect(elapsedMs).toBe(55_000);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message:
+            'The closest-capture lookup for nasa.gov near 20200101 did not finish within its 55 s deadline: the Availability API did not answer in time.',
+          data: {
+            reason: 'availability_unavailable',
+            retryAttempts: 2,
+            recovery: { hint: expect.stringMatching(NO_LOOKUP_ROUTE) },
+          },
+        },
+      });
+      expect(contentText(result)).toMatch(/did not finish within its 55 s deadline/);
+      expect(calls(isAvailability)).toHaveLength(2);
+      expect(calls(isCdx)).toHaveLength(0);
+    });
+
+    it('gives the CDX attempt only what remains after four 503s, so it ends at the deadline too', async () => {
+      // Backoff without jitter: 1 s, 2 s, then 4 s, so the fourth 503 lands at 51 s.
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      try {
+        routeAvailability(answerAfter(11_000, UNAVAILABLE));
+        routeCdx(hang);
+
+        const { result, elapsedMs } = await runTimed();
+
+        expect(elapsedMs).toBe(55_000);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
+            data: { reason: 'availability_unavailable', status: 503, retryAttempts: 4 },
+          },
+        });
+        expect(calls(isAvailability)).toHaveLength(4);
+        expect(calls(isCdx)).toHaveLength(1);
+      } finally {
+        random.mockRestore();
+      }
+    });
+
+    it('keeps the 25 s CDX ceiling after a fast 429', async () => {
+      routeAvailability(RATE_LIMITED);
+      routeCdx(hang);
+
+      const { result, elapsedMs } = await runTimed();
+
+      expect(elapsedMs).toBe(25_000);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
+          data: { reason: 'availability_unavailable', status: 429 },
+        },
+      });
+    });
   });
 });
 
@@ -852,22 +1016,76 @@ describe('ia_get_snapshot', () => {
     expect(calls(isReplay)).toHaveLength(0);
   });
 
-  it('surfaces content_fetch_failed after retrying an Availability 503', async () => {
-    routeAvailability(() => new Response('Service Unavailable', { status: 503 }));
+  it('fetches the CDX capture after retrying an Availability 503', async () => {
+    routeAvailability(UNAVAILABLE);
+    routeCdx(cdxRows(['20200101231916', 'https://www.nasa.gov/', '200']));
+    routeReplay(replay(PAGE));
 
     const result = await runWithRetries(() =>
       runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' }),
     );
 
-    const recovery = hint(iaGetSnapshot.errors, 'content_fetch_failed');
+    expect(result.structuredContent).toMatchObject({
+      text: 'Hello world › more',
+      resolved_timestamp: '20200101231916',
+    });
+    expect(contentText(result)).toContain('**Resolved Timestamp:** 20200101231916');
+    expect(calls(isAvailability)).toHaveLength(4);
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(calls(isReplay)[0]?.request.url).toBe(
+      'https://web.archive.org/web/20200101231916/https://www.nasa.gov/',
+    );
+  });
+
+  it('surfaces content_fetch_failed naming the lookup, never the Availability API alone, when the fallback after four 503s fails too', async () => {
+    routeAvailability(UNAVAILABLE);
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' }),
+    );
+
     expect(result.structuredContent).toMatchObject({
       error: {
         code: JsonRpcErrorCode.ServiceUnavailable,
-        data: { reason: 'content_fetch_failed', recovery: { hint: recovery } },
+        message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
+        data: {
+          reason: 'content_fetch_failed',
+          recovery: { hint: expect.stringMatching(NO_LOOKUP_ROUTE) },
+        },
       },
     });
-    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    const text = contentText(result);
+    expect(text).toMatch(
+      /^Error: The closest-capture lookup for nasa\.gov near 20200101 did not complete/m,
+    );
+    expect(text).not.toContain(hint(iaGetSnapshot.errors, 'content_fetch_failed'));
     expect(calls(isAvailability)).toHaveLength(4);
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(calls(isReplay)).toHaveLength(0);
+  });
+
+  it('ends a lookup whose Availability attempts each answer 503 just inside the request timeout at 55 s', async () => {
+    routeAvailability(answerAfter(29_900, UNAVAILABLE));
+    routeCdx(hang);
+    vi.useFakeTimers();
+    const start = Date.now();
+
+    const pending = runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(Date.now() - start).toBe(55_000);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        message: expect.stringMatching(/^The closest-capture lookup for nasa\.gov .*55 s deadline/),
+        data: {
+          reason: 'content_fetch_failed',
+          recovery: { hint: expect.stringMatching(NO_LOOKUP_ROUTE) },
+        },
+      },
+    });
+    expect(calls(isCdx)).toHaveLength(0);
     expect(calls(isReplay)).toHaveLength(0);
   });
 
@@ -894,8 +1112,25 @@ describe('ia_get_snapshot', () => {
     expect(calls(isReplay)).toHaveLength(0);
   });
 
-  it('answers an Availability 429 with one request and content_fetch_failed carrying the wait hint', async () => {
+  it('fetches the CDX capture after one Availability 429', async () => {
     routeAvailability(RATE_LIMITED);
+    routeCdx(cdxRows(['20200101231916', 'https://www.nasa.gov/', '200']));
+    routeReplay(replay(PAGE));
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' }),
+    );
+
+    expect(result.structuredContent).toMatchObject({ resolved_timestamp: '20200101231916' });
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(1);
+  });
+
+  it('answers an Availability 429 whose fallback fails with content_fetch_failed carrying the wait hint', async () => {
+    routeAvailability(
+      () => new Response('rate limited', { status: 429, headers: { 'retry-after': '120' } }),
+    );
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
 
     const result = await runWithRetries(() =>
       runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' }),
@@ -903,18 +1138,22 @@ describe('ia_get_snapshot', () => {
 
     expect(result.structuredContent).toMatchObject({
       error: {
+        message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
         data: {
           reason: 'content_fetch_failed',
-          recovery: { hint: expect.stringContaining('wait') },
+          retryAfter: '120',
+          recovery: { hint: expect.stringMatching(/wait 120 seconds, then list nearby captures/) },
         },
       },
     });
     expect(contentText(result)).not.toContain('not retryable');
     expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(1);
   });
 
   it('maps an Availability page of unparseable JSON to content_fetch_failed, never ValidationError', async () => {
     routeAvailability(() => new Response('{"url": "nasa.gov", "archived_snap'));
+    routeCdx(() => new Response('Temporarily Offline', { status: 503 }));
 
     const result = await runWithRetries(() =>
       runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' }),
@@ -1099,6 +1338,385 @@ describe('ia_get_snapshot', () => {
     expect(sc.text).toBe('Actualités · Multimédia');
     expect(contentText(result)).toContain('Actualités · Multimédia');
     expect(contentText(result)).not.toContain('�');
+  });
+});
+
+describe('ia_get_snapshot by the replay’s media type (#49)', () => {
+  /** A replay of a capture's original bytes: the `id_` form. */
+  const isRaw = (r: Request) => /^https:\/\/web\.archive\.org\/web\/\d{14}id_\//.test(r.url);
+  const routeRaw = (respond: FetchMockResponder) => http.route({ match: isRaw, respond });
+  const routePlain = (respond: FetchMockResponder) =>
+    http.route({ match: (r) => isReplay(r) && !isRaw(r), respond });
+
+  const GITHUB = { url: 'https://api.github.com/', timestamp: '20200116122222' } as const;
+  const GITHUB_PLAIN = 'https://web.archive.org/web/20200116122222/https://api.github.com/';
+  const GITHUB_RAW = 'https://web.archive.org/web/20200116122222id_/https://api.github.com/';
+  /** The first two keys of the 2020-01-16 api.github.com capture, as its id_ form serves them. */
+  const GITHUB_JSON =
+    '{"current_user_url":"https://api.github.com/user","current_user_authorizations_html_url":"https://github.com/settings/connections/applications{/client_id}"}';
+  /** RFC 2616 §2.1, as its text/plain capture holds it: line breaks and ABNF angle brackets. */
+  const RFC_2616_RULE =
+    '   *rule\n      The character "*" preceding an element indicates repetition. The\n      full form is "<n>*<m>element" indicating at least <n> and at most\n      <m> occurrences of element.\n';
+
+  /**
+   * A plain-form replay body of 20 `chunk`s that records each one pulled and whether the
+   * rest was cancelled. Nothing is pulled until a read asks, so the one chunk the request
+   * deadline's passthrough prefetches is the most an unread body loses.
+   */
+  const tracked = (contentType: string, chunk = 'x'.repeat(65_536)) => {
+    const stats = { pulled: 0, cancelled: false };
+    const bytes = new TextEncoder().encode(chunk);
+    const respond: FetchMockResponder = () =>
+      new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              if (stats.pulled === 20) return controller.close();
+              stats.pulled++;
+              controller.enqueue(bytes);
+            },
+            cancel() {
+              stats.cancelled = true;
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        { headers: { 'content-type': contentType, 'x-archive-guessed-charset': 'utf-8' } },
+      );
+    return { stats, respond };
+  };
+  const original = (body: string, contentType: string) => () =>
+    new Response(new TextEncoder().encode(body), { headers: { 'content-type': contentType } });
+
+  it('reads a JSON capture from its id_ form with its own URLs, on both surfaces', async () => {
+    const plain = tracked('application/json; charset=utf-8');
+    routeRaw(original(GITHUB_JSON, 'application/json; charset=utf-8'));
+    routePlain(plain.respond);
+
+    const result = await runToolContract(iaGetSnapshot, GITHUB);
+
+    expect(result.structuredContent).toMatchObject({
+      text: GITHUB_JSON,
+      replay_url: GITHUB_PLAIN,
+      resolved_timestamp: '20200116122222',
+      resolved_status: '200',
+    });
+    expect(contentText(result)).toContain('"current_user_url":"https://api.github.com/user"');
+    expect(JSON.stringify(result)).not.toContain('20200116122222/https://api.github.com/user');
+    expect(calls(isReplay).map((c) => c.request.url)).toEqual([GITHUB_PLAIN, GITHUB_RAW]);
+    expect(plain.stats.cancelled).toBe(true);
+    expect(plain.stats.pulled).toBeLessThanOrEqual(1);
+  });
+
+  it('keeps a text/plain capture’s line breaks and angle brackets, on both surfaces', async () => {
+    routeRaw(original(RFC_2616_RULE, 'text/plain'));
+    routePlain(tracked('text/plain').respond);
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://www.rfc-editor.org/rfc/rfc2616.txt',
+      timestamp: '20201230144805',
+    });
+
+    expect((result.structuredContent as { text: string }).text).toBe(RFC_2616_RULE);
+    expect(contentText(result)).toContain(
+      'full form is "\\<n>\\*\\<m>element" indicating at least \\<n> and at most\\\n',
+    );
+  });
+
+  it('fails a PDF capture as non_text_capture on both surfaces without reading its body', async () => {
+    const replayUrl =
+      'https://web.archive.org/web/20200101164020/https://www.irs.gov/pub/irs-pdf/f1040.pdf';
+    const pdf = tracked('application/pdf', '%PDF-1.7 922 0 obj <</Linearized 1/L 146326>>');
+    routePlain(pdf.respond);
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://www.irs.gov/pub/irs-pdf/f1040.pdf',
+      timestamp: '20200101164020',
+    });
+
+    const recovery = hint(iaGetSnapshot.errors, 'non_text_capture');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining('application/pdf'),
+        data: {
+          reason: 'non_text_capture',
+          mediaType: 'application/pdf',
+          replayUrl,
+          recovery: { hint: recovery },
+        },
+      },
+    });
+    expect((result.structuredContent as { error: { message: string } }).error.message).toContain(
+      replayUrl,
+    );
+    const text = contentText(result);
+    expect(text).toContain('application/pdf');
+    expect(text).toContain(`Recovery: ${recovery}`);
+    expect(`${JSON.stringify(result.structuredContent)}${text}`).not.toContain('%PDF');
+    expect(calls(isReplay)).toHaveLength(1);
+    expect(pdf.stats.cancelled).toBe(true);
+    expect(pdf.stats.pulled).toBeLessThanOrEqual(1);
+  });
+
+  it('extracts a text/html capture declaring no charset from the plain form alone, as before', async () => {
+    const html = '<html><body>The Rest \xa9 1997-99 Rob Malda</body></html>';
+    routeReplay(
+      replay(
+        Uint8Array.from(html, (c) => c.charCodeAt(0)),
+        undefined,
+        { 'x-archive-guessed-charset': 'latin1' },
+      ),
+    );
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'http://www.slashdot.org/',
+      timestamp: '19990125103314',
+    });
+
+    expect((result.structuredContent as { text: string }).text).toBe(
+      'The Rest © 1997-99 Rob Malda',
+    );
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it('retries an id_ 503 as it does a plain one, without requesting the plain form again', async () => {
+    routeRaw(() => new Response('Service Unavailable', { status: 503 }));
+    routePlain(tracked('application/json').respond);
+
+    const result = await runWithRetries(() => runToolContract(iaGetSnapshot, GITHUB));
+
+    const recovery = hint(iaGetSnapshot.errors, 'content_fetch_failed');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'content_fetch_failed', recovery: { hint: recovery } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    expect(calls(isRaw)).toHaveLength(4);
+    expect(calls(isReplay)).toHaveLength(5);
+  });
+
+  it.each([
+    ['a 404', () => new Response('Not Found', { status: 404 })],
+    ['a 403', () => new Response('Forbidden', { status: 403 })],
+    ['a 451', () => new Response('Unavailable', { status: 451 })],
+    ['a 400', () => new Response('Bad Request', { status: 400 })],
+    ['an archived 404', archivedError(404, 'Thu, 16 Jan 2020 12:22:22 GMT')],
+  ])(
+    'answers %s on the id_ form of a capture the plain replay served as content_fetch_failed, after one id_ request',
+    async (_label, respond) => {
+      routeRaw(respond);
+      routePlain(tracked('application/json').respond);
+
+      const result = await runToolContract(iaGetSnapshot, GITHUB);
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining(GITHUB_RAW),
+          data: {
+            reason: 'content_fetch_failed',
+            retryable: false,
+            recovery: { hint: expect.stringContaining(GITHUB_PLAIN) },
+          },
+        },
+      });
+      const text = contentText(result);
+      expect(text).toContain('Recovery: Wayback replayed this capture');
+      expect(text).not.toMatch(/does not serve captures|No capture found|error page/);
+      expect(calls(isRaw)).toHaveLength(1);
+    },
+  );
+
+  it('answers an id_ body that stalls with content_fetch_failed after one id_ request, within one request timeout', async () => {
+    routeRaw(stall('{"current_user_url"'));
+    routePlain(tracked('application/json').respond);
+    vi.useFakeTimers();
+    const start = Date.now();
+
+    const pending = runToolContract(iaGetSnapshot, GITHUB);
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    const recovery = hint(iaGetSnapshot.errors, 'content_fetch_failed');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'content_fetch_failed', recovery: { hint: recovery } },
+      },
+    });
+    expect(calls(isRaw)).toHaveLength(1);
+    expect(Date.now() - start).toBeLessThanOrEqual(30_000);
+  });
+
+  it('keeps a caller cancellation during the id_ fetch a cancellation', async () => {
+    routeRaw(hang);
+    routePlain(tracked('application/json').respond);
+    const controller = new AbortController();
+
+    const pending = runToolContract(iaGetSnapshot, GITHUB, {
+      context: { signal: controller.signal },
+    });
+    await vi.waitFor(() => expect(calls(isRaw)).toHaveLength(1));
+    controller.abort();
+    const result = await pending;
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.RequestCancelled },
+    });
+    expect(
+      (result.structuredContent as { error: { data?: { reason?: string } } }).error.data?.reason,
+    ).toBeUndefined();
+    expect(calls(isReplay)).toHaveLength(2);
+  });
+});
+
+describe('ia_get_snapshot paging (#44)', () => {
+  const PAGE = getServerConfig().maxSnapshotChars;
+  const WW2 = { url: 'https://en.wikipedia.org/wiki/World_War_II', timestamp: '20200101030920' };
+  /** The length of the World War II capture's text; each position's letter follows from its index. */
+  const TEXT = Array.from({ length: 177_671 }, (_, i) => String.fromCharCode(97 + (i % 26))).join(
+    '',
+  );
+  type Page = {
+    text: string;
+    char_offset: number;
+    max_chars: number;
+    has_more: boolean;
+    total_chars: number;
+    notice?: string;
+  };
+
+  it('walks a capture’s text in pages that join with no gap or overlap, one replay request each, on both surfaces', async () => {
+    routeReplay(replay(`<html><body><p>${TEXT}</p></body></html>`));
+
+    const pages: { page: Page; content: string }[] = [];
+    for (let char_offset = 0; char_offset < TEXT.length; char_offset += PAGE) {
+      const result = await runToolContract(iaGetSnapshot, {
+        ...WW2,
+        ...(char_offset > 0 && { char_offset }),
+      });
+      pages.push({ page: result.structuredContent as Page, content: contentText(result) });
+    }
+
+    expect(pages.map(({ page }) => page.text).join('')).toBe(TEXT);
+    expect(calls(isReplay)).toHaveLength(pages.length);
+    pages.forEach(({ page, content }, i) => {
+      const last = i === pages.length - 1;
+      expect(page).toMatchObject({
+        char_offset: i * PAGE,
+        max_chars: PAGE,
+        has_more: !last,
+        total_chars: 177_671,
+      });
+      expect(content).toContain('**Total Chars:** 177,671');
+      if (last) {
+        expect(page.notice).toBeUndefined();
+        expect(content).toContain('end of text');
+      } else {
+        expect(page.notice).toContain(`char_offset ${(i + 1) * PAGE}`);
+        expect(page.notice).toContain('timestamp 20200101030920');
+        expect(content).toContain(page.notice);
+      }
+    });
+  });
+
+  it('serves empty text with has_more false past the end', async () => {
+    routeReplay(replay(`<p>${TEXT}</p>`));
+
+    const result = await runToolContract(iaGetSnapshot, { ...WW2, char_offset: 177_671 });
+
+    expect(result.structuredContent).toMatchObject({
+      text: '',
+      char_offset: 177_671,
+      has_more: false,
+      total_chars: 177_671,
+    });
+  });
+
+  it('counts only the text of the first 4 MiB of a longer page, keeping its notice beside the next page’s', async () => {
+    const CHUNK = 65_536;
+    const unit = new TextEncoder().encode('<p>word</p>');
+    const chunk = new Uint8Array(CHUNK).fill(0x20);
+    for (let at = 0; at + unit.length <= CHUNK; at += unit.length) chunk.set(unit, at);
+    let pulled = 0;
+    routeReplay(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (pulled++ === 200) return controller.close();
+              controller.enqueue(chunk);
+            },
+          }),
+          { headers: { 'content-type': 'text/html' } },
+        ),
+    );
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://edition.cnn.com/',
+      timestamp: '20240601000205',
+    });
+
+    // 4 MiB is 64 whole chunks of 5,957 paragraphs each: that many words, one space apart.
+    const words = Math.floor(CHUNK / unit.length) * 64;
+    const sc = result.structuredContent as Page;
+    expect(sc.total_chars).toBe(words * 4 + (words - 1));
+    expect(sc.text).toHaveLength(PAGE);
+    expect(sc.has_more).toBe(true);
+    expect(sc.notice).toContain('first 4,194,304 bytes');
+    expect(sc.notice).toContain(`char_offset ${PAGE}`);
+    expect(contentText(result)).toContain(sc.notice);
+  });
+
+  it('pages the text of a capture read from its id_ form too', async () => {
+    const json = JSON.stringify({ items: TEXT });
+    routeReplay((request) =>
+      request.url.includes('20200116122222id_/')
+        ? new Response(new TextEncoder().encode(json), {
+            headers: { 'content-type': 'application/json' },
+          })
+        : new Response(new TextEncoder().encode('rewritten'), {
+            headers: { 'content-type': 'application/json' },
+          }),
+    );
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://api.github.com/',
+      timestamp: '20200116122222',
+      char_offset: 3,
+      max_chars: 20,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      text: json.slice(3, 23),
+      char_offset: 3,
+      max_chars: 20,
+      has_more: true,
+      total_chars: json.length,
+    });
+  });
+
+  it('fails a non-text capture as non_text_capture whatever page it asks for', async () => {
+    routeReplay(
+      () =>
+        new Response(new TextEncoder().encode('%PDF-1.7'), {
+          headers: { 'content-type': 'application/pdf' },
+        }),
+    );
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://www.irs.gov/pub/irs-pdf/f1040.pdf',
+      timestamp: '20200101164020',
+      char_offset: 999_999_999,
+      max_chars: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'non_text_capture' } },
+    });
   });
 });
 
@@ -1747,8 +2365,9 @@ describe('CDX and Availability API 4xx answers', () => {
     async (status) => {
       routeCdx(refusedWith(status));
 
+      // The stub refuses any query; a from the handler accepts lets this one reach CDX.
       const result = await runWithRetries(() =>
-        runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history', from: 'abc' }),
+        runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history', from: '2015' }),
       );
 
       expect(calls(isCdx)).toHaveLength(1);
@@ -1831,6 +2450,77 @@ describe('CDX and Availability API 4xx answers', () => {
       expectNoBody(result);
     },
   );
+});
+
+describe('Wayback 5xx and 429 HTML pages stay off both surfaces', () => {
+  /** A proxy's 502 page or archive.org's rate-limit page, as the error body of the answer. */
+  const htmlPage = (status: number) => () =>
+    new Response('<!DOCTYPE html><html><body><h1>html-error-page-marker</h1></body></html>', {
+      status,
+      headers: { 'content-type': 'text/html' },
+    });
+
+  const closest = () =>
+    runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'closest', timestamp: '2023' });
+  const history = () => runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history' });
+  const exactSnapshot = () =>
+    runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20230101000000' });
+
+  describe.each([502, 429])('HTTP %i', (status) => {
+    it.each([
+      [
+        'an Availability lookup and its CDX fallback',
+        'availability_unavailable',
+        closest,
+        () => {
+          routeAvailability(htmlPage(status));
+          routeCdx(htmlPage(status));
+        },
+      ],
+      [
+        'a CDX closest fallback',
+        'cdx_unavailable',
+        closest,
+        () => {
+          routeAvailability(EMPTY_AVAILABILITY);
+          routeCdx(htmlPage(status));
+        },
+      ],
+      [
+        'a CDX history page',
+        'cdx_unavailable',
+        history,
+        () => {
+          routeCdx(htmlPage(status));
+        },
+      ],
+      [
+        'a replay',
+        'content_fetch_failed',
+        exactSnapshot,
+        () => {
+          routeReplay(htmlPage(status));
+        },
+      ],
+    ] as const)('from %s surfaces %s without the page', async (_label, reason, run, route) => {
+      route();
+
+      const result = await runWithRetries(run);
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining(`HTTP ${status}`),
+          data: { reason },
+        },
+      });
+      const { data } = (result.structuredContent as { error: { data: object } }).error;
+      expect(data).not.toHaveProperty('body');
+      expect(data).not.toHaveProperty('responseBody');
+      expect(JSON.stringify(result.structuredContent)).not.toMatch(/html-error-page-marker|<html/);
+      expect(contentText(result)).not.toMatch(/html-error-page-marker|<html/);
+    });
+  });
 });
 
 describe('Wayback log level for an upstream non-2xx', () => {
@@ -1972,6 +2662,48 @@ describe('input rejected before any Wayback request', () => {
     },
   );
 
+  /** A malformed timestamp field's envelope, on both surfaces, with no request sent. */
+  const expectInvalidTimestamp = (
+    result: ToolResult,
+    field: string,
+    errors: readonly { reason: string; recovery: string }[] | undefined,
+  ) => {
+    const recovery = hint(errors, 'invalid_timestamp');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(`${field} must be`),
+        data: { reason: 'invalid_timestamp', field, recovery: { hint: recovery } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    expect(http.calls).toHaveLength(0);
+  };
+
+  it.each([
+    ['timestamp', { mode: 'closest', timestamp: '20151345' }],
+    ['timestamp', { mode: 'closest', timestamp: '201506150527291' }],
+    ['from', { mode: 'history', from: 'January 2015' }],
+    ['from', { mode: 'history', from: '2015/01/01' }],
+    ['to', { mode: 'history', to: '2015-02-01T00:00+01:00' }],
+  ] as const)(
+    'ia_find_snapshots fails a malformed %s as invalid_timestamp',
+    async (field, rest) => {
+      const result = await runToolContract(iaFindSnapshots, { url: 'example.com', ...rest });
+
+      expectInvalidTimestamp(result, field, iaFindSnapshots.errors);
+    },
+  );
+
+  it.each(['20151345', '201506150527291', 'January 2015'])(
+    'ia_get_snapshot fails the timestamp %s as invalid_timestamp',
+    async (timestamp) => {
+      const result = await runToolContract(iaGetSnapshot, { url: 'example.com', timestamp });
+
+      expectInvalidTimestamp(result, 'timestamp', iaGetSnapshot.errors);
+    },
+  );
+
   it.each([
     ['ia_find_snapshots closest', { mode: 'closest', timestamp: '20200101' }],
     ['ia_find_snapshots history', { mode: 'history' }],
@@ -1994,5 +2726,138 @@ describe('input rejected before any Wayback request', () => {
       error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
     });
     expect(http.calls).toHaveLength(0);
+  });
+});
+
+describe('timestamp forms reach every Wayback endpoint as digits (#48)', () => {
+  const HISTORY_ROWS = [
+    ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'],
+    ['20150105000000', '200', 'text/html', 'http://example.com/', 'DIGEST1', '1256'],
+  ];
+  const NASA_CAPTURE = {
+    archived_snapshots: {
+      closest: {
+        url: 'http://web.archive.org/web/20200616000524/https://www.nasa.gov/',
+        timestamp: '20200616000524',
+        status: '200',
+      },
+    },
+  };
+  const searchOf = (request: Request | undefined) => new URL(request?.url ?? '').searchParams;
+
+  it('lists the same captures for ISO from and to as for their digits, on both surfaces', async () => {
+    routeCdx(() => Response.json(HISTORY_ROWS));
+
+    const iso = await runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      from: '2015-01-01',
+      to: '2015-02-01',
+    });
+    const digits = await runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      from: '20150101',
+      to: '20150201',
+    });
+
+    expect(iso.structuredContent).toEqual(digits.structuredContent);
+    expect(contentText(iso)).toBe(contentText(digits));
+    const [isoQuery, digitQuery] = calls(isCdx).map((c) => searchOf(c.request));
+    expect(isoQuery?.get('from')).toBe('20150101');
+    expect(isoQuery?.get('to')).toBe('20150201');
+    expect(isoQuery?.toString()).toBe(digitQuery?.toString());
+  });
+
+  it.each([
+    ['3-digit prefixes', '201', '201'],
+    ['an 8-digit from and a year to', '20150615', '2015'],
+  ])('sends %s to CDX unchanged', async (_label, from, to) => {
+    routeCdx(() => Response.json(HISTORY_ROWS));
+
+    await runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'history', from, to });
+
+    const query = searchOf(calls(isCdx)[0]?.request);
+    expect(query.get('from')).toBe(from);
+    expect(query.get('to')).toBe(to);
+  });
+
+  it('still answers a reversed range with no_snapshots, as CDX does', async () => {
+    routeCdx(() => Response.json([]));
+
+    const result = await runToolContract(iaFindSnapshots, {
+      url: 'example.com',
+      mode: 'history',
+      from: '20160101',
+      to: '20150101',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshots' } },
+    });
+    expect(calls(isCdx)).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      'ia_find_snapshots closest',
+      () =>
+        runToolContract(iaFindSnapshots, {
+          url: 'https://www.nasa.gov/',
+          mode: 'closest',
+          timestamp: '2020-06-15',
+        }),
+    ],
+    [
+      'ia_get_snapshot',
+      () =>
+        runToolContract(iaGetSnapshot, { url: 'https://www.nasa.gov/', timestamp: '2020-06-15' }),
+    ],
+  ])('%s resolves an ISO date the way it resolves its digits', async (_label, run) => {
+    routeAvailability(() => Response.json(NASA_CAPTURE));
+    routeReplay(replay('<html><body>page</body></html>'));
+
+    const result = await run();
+
+    expect(result.isError).toBeFalsy();
+    expect(searchOf(calls(isAvailability)[0]?.request).get('timestamp')).toBe('20200615');
+    expect(calls(isCdx)).toHaveLength(0);
+  });
+
+  it('ia_get_snapshot reads an ISO date-time naming a second from that capture, with no lookup', async () => {
+    routeReplay(replay('<html><body>page</body></html>'));
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://www.nasa.gov/',
+      timestamp: '2020-06-15T12:34:56Z',
+    });
+
+    expect(result.structuredContent).toMatchObject({ resolved_timestamp: '20200615123456' });
+    expect(calls(isReplay)[0]?.request.url).toBe(
+      'https://web.archive.org/web/20200615123456/https://www.nasa.gov/',
+    );
+    expect(calls(isAvailability)).toHaveLength(0);
+  });
+
+  it('ia_get_snapshot reads the latest capture for a blank timestamp, asking for it with none', async () => {
+    routeAvailability((request) =>
+      new URL(request.url).searchParams.has('timestamp')
+        ? new Response('<html><body>Internal Server Error</body></html>', { status: 500 })
+        : Response.json(NASA_CAPTURE),
+    );
+    routeReplay(replay('<html><body>latest</body></html>'));
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'https://www.nasa.gov/',
+      timestamp: '',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      text: 'latest',
+      resolved_timestamp: '20200616000524',
+    });
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(searchOf(calls(isAvailability)[0]?.request).has('timestamp')).toBe(false);
+    expect(calls(isCdx)).toHaveLength(0);
   });
 });

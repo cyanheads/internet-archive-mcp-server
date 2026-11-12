@@ -97,6 +97,17 @@ describe('example identifiers', () => {
     expect(description).toContain('prideprejudice00aust');
     for (const id of dead) expect(description).not.toContain(id);
   });
+
+  it.each([
+    ['ia_get_item', iaGetItem.input.shape.identifier.description],
+    ['ia_get_text', iaGetText.input.shape.identifier.description],
+  ])('%s identifier description offers the archive.org item URL form', (_name, description) => {
+    expect(description).toContain('https://archive.org/details/prideprejudice00aust');
+  });
+
+  it('keeps the archive.org item URL form out of the ia://item identifier description', () => {
+    expect(iaItemResource.params.shape.identifier.description).not.toContain('archive.org/');
+  });
 });
 
 describe('definition smoke test', () => {

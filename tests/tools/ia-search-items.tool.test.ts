@@ -207,6 +207,53 @@ describe('iaSearchItems empty-result notice (assembled result)', () => {
     expect(contentText(result)).toContain('mediatype "movies"');
   });
 
+  it('names every filter applied, in order, on both surfaces', async () => {
+    mockService.search.mockResolvedValue(EMPTY_PAGE);
+
+    const result = await runToolContract(iaSearchItems, {
+      query: 'zzz',
+      mediatype: 'book',
+      collection: ' gutenberg ',
+      creator: 'Qzxv Wrrbl',
+      language: 'eng',
+      date_from: '1850',
+      date_to: '1890-12',
+    });
+
+    expect(noticeOf(result)).toBe(
+      'No items matched "zzz" with mediatype "texts", collection "gutenberg", creator "Qzxv Wrrbl", language "eng", date_from "1850", date_to "1890-12". Try broader search terms, remove filters, or verify the query syntax (Solr field prefixes: title:, creator:, subject:).',
+    );
+    expect(contentText(result)).toContain(
+      'with mediatype "texts", collection "gutenberg", creator "Qzxv Wrrbl", language "eng", date_from "1850", date_to "1890-12".',
+    );
+  });
+
+  it.each([
+    ['collection', 'gutenberg'],
+    ['creator', 'Qzxv Wrrbl'],
+    ['language', 'eng'],
+    ['date_from', '1850'],
+    ['date_to', '1890'],
+  ])('names %s when it is the only filter', async (field, value) => {
+    mockService.search.mockResolvedValue(EMPTY_PAGE);
+
+    const result = await runToolContract(iaSearchItems, { query: 'zzz', [field]: value });
+
+    expect(noticeOf(result)).toContain(`No items matched "zzz" with ${field} "${value}". Try`);
+  });
+
+  it('leaves a blank filter out of the notice', async () => {
+    mockService.search.mockResolvedValue(EMPTY_PAGE);
+
+    const result = await runToolContract(iaSearchItems, {
+      query: 'zzz',
+      creator: '   ',
+      language: '',
+    });
+
+    expect(noticeOf(result)).toContain('No items matched "zzz". Try');
+  });
+
   it('says the page is past the end, not that nothing matched, when results exist', async () => {
     mockService.search.mockResolvedValue({ items: [], totalFound: 120, page: 5, rows: 50 });
 

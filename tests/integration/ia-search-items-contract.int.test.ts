@@ -17,6 +17,7 @@ import {
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaSearchItems } from '@/mcp-server/tools/definitions/ia-search-items.tool.js';
 import { initArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
+import { cpuMsPerCall } from '../helpers/cpu-time.js';
 
 type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
@@ -189,7 +190,7 @@ describe('ia_search_items input validation', () => {
     const result = await runToolContract(iaSearchItems, { query: ' tesla ', mediatype: ' Texts ' });
 
     expect(result.isError).toBeFalsy();
-    expect(solrQueries()).toEqual(['tesla AND mediatype:"texts"']);
+    expect(solrQueries()).toEqual(['(tesla) AND mediatype:"texts"']);
   });
 
   it('rejects an unknown mediatype before any Advanced Search request', async () => {
@@ -254,7 +255,7 @@ describe('ia_search_items Gregorian date bounds', () => {
     routeSearch(1, [{ identifier: 'date-match' }]);
     const result = await runToolContract(iaSearchItems, { query: 'tesla', ...bounds });
     expect(result.isError).toBeFalsy();
-    expect(solrQueries()).toEqual([`tesla AND date:[${range}]`]);
+    expect(solrQueries()).toEqual([`(tesla) AND date:[${range}]`]);
     expect(result.structuredContent).toMatchObject({ items: [{ identifier: 'date-match' }] });
     expect(contentText(result)).toContain('date-match');
   });
@@ -298,7 +299,7 @@ describe('ia_search_items Gregorian date bounds', () => {
     routeSearch(0);
     const result = await runToolContract(iaSearchItems, { query: 'tesla', ...bounds });
     expect(result.isError).toBeFalsy();
-    expect(solrQueries()).toEqual([clause ? `tesla AND ${clause}` : 'tesla']);
+    expect(solrQueries()).toEqual([clause ? `(tesla) AND ${clause}` : 'tesla']);
     expect(result.structuredContent).toMatchObject({ items: [], total_found: 0 });
     expect(contentText(result)).toContain('No items matched');
   });
@@ -335,7 +336,7 @@ describe('ia_search_items empty-result notice', () => {
       mediatype: 'book',
     });
 
-    expect(solrQueries()).toEqual(['zzznoresultszzzz AND mediatype:"texts"']);
+    expect(solrQueries()).toEqual(['(zzznoresultszzzz) AND mediatype:"texts"']);
     const notice = (result.structuredContent as { notice?: string }).notice;
     expect(notice).toContain('No items matched "zzznoresultszzzz"');
     expect(notice).toContain('mediatype "texts"');
@@ -354,6 +355,361 @@ describe('ia_search_items empty-result notice', () => {
     expect(notice).not.toContain('No items matched');
     expect(contentText(result)).toContain('Page 5 is past the last page');
   });
+
+  it('names the creator filter on both surfaces when nothing matched', async () => {
+    routeSearch(0);
+
+    const result = await runToolContract(iaSearchItems, {
+      query: '*',
+      mediatype: 'texts',
+      creator: 'Qzxv Wrrbl',
+    });
+
+    const notice = (result.structuredContent as { notice?: string }).notice;
+    expect(notice).toContain('No items matched "*" with mediatype "texts", creator "Qzxv Wrrbl".');
+    expect(contentText(result)).toContain('creator "Qzxv Wrrbl"');
+  });
+});
+
+describe('ia_search_items query precedence', () => {
+  it.each([
+    ['a top-level OR', 'tesla OR edison', '(tesla OR edison) AND mediatype:"texts"'],
+    ['a leading NOT', 'NOT edison', '(NOT edison) AND mediatype:"texts"'],
+    ['the match-all query', '*', '(*) AND mediatype:"texts"'],
+  ])('parenthesizes %s so the filter binds to all of it', async (_label, query, q) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query, mediatype: 'texts' });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([q]);
+  });
+
+  it('sends a query with no filter unwrapped', async () => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    await runToolContract(iaSearchItems, { query: 'tesla OR edison' });
+
+    expect(solrQueries()).toEqual(['tesla OR edison']);
+  });
+
+  it.each([
+    ['one trailing backslash, filtered', { query: 'tesla\\', mediatype: 'texts' }],
+    ['three trailing backslashes, filtered', { query: 'tesla\\\\\\', mediatype: 'texts' }],
+    ['one trailing backslash, unfiltered', { query: 'tesla\\' }],
+    ['a lone backslash', { query: ' \\ ' }],
+  ])('answers a query ending in %s as invalid_query before any request', async (_label, input) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, input);
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        message:
+          'query ends in a backslash that escapes nothing, which Advanced Search cannot parse.',
+        data: { reason: 'invalid_query', recovery: { hint: hint('invalid_query') } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${hint('invalid_query')}`);
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it.each([
+    [
+      'an escaped trailing backslash, filtered',
+      { query: 'tesla\\\\', mediatype: 'texts' },
+      '(tesla\\\\) AND mediatype:"texts"',
+    ],
+    ['an escaped trailing backslash, unfiltered', { query: 'tesla\\\\' }, 'tesla\\\\'],
+    [
+      'a backslash before the last character',
+      { query: 'tesla\\-x', mediatype: 'texts' },
+      '(tesla\\-x) AND mediatype:"texts"',
+    ],
+  ])('sends a query ending in %s as given inside the wrap', async (_label, input, q) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, input);
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([q]);
+  });
+
+  it('wraps the query once and ANDs every filter after it', async () => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    await runToolContract(iaSearchItems, {
+      query: 'tesla OR edison',
+      mediatype: 'texts',
+      collection: 'gutenberg',
+      creator: 'Charles Dickens',
+      language: 'eng',
+      date_from: '1850',
+      date_to: '1890',
+    });
+
+    expect(solrQueries()).toEqual([
+      '(tesla OR edison) AND mediatype:"texts" AND collection:"gutenberg" AND ' +
+        'creator:"Charles Dickens"~2 AND language:("eng" OR "en" OR "English") AND ' +
+        'date:[1850-01-01 TO 1890-12-31]',
+    ]);
+  });
+});
+
+describe('ia_search_items creator filter', () => {
+  /** A name of `n` tokens. */
+  const name = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ');
+
+  it.each([
+    ['Charles Dickens', 'creator:"Charles Dickens"~2'],
+    ['Johann Wolfgang von Goethe', 'creator:"Johann Wolfgang von Goethe"~6'],
+    ['Dickens, Charles, 1812-1870', 'creator:"Dickens, Charles, 1812-1870"~6'],
+    ['Plato', 'creator:"Plato"'],
+    ['夏目漱石', 'creator:"夏目漱石"'],
+    ['Renée Fleming', 'creator:"Renée Fleming"~2'],
+    [name(34), `creator:"${name(34)}"~66`],
+    [name(35), `creator:"${name(35)}"`],
+  ])('sends %j as %s', async (creator, clause) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', creator });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([`(*) AND ${clause}`]);
+  });
+
+  it('describes how creator matches and where an exact phrase goes', () => {
+    const description = iaSearchItems.input.shape.creator.description ?? '';
+    expect(description).toContain('any order');
+    expect(description).toContain('creator:"Charles Dickens" in query');
+  });
+});
+
+describe('ia_search_items filter value text', () => {
+  it.each([
+    ['creator', 'Flann O"Brien', 'creator:"Flann O Brien"~4'],
+    ['collection', 'a"b', 'collection:"a b"'],
+    ['language', 'eng"', 'language:"eng "'],
+  ])('sends a " in %s as a space', async (field, value, clause) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', [field]: value });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([`(*) AND ${clause}`]);
+  });
+
+  it('escapes a backslash in a filter value', async () => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    await runToolContract(iaSearchItems, { query: '*', collection: 'a\\b' });
+
+    expect(solrQueries()).toEqual(['(*) AND collection:"a\\\\b"']);
+  });
+
+  it.each([
+    ['creator', '-'],
+    ['creator', '"'],
+    ['creator', '.,; ()'],
+    ['language', '-'],
+    ['language', '"́"'],
+  ])('rejects a %s of %j, with no letter or digit, before any request', async (field, value) => {
+    routeSearch(0);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', [field]: value });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'invalid_filter', field, recovery: { hint: hint('invalid_filter') } },
+      },
+    });
+    expect(contentText(result)).toContain(`${field} has no letter or digit`);
+    expect(contentText(result)).toContain(`Recovery: ${hint('invalid_filter')}`);
+    expect(contentText(result)).toContain('(reason invalid_filter');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('sends a collection with no letter or digit as given: it is matched exactly', async () => {
+    routeSearch(0);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', collection: '-' });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual(['(*) AND collection:"-"']);
+  });
+
+  it.each([
+    ['creator', '1812', 'creator:"1812"'],
+    ['language', '639', 'language:"639"'],
+  ])('sends a %s of digits alone as its filter', async (field, value, clause) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', [field]: value });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([`(*) AND ${clause}`]);
+  });
+});
+
+describe('ia_search_items collection given as an archive.org URL', () => {
+  it.each([
+    'https://archive.org/details/gutenberg',
+    'archive.org/details/gutenberg?tab=collection',
+    'http://www.archive.org/details/gutenberg/',
+  ])('filters by the collection identifier %s names', async (collection) => {
+    routeSearch(39, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query: 'pride', collection });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual(['(pride) AND collection:"gutenberg"']);
+  });
+
+  it('names the collection identifier in the no-match notice on both surfaces', async () => {
+    routeSearch(0);
+
+    const result = await runToolContract(iaSearchItems, {
+      query: 'zzz',
+      collection: 'https://archive.org/details/gutenberg',
+    });
+
+    const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+    expect(notice).toContain('with collection "gutenberg"');
+    expect(notice).not.toContain('https://');
+    expect(contentText(result)).toContain('with collection "gutenberg"');
+  });
+
+  it.each([
+    ['a download URL', 'https://archive.org/download/gutenberg'],
+    ['a URL on another host', 'https://example.com/details/gutenberg'],
+    ['a value with a colon', 'gutenberg:books'],
+  ])('sends %s as given', async (_label, collection) => {
+    routeSearch(0);
+
+    await runToolContract(iaSearchItems, { query: '*', collection });
+
+    expect(solrQueries()).toEqual([`(*) AND collection:"${collection}"`]);
+  });
+});
+
+describe('ia_search_items language filter', () => {
+  it.each([
+    ['eng', '"eng" OR "en" OR "English"'],
+    ['ENG', '"ENG" OR "en" OR "English"'],
+    ['English', '"English" OR "eng" OR "en"'],
+    ['en', '"en" OR "eng" OR "English"'],
+    ['fre', '"fre" OR "fra" OR "fr" OR "French"'],
+    ['french', '"french" OR "fre" OR "fra" OR "fr"'],
+    ['scr', '"scr" OR "hrv" OR "hr" OR "Croatian"'],
+    ['Papiamento', '"Papiamento" OR "pap"'],
+    ['Greek', '"Greek" OR "gre" OR "ell" OR "el" OR "Modern Greek"'],
+    ['Norwegian', '"Norwegian" OR "nor"'],
+    ['no', '"no" OR "nor" OR "Norwegian"'],
+  ])('sends %s as every spelling of its language', async (language, spellings) => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const result = await runToolContract(iaSearchItems, { query: '*', language });
+
+    expect(result.isError).toBeFalsy();
+    expect(solrQueries()).toEqual([`(*) AND language:(${spellings})`]);
+  });
+
+  it.each(['Norwegian (Bokmål)', 'chi_tra', '__proto__', 'constructor'])(
+    'sends %s, outside the table, as given',
+    async (language) => {
+      routeSearch(1, [{ identifier: 'a' }]);
+
+      const result = await runToolContract(iaSearchItems, { query: '*', language });
+
+      expect(result.isError).toBeFalsy();
+      expect(solrQueries()).toEqual([`(*) AND language:"${language}"`]);
+    },
+  );
+
+  it('trims a language before reading its spellings, and omits a blank one', async () => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    const padded = await runToolContract(iaSearchItems, { query: '*', language: '  English\t' });
+    const blank = await runToolContract(iaSearchItems, { query: '*', language: '   ' });
+
+    expect(padded.isError).toBeFalsy();
+    expect(blank.isError).toBeFalsy();
+    expect(solrQueries()).toEqual(['(*) AND language:("English" OR "eng" OR "en")', '*']);
+  });
+
+  it('describes how language matches and where an exact spelling goes', () => {
+    const description = iaSearchItems.input.shape.language.description ?? '';
+    expect(description).toContain('Case-insensitive');
+    expect(description).toContain('language:"eng" in query');
+  });
+});
+
+describe('ia_search_items creator and language text in linear time', () => {
+  /** The smallest input timed; each larger one doubles it, up to 64× (320k). */
+  const BASE_CHARS = 5_000;
+  const MAX_CHARS = 320_000;
+
+  /** Base-and-size pairs timed at each size; the least growth across them is kept. */
+  const PAIRS = 3;
+
+  /** CPU ceiling for one call at any size: about 10× the slowest 320k case measured (58 ms). */
+  const MAX_CPU_MS = 600;
+
+  /** One tool call with `field` set to `text`, answered by an empty page. */
+  const call = (field: string) => (text: string) => async () => {
+    http.reset();
+    routeSearch(0);
+    await runToolContract(iaSearchItems, { query: '*', [field]: text });
+  };
+
+  /**
+   * Times the call `setup(n)` builds from 5k characters to 320k, doubling, timing the 5k call
+   * again beside each size. Each size must stay under `MAX_CPU_MS` before the next one runs, so
+   * a quadratic fails at a small size instead of hanging at 320k; at 320k the least growth over
+   * the 5k call across the pairs must stay under 256, four times the 64 of linear work and
+   * sixteen times under the 4,096 of quadratic.
+   */
+  const expectLinear = async (setup: (n: number) => () => Promise<void>) => {
+    const base = setup(BASE_CHARS);
+    let growth = Number.POSITIVE_INFINITY;
+    for (let n = 2 * BASE_CHARS; n <= MAX_CHARS; n *= 2) {
+      const sized = setup(n);
+      let least = Number.POSITIVE_INFINITY;
+      growth = Number.POSITIVE_INFINITY;
+      for (let pair = 0; pair < PAIRS; pair++) {
+        const tBase = await cpuMsPerCall(base);
+        const tSized = await cpuMsPerCall(sized);
+        least = Math.min(least, tSized);
+        growth = Math.min(growth, tSized / tBase);
+      }
+      expect(least, `${least.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(MAX_CPU_MS);
+    }
+    expect(growth, `${growth.toFixed(1)}× the 5k time at 320k`).toBeLessThan(256);
+  };
+
+  const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+
+  it.each([
+    ['creator', 'words and dashes', (n: number) => fill('a-', n)],
+    ['creator', 'one digit run', (n: number) => '1'.repeat(n)],
+    ['creator', 'letters with combining marks', (n: number) => fill('á', n)],
+    ['creator', 'one long line ending in a break', (n: number) => `${fill('§1 x', n - 2)}\ny`],
+    ['creator', 'line breaks throughout', (n: number) => fill('a  \r\n', n)],
+    ['creator', 'punctuation only, rejected', (n: number) => '-'.repeat(n)],
+    ['creator', 'line breaks and no letter, rejected', (n: number) => fill('-  \r\n', n)],
+    ['language', 'one long line ending in a break', (n: number) => `${fill('§1 x', n - 2)}\ny`],
+    ['language', 'punctuation only, rejected', (n: number) => '-'.repeat(n)],
+  ])(
+    'handles a %s of %s in linear time',
+    async (field, _shape, build) => {
+      const send = call(field);
+      await expectLinear((n) => send(build(n)));
+    },
+    0,
+  );
 });
 
 describe('ia_search_items list-valued title and date', () => {
@@ -924,6 +1280,29 @@ describe('ia_search_items Advanced Search error bodies', () => {
       expect(http.calls).toHaveLength(1);
     },
   );
+
+  it.each([
+    [502, 'Advanced Search returned HTTP 502. (failed after 4 attempts)'],
+    [429, 'Advanced Search returned HTTP 429 (rate limited).'],
+  ])('keeps the HTML page an HTTP %i carries off both surfaces', async (status, message) => {
+    routeSearchWith(
+      () =>
+        new Response('<!DOCTYPE html><html><body><h1>html-error-page-marker</h1></body></html>', {
+          status,
+          headers: { 'content-type': 'text/html' },
+        }),
+    );
+
+    const result = await runWithRetries({ query: 'tesla' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: { message, data: { reason: 'search_unavailable', status } },
+    });
+    expect(errorOf(result)).not.toHaveProperty('data.body');
+    expect(errorOf(result)).not.toHaveProperty('data.responseBody');
+    expect(JSON.stringify(result.structuredContent)).not.toMatch(/html-error-page-marker|<html/);
+    expect(contentText(result)).not.toMatch(/html-error-page-marker|<html/);
+  });
 
   it('recovers when a retried 503 is followed by a page', async () => {
     let attempt = 0;

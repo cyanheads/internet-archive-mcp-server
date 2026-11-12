@@ -133,6 +133,80 @@ describe('iaFindSnapshots', () => {
       );
     });
 
+    it.each([
+      ['an ISO date', '2020-06-15', '20200615'],
+      ['an ISO UTC date-time', ' 2020-06-15T12:34:56Z ', '20200615123456'],
+      ['a 3-digit prefix', '201', '201'],
+    ])('looks up %s as its digit timestamp', async (_label, timestamp, digits) => {
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: 'https://web.archive.org/web/20200615000000/https://www.nasa.gov/',
+        timestamp: '20200615000000',
+        status: '200',
+      });
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'https://www.nasa.gov/',
+        mode: 'closest',
+        timestamp,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.findClosest).toHaveBeenCalledWith(
+        'https://www.nasa.gov/',
+        digits,
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      ['a month name', 'January 2015'],
+      ['an impossible month', '20151345'],
+      ['15 digits', '201506150527291'],
+      ['a UTC offset', '2020-06-15T12:34:56+02:00'],
+    ])(
+      'rejects %s as invalid_timestamp naming timestamp on both surfaces, without a lookup',
+      async (_label, timestamp) => {
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com',
+          mode: 'closest',
+          timestamp,
+        });
+
+        const recovery = iaFindSnapshots.errors?.find(
+          (e) => e.reason === 'invalid_timestamp',
+        )?.recovery;
+        expect(recovery).toBeDefined();
+        expect(result.isError).toBe(true);
+        expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringMatching(/^timestamp .*1–14 digits.*ISO 8601/),
+          data: { reason: 'invalid_timestamp', field: 'timestamp', recovery: { hint: recovery } },
+        });
+        const text = contentText(result);
+        expect(text).toContain(`Recovery: ${recovery}`);
+        expect(text).toContain('(reason invalid_timestamp');
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not read from or to, which only history mode uses', async () => {
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
+        timestamp: '20200101120000',
+        status: '200',
+      });
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'closest',
+        timestamp: '20200101',
+        from: 'January 2015',
+        to: '2015/12/31',
+      });
+
+      expect(result.isError).toBeFalsy();
+    });
+
     it('propagates a service-thrown availability_unavailable unchanged', async () => {
       const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
       const unavailable = serviceUnavailable('Wayback Availability API returned HTTP 503.', {
@@ -216,6 +290,83 @@ describe('iaFindSnapshots', () => {
       await expect(iaFindSnapshots.handler(input, ctx)).rejects.toMatchObject({
         data: { reason: 'no_snapshots' },
       });
+    });
+
+    const oneRecord = {
+      records: [
+        {
+          timestamp: '20150105000000',
+          statuscode: '200',
+          mimetype: 'text/html',
+          original: 'https://example.com/',
+          digest: 'X',
+        },
+      ],
+    };
+
+    it.each([
+      ['ISO dates', '2015-01-01', '2015-02-01', '20150101', '20150201'],
+      [
+        'ISO date-times',
+        '2015-01-01T00:00Z',
+        '2015-02-01T23:59:59Z',
+        '201501010000',
+        '20150201235959',
+      ],
+      ['3-digit prefixes', '201', '201', '201', '201'],
+      ['an 8-digit from and a year to', '20150615', '2015', '20150615', '2015'],
+      ['a reversed range', '20160101', '20150101', '20160101', '20150101'],
+    ])('sends %s to CDX as their digit timestamps', async (_label, from, to, cdxFrom, cdxTo) => {
+      mockService.fetchHistory.mockResolvedValue(oneRecord);
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'history',
+        from,
+        to,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.fetchHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ from: cdxFrom, to: cdxTo }),
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      ['from', 'January 2015'],
+      ['from', '2015/01/01'],
+      ['to', '20151345'],
+      ['to', '2015-06-15T12:34:56+02:00'],
+    ] as const)(
+      'rejects %s %s as invalid_timestamp naming that field, without a CDX query',
+      async (field, value) => {
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com',
+          mode: 'history',
+          [field]: value,
+        });
+
+        expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringMatching(new RegExp(`^${field} `)),
+          data: { reason: 'invalid_timestamp', field },
+        });
+        expect(contentText(result)).toContain('(reason invalid_timestamp');
+        expect(mockService.fetchHistory).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not read timestamp, which only closest mode uses', async () => {
+      mockService.fetchHistory.mockResolvedValue(oneRecord);
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'history',
+        timestamp: 'January 2015',
+      });
+
+      expect(result.isError).toBeFalsy();
     });
 
     it('passes collapse="" as undefined to service, which applies its timestamp:8 default', async () => {

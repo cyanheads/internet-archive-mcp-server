@@ -1,9 +1,9 @@
 /**
- * @fileoverview Named character references decoded in archived page text: HTML 4.01's
+ * @fileoverview Named character references decoded in HTML text: HTML 4.01's
  * 252 entities plus `apos` and the WHATWG upper-case aliases `AMP` `LT` `GT` `QUOT`
  * `COPY` `REG`. Code points follow the WHATWG table, which differs from HTML 4.01 only
  * for `lang`/`rang` (U+27E8/U+27E9, where HTML 4.01 had U+2329/U+232A).
- * @module services/wayback/html-entities
+ * @module services/html-entities
  */
 
 /** Whitespace-separated words of a table literal. */

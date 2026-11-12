@@ -863,3 +863,263 @@ describe('ia_get_text download failures surface as archive_unavailable', () => {
     expect(calls(isDownload)).toHaveLength(1);
   });
 });
+
+describe('ia_get_text text file selection', () => {
+  const STRABO = 'Strabo08Geography17AndIndex';
+  const VOLUME_2 = 'Strabo 02 Geography 3-5_djvu.txt';
+  const volumeNames = [
+    'Strabo 01 Geography 1-2_djvu.txt',
+    VOLUME_2,
+    ...[3, 4, 5, 6, 7].map((n) => `Strabo 0${n} Geography_djvu.txt`),
+    'Strabo 08 Geography 17 and index_djvu.txt',
+  ];
+  const volumeText = (name: string) => `Text of ${name}.`;
+
+  /** The Strabo manifest shape: per volume, page images, its DjVuTXT, and gzipped OCR search text. */
+  const routeStrabo = () =>
+    routeMetadata(() =>
+      Response.json({
+        metadata: { identifier: STRABO, mediatype: 'texts' },
+        files: volumeNames.flatMap((name) => [
+          { name: name.replace('_djvu.txt', '_jp2.zip'), format: 'Single Page Processed JP2 ZIP' },
+          { name, format: 'DjVuTXT', size: String(volumeText(name).length) },
+          { name: name.replace('_djvu.txt', '_hocr_searchtext.txt.gz'), format: 'OCR Search Text' },
+        ]),
+      }),
+    );
+
+  /** Each volume served by its download URL, with conditional Range for continuations. */
+  const routeVolumes = () =>
+    routeDownload((request) => {
+      const name = decodeURIComponent(request.url.slice(request.url.lastIndexOf('/') + 1));
+      const bytes = new TextEncoder().encode(volumeText(name));
+      const start = Number(request.headers.get('range')?.slice(6, -1) ?? 0);
+      return new Response(bytes.subarray(start), {
+        status: start > 0 ? 206 : 200,
+        headers: {
+          etag: '"stable"',
+          'content-length': String(bytes.length - start),
+          ...(start > 0 && {
+            'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+          }),
+        },
+      });
+    });
+
+  /** Tool calls sharing one tenant state, so a continuation from one call resolves in the next. */
+  const session = () => {
+    const { state } = createMockContext();
+    const definition = {
+      ...iaGetText,
+      handler: (
+        input: Parameters<typeof iaGetText.handler>[0],
+        ctx: Parameters<typeof iaGetText.handler>[1],
+      ) => iaGetText.handler(input, Object.assign(ctx, { state })),
+    };
+    return (input: Record<string, unknown>) => runToolContract(definition, input);
+  };
+
+  const downloadedFiles = () =>
+    calls(isDownload).map(({ request }) =>
+      decodeURIComponent(request.url.slice(request.url.lastIndexOf('/') + 1)),
+    );
+
+  it('reads volume 2 by file, and its continuation continues volume 2 with file omitted', async () => {
+    routeStrabo();
+    routeVolumes();
+    const run = session();
+
+    const first = await run({ identifier: STRABO, file: VOLUME_2, max_chars: 10 });
+    const token = (first.structuredContent as { next_continuation: string }).next_continuation;
+    const second = await run({ identifier: STRABO, continuation: token, max_chars: 10 });
+
+    expect(first.structuredContent).toMatchObject({
+      text: volumeText(VOLUME_2).slice(0, 10),
+      source_file: VOLUME_2,
+      has_more: true,
+    });
+    expect(contentText(first)).toContain(token);
+    expect(second.structuredContent).toMatchObject({
+      text: volumeText(VOLUME_2).slice(10, 20),
+      char_offset: 10,
+      source_file: VOLUME_2,
+    });
+    expect(contentText(second)).toContain(`**Source:** ${VOLUME_2}`);
+    expect(first.structuredContent).not.toHaveProperty('notice');
+    expect(second.structuredContent).not.toHaveProperty('notice');
+    expect(downloadedFiles()).toEqual([VOLUME_2, VOLUME_2]);
+    expect(calls(isDownload)[1]?.request.headers.get('range')).toBe('bytes=10-');
+  });
+
+  it.each([
+    ['the same download URL', true],
+    ['the bare identifier and the file', false],
+  ])('reads volume 2 from its download URL and continues it under %s', async (_label, sameUrl) => {
+    routeStrabo();
+    routeVolumes();
+    const run = session();
+    const url = `https://archive.org/download/${STRABO}/Strabo%2002%20Geography%203-5_djvu.txt`;
+
+    const first = await run({ identifier: url, max_chars: 10 });
+    const token = (first.structuredContent as { next_continuation: string }).next_continuation;
+    const second = await run({
+      ...(sameUrl ? { identifier: url } : { identifier: STRABO, file: VOLUME_2 }),
+      continuation: token,
+      max_chars: 10,
+    });
+
+    expect(first.structuredContent).toMatchObject({
+      text: volumeText(VOLUME_2).slice(0, 10),
+      source_file: VOLUME_2,
+    });
+    expect(second.structuredContent).toMatchObject({
+      text: volumeText(VOLUME_2).slice(10, 20),
+      source_file: VOLUME_2,
+    });
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      `https://archive.org/metadata/${STRABO}`,
+      `https://archive.org/metadata/${STRABO}`,
+    ]);
+    expect(downloadedFiles()).toEqual([VOLUME_2, VOLUME_2]);
+  });
+
+  it('answers a download URL naming a file that is not readable text as invalid_file', async () => {
+    routeStrabo();
+    routeVolumes();
+
+    const result = await runToolContract(iaGetText, {
+      identifier: `https://archive.org/download/${STRABO}/Strabo%2001%20Geography%201-2_jp2.zip`,
+    });
+
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason: 'invalid_file', file: 'Strabo 01 Geography 1-2_jp2.zip' },
+    });
+    expect(calls(isDownload)).toHaveLength(0);
+  });
+
+  it('reports 8 readable text files on both surfaces when file is omitted', async () => {
+    routeStrabo();
+    routeVolumes();
+
+    const result = await runToolContract(iaGetText, { identifier: STRABO, max_chars: 10 });
+
+    const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+    expect(result.structuredContent).toMatchObject({ source_file: volumeNames[0] });
+    expect(notice).toContain('This item has 8 readable text files');
+    expect(notice).toContain('ia_get_item with format "DjVuTXT" lists them');
+    expect(contentText(result)).toContain(notice);
+  });
+
+  it('adds no file-count notice for an item with one text file', async () => {
+    routeMetadata(MANIFEST);
+    routeDownload(() => new Response('Chapter one.'));
+
+    const result = await runToolContract(iaGetText, { identifier: ID });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).not.toHaveProperty('notice');
+  });
+
+  it.each([
+    [
+      'an OCR search-text archive',
+      'Strabo 02 Geography 3-5_hocr_searchtext.txt.gz',
+      'has format "OCR Search Text"',
+    ],
+    ['a name the manifest lacks', 'missing_djvu.txt', 'lists no file named "missing_djvu.txt"'],
+  ])(
+    'answers %s as invalid_file on both surfaces, with no download',
+    async (_label, file, message) => {
+      routeStrabo();
+      routeVolumes();
+
+      const result = await runToolContract(iaGetText, { identifier: STRABO, file });
+
+      const recovery = hint(iaGetText.errors, 'invalid_file');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message: expect.stringContaining(message),
+          data: { reason: 'invalid_file', file, recovery: { hint: recovery } },
+        },
+      });
+      expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expect(calls(isMetadata)).toHaveLength(1);
+      expect(calls(isDownload)).toHaveLength(0);
+    },
+  );
+
+  it('answers an item whose only .txt files are Metadata sidecars as no_text_file, with no download', async () => {
+    routeMetadata(() =>
+      Response.json({
+        metadata: { identifier: 'gov.uscourts.mieb.653252' },
+        files: [
+          { name: 'gov.uscourts.mieb.653252.11.0.pdf', format: 'Text PDF' },
+          { name: 'gov.uscourts.mieb.653252.11.0.pdf_meta.txt', format: 'Metadata', size: '834' },
+          { name: 'gov.uscourts.mieb.653252.docket.xml', format: 'Metadata' },
+        ],
+      }),
+    );
+
+    const result = await runToolContract(iaGetText, { identifier: 'gov.uscourts.mieb.653252' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_text_file' } },
+    });
+    expect(contentText(result)).toContain(hint(iaGetText.errors, 'no_text_file'));
+    expect(calls(isDownload)).toHaveLength(0);
+  });
+});
+
+describe('archive.org item URLs as identifiers', () => {
+  it.each([
+    'https://archive.org/details/prideprejudice00aust',
+    'archive.org/details/prideprejudice00aust/page/n5/mode/2up',
+    'www.archive.org/embed/prideprejudice00aust',
+    'https://archive.org/stream/prideprejudice00aust/prideprejudice00aust_djvu.txt',
+  ])('ia_get_item reads %s as prideprejudice00aust', async (identifier) => {
+    routeMetadata(() =>
+      Response.json({ metadata: { title: 'Pride and Prejudice' }, files: [{ name: 'a.txt' }] }),
+    );
+
+    const result = await runToolContract(iaGetItem, { identifier });
+
+    expect(result.structuredContent).toMatchObject({ identifier: 'prideprejudice00aust' });
+    expect(contentText(result)).toContain('**Identifier:** prideprejudice00aust');
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      'https://archive.org/metadata/prideprejudice00aust',
+    ]);
+  });
+
+  it.each([
+    ['ia_get_item', iaGetItem, 'https://example.com/foo', 'invalid_identifier'],
+    [
+      'ia_get_item',
+      iaGetItem,
+      'https://web.archive.org/web/2020/https://example.com/',
+      'ia_get_snapshot',
+    ],
+    ['ia_get_text', iaGetText, 'https://example.com/foo', 'invalid_identifier'],
+    [
+      'ia_get_text',
+      iaGetText,
+      'https://web.archive.org/web/2020/https://example.com/',
+      'ia_get_snapshot',
+    ],
+  ] as const)(
+    '%s answers %s as invalid_identifier before any request',
+    async (_name, definition, identifier, term) => {
+      http.route({ match: () => true, respond: () => new Response('unexpected request') });
+
+      const result = await runToolContract(definition, { identifier });
+
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'invalid_identifier' },
+      });
+      expect(contentText(result)).toContain(term);
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+});

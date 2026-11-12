@@ -1,12 +1,14 @@
 /**
  * @fileoverview Tests for WaybackService.fetchContent — the text it extracts from an
  * archived page (markup removal, one-pass character-reference decoding, linear-time
- * scanning), the charset it decodes the body with, and the replay URL and timestamp
+ * scanning), the charset it decodes the body with, how the replay's media type routes
+ * the read (HTML, text from the `id_` form, or no text), and the replay URL and timestamp
  * it reports for the capture Wayback actually served.
  * @module tests/services/wayback-content.test
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,6 +24,7 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   };
 });
 
+import { getServerConfig } from '@/config/server-config.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { WaybackService } from '@/services/wayback/wayback-service.js';
 import {
@@ -58,13 +61,9 @@ const served = (
   return response;
 };
 
-const fetchContent = (response: Response, maxChars?: number) => {
+const fetchContent = (response: Response) => {
   fetchWithTimeout.mockResolvedValueOnce(response);
-  return buildService().fetchContent(
-    SNAPSHOT,
-    createMockContext({ errors: iaGetSnapshot.errors }),
-    maxChars,
-  );
+  return buildService().fetchContent(SNAPSHOT, createMockContext({ errors: iaGetSnapshot.errors }));
 };
 
 /** The text extracted from an HTML string served as UTF-8. */
@@ -100,9 +99,10 @@ describe('fetchContent text extraction — existing behavior', () => {
     expect(await textOf('<td>Home</td><td>News</td>')).toBe('Home News');
   });
 
-  it('caps the text at maxChars', async () => {
-    const result = await fetchContent(served(`<p>${'x'.repeat(100)}</p>`), 10);
-    expect(result.text).toBe('x'.repeat(10));
+  it('returns the whole extracted text, with no character cap of its own (#44)', async () => {
+    const length = getServerConfig().maxSnapshotChars + 1_000;
+    const result = await fetchContent(served(`<p>${'x'.repeat(length)}</p>`));
+    expect(result.text).toBe('x'.repeat(length));
   });
 
   it('decodes an undeclared UTF-8 page as UTF-8', async () => {
@@ -273,7 +273,7 @@ describe('fetchContent scan time (#8)', () => {
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     return () => {
       fetchWithTimeout.mockResolvedValueOnce(served(html));
-      return svc.fetchContent(SNAPSHOT, ctx, 100);
+      return svc.fetchContent(SNAPSHOT, ctx);
     };
   };
 
@@ -537,7 +537,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
   it('stops reading at the ceiling, cancels the upstream body, and reports the cut', async () => {
     const { body, stats } = streamed(200, () => paragraphChunk('word'));
 
-    const result = await fetchContent(served(body), 10_000_000);
+    const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBe(CEILING);
     expect(stats.cancelled).toBe(true);
@@ -560,7 +560,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
       return chunk;
     });
 
-    const result = await fetchContent(served(body), 10_000_000);
+    const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBe(CEILING);
     expect(result.text.endsWith('lead')).toBe(true);
@@ -577,7 +577,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
       return chunk;
     });
 
-    const result = await fetchContent(served(body), 10_000_000);
+    const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBe(CEILING);
     expect(result.text).not.toContain('�');
@@ -595,7 +595,6 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
 
     const result = await fetchContent(
       served(body, { headers: { 'x-archive-guessed-charset': 'iso-8859-2' } }),
-      10_000_000,
     );
 
     expect(result.truncatedAtBytes).toBe(CEILING);
@@ -606,7 +605,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
   it('reads a body that ends exactly at the ceiling in full, with no cut reported', async () => {
     const { body, stats } = streamed(CEILING / CHUNK, () => paragraphChunk('w'));
 
-    const result = await fetchContent(served(body), 10_000_000);
+    const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBeUndefined();
     expect(stats.cancelled).toBe(false);
@@ -628,10 +627,10 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
       return chunk;
     });
 
-    const result = await fetchContent(served(body), 20);
+    const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBe(CEILING);
-    expect(result.text).toBe('Actualités x x x x x');
+    expect(result.text.slice(0, 20)).toBe('Actualités x x x x x');
   });
 });
 
@@ -639,5 +638,215 @@ describe('fetchContent served status (#19)', () => {
   it('reports the HTTP status Wayback replayed the served capture with', async () => {
     const result = await fetchContent(served('<p>x</p>', { status: 203 }));
     expect(result.status).toBe('203');
+  });
+});
+
+describe('fetchContent media-type routing (#49)', () => {
+  const GITHUB = 'https://web.archive.org/web/20200116122222/https://api.github.com/';
+  const GITHUB_RAW = 'https://web.archive.org/web/20200116122222id_/https://api.github.com/';
+  /** The first two keys of the 2020-01-16 api.github.com capture, as each replay form serves them. */
+  const GITHUB_JSON =
+    '{"current_user_url":"https://api.github.com/user","current_user_authorizations_html_url":"https://github.com/settings/connections/applications{/client_id}"}';
+  const GITHUB_JSON_REWRITTEN =
+    '{"current_user_url":"https://web.archive.org/web/20200116122222/https://api.github.com/user","current_user_authorizations_html_url":"https://web.archive.org/web/20200116122222/https://github.com/settings/connections/applications{/client_id}"}';
+  /** RFC 2616 §2.1, as its text/plain capture holds it: line breaks and ABNF angle brackets. */
+  const RFC_2616_RULE =
+    '   *rule\n      The character "*" preceding an element indicates repetition. The\n      full form is "<n>*<m>element" indicating at least <n> and at most\n      <m> occurrences of element.\n';
+  const utf8 = (text: string) => new TextEncoder().encode(text);
+
+  /** A body that counts reads and records a cancel; nothing is pulled until a read asks for it. */
+  const tracked = (body: Uint8Array) => {
+    const stats = { pulled: 0, cancelled: false };
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          stats.pulled++;
+          controller.enqueue(body);
+          controller.close();
+        },
+        cancel() {
+          stats.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { stream, stats };
+  };
+
+  /** fetchContent of `snapshotUrl`, the upstream answering each request in turn with `responses`. */
+  const fetchServed = (snapshotUrl: string, ...responses: Response[]) => {
+    for (const response of responses) fetchWithTimeout.mockResolvedValueOnce(response);
+    return buildService().fetchContent(
+      snapshotUrl,
+      createMockContext({ errors: iaGetSnapshot.errors }),
+    );
+  };
+  const requestedUrls = () => fetchWithTimeout.mock.calls.map((call) => String(call[0]));
+
+  it.each([
+    ['text/html', 'text/html'],
+    ['application/xhtml+xml', 'application/xhtml+xml'],
+    ['an HTML type in mixed case with parameters', 'Text/HTML ; charset=UTF-8'],
+    ['no Content-Type', null],
+    ['a Content-Type naming no subtype', 'unk'],
+  ])('extracts %s from the plain form as HTML, in one request', async (_name, contentType) => {
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('<p>a</p>\n<p>b &amp; c</p>'), { contentType }),
+    );
+    expect(result.text).toBe('a b & c');
+    expect(requestedUrls()).toEqual([SNAPSHOT]);
+  });
+
+  it('reads a JSON capture from its id_ form, leaving the URL-rewritten plain body unread', async () => {
+    const plain = tracked(utf8(GITHUB_JSON_REWRITTEN));
+    const json = 'application/json; charset=utf-8';
+
+    const result = await fetchServed(
+      GITHUB,
+      served(plain.stream, {
+        contentType: json,
+        url: GITHUB,
+        headers: { 'x-archive-guessed-charset': 'utf-8' },
+      }),
+      served(utf8(GITHUB_JSON), { contentType: json, url: GITHUB_RAW }),
+    );
+
+    expect(result.text).toBe(GITHUB_JSON);
+    expect(result).toMatchObject({ replayUrl: GITHUB, timestamp: '20200116122222', status: '200' });
+    expect(requestedUrls()).toEqual([GITHUB, GITHUB_RAW]);
+    expect(plain.stats).toEqual({ pulled: 0, cancelled: true });
+  });
+
+  it('builds the id_ URL from the capture Wayback redirected to, and keeps a text body as stored', async () => {
+    const requested = 'https://web.archive.org/web/2020/https://www.rfc-editor.org/rfc/rfc2616.txt';
+    const servedUrl =
+      'https://web.archive.org/web/20201230144805/https://www.rfc-editor.org/rfc/rfc2616.txt';
+    const raw =
+      'https://web.archive.org/web/20201230144805id_/https://www.rfc-editor.org/rfc/rfc2616.txt';
+
+    const result = await fetchServed(
+      requested,
+      served(utf8('rewritten'), { contentType: 'text/plain', url: servedUrl }),
+      served(utf8(RFC_2616_RULE), { contentType: 'text/plain', url: raw }),
+    );
+
+    expect(result.text).toBe(RFC_2616_RULE);
+    expect(result).toMatchObject({ replayUrl: servedUrl, timestamp: '20201230144805' });
+    expect(requestedUrls()).toEqual([requested, raw]);
+  });
+
+  it.each([
+    'text/plain; charset=utf-8',
+    'TEXT/CSS',
+    'text/xml',
+    'application/xml',
+    'application/javascript',
+    'application/x-javascript',
+    'application/rss+xml',
+    'application/ld+json',
+  ])('reads a %s capture from its id_ form as text', async (contentType) => {
+    const body = 'a <b>c</b>\n  &amp; d';
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), { contentType }),
+      served(utf8(body), { contentType }),
+    );
+    expect(result.text).toBe(body);
+    expect(requestedUrls()).toEqual([
+      SNAPSHOT,
+      'https://web.archive.org/web/20120601000000id_/https://www.nasa.gov',
+    ]);
+  });
+
+  it('decodes a text body with the charset its id_ response declares', async () => {
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), { contentType: 'text/plain; charset=iso-8859-1' }),
+      served(latin1('Actualit\xe9s'), { contentType: 'text/plain; charset=iso-8859-1' }),
+    );
+    expect(result.text).toBe('Actualités');
+  });
+
+  it('decodes an undeclared non-UTF-8 text body with the charset Wayback guessed for the capture', async () => {
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), {
+        contentType: 'text/plain',
+        headers: { 'x-archive-guessed-charset': 'iso-8859-7' },
+      }),
+      served(latin1('\xe1\xe8\xe7\xed\xe1'), { contentType: 'text/plain' }),
+    );
+    expect(result.text).toBe('αθηνα');
+  });
+
+  it('reads no <meta> declaration in a text body', async () => {
+    const body = '<meta charset="iso-8859-1"> Actualités';
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), { contentType: 'text/plain' }),
+      served(utf8(body), { contentType: 'text/plain' }),
+    );
+    expect(result.text).toBe(body);
+  });
+
+  it('decodes a text body by its byte-order mark first', async () => {
+    const utf16le = Uint8Array.from([0xff, 0xfe, 0x41, 0x00, 0xe9, 0x00]);
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), { contentType: 'text/plain; charset=iso-8859-1' }),
+      served(utf16le, { contentType: 'text/plain; charset=iso-8859-1' }),
+    );
+    expect(result.text).toBe('Aé');
+  });
+
+  it('cuts an id_ body at the byte ceiling and cancels the rest', async () => {
+    const CEILING = 4 * 1024 * 1024;
+    const chunk = new Uint8Array(64 * 1024).fill(0x61);
+    let pulled = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled++ === 100) return controller.close();
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const result = await fetchServed(
+      SNAPSHOT,
+      served(utf8('rewritten'), { contentType: 'text/plain' }),
+      served(body, { contentType: 'text/plain' }),
+    );
+
+    expect(result.truncatedAtBytes).toBe(CEILING);
+    expect(result.text).toBe('a'.repeat(CEILING));
+    expect(cancelled).toBe(true);
+  });
+
+  it.each([
+    ['application/pdf', 'application/pdf'],
+    ['image/png', 'image/png'],
+    ['application/octet-stream', 'application/octet-stream'],
+    ['Application/PDF; name="f1040.pdf"', 'application/pdf'],
+    ['application/constructor', 'application/constructor'],
+    ['__proto__/__proto__', '__proto__/__proto__'],
+  ])('fails a %s capture as non-text without reading its body', async (contentType, mediaType) => {
+    const pdf = tracked(latin1('%PDF-1.7\r%\xe2\xe3\xcf\xd3\r\n922 0 obj\r<</Linearized'));
+
+    const err = await fetchServed(
+      SNAPSHOT,
+      served(pdf.stream, { contentType, url: SNAPSHOT }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: expect.stringContaining(mediaType),
+      data: { mediaType, replayUrl: SNAPSHOT },
+    });
+    expect(requestedUrls()).toEqual([SNAPSHOT]);
+    expect(pdf.stats).toEqual({ pulled: 0, cancelled: true });
   });
 });

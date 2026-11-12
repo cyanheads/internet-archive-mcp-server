@@ -22,6 +22,7 @@ import {
   statusOf,
   transportError,
 } from '../upstream-errors.js';
+import { languageSpellings } from './language-spellings.js';
 import type { SearchResult, SearchResultItem } from './types.js';
 
 const SEARCH_BASE = 'https://archive.org/advancedsearch.php';
@@ -78,11 +79,97 @@ const SEARCH_FIELDS = [
 ];
 
 /**
- * Escape a string value for safe embedding inside a Solr phrase query ("value").
- * Backslash-escapes double-quotes and backslashes so the phrase boundary cannot be closed early.
+ * A string value as the text of a Solr phrase ("value"), which it cannot close early. A
+ * backslash is escaped; a double quote is sent as a space, since Advanced Search answers an
+ * escaped one (`creator:"Flann O\"Brien"`) with `[BACKEND_ERROR]` and its analyzer splits
+ * words at a quote anyway.
  */
 function solrEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return value.replace(/\\/g, '\\\\').replace(/"/g, ' ');
+}
+
+/** One word of a creator name: a run of letters (with their combining marks) or digits. */
+const NAME_WORD = /[\p{L}\p{M}\p{N}]+/gu;
+
+/** A letter or digit, which a creator or language value needs to filter anything. */
+const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+
+/**
+ * Words past which a creator name is sent as an exact phrase. The index puts 100 positions
+ * between one creator value and the next, so a phrase of k words starts matching across two
+ * values at a slop of 102 − k; the creator slop of 2 × (k − 1) stays below that up to 34 words.
+ */
+const MAX_SLOPPY_WORDS = 34;
+
+/**
+ * `creator:"<name>"~N` with N = 2 × (words − 1), the slop a full reversal of the name needs, so
+ * its words match close together in any order within one creator value: "Charles Dickens" also
+ * finds "Dickens, Charles, 1812-1870" and "Charles John Huffam Dickens". The slop is a superset
+ * of the exact phrase. A one-word name, or one past `MAX_SLOPPY_WORDS`, is the exact phrase.
+ */
+function creatorClause(creator: string): string {
+  const words = creator.match(NAME_WORD)?.length ?? 0;
+  const slop = words > 1 && words <= MAX_SLOPPY_WORDS ? `~${2 * (words - 1)}` : '';
+  return `creator:"${solrEscape(creator)}"${slop}`;
+}
+
+/** `language:"<value>"`, or every spelling of its language ORed (`languageSpellings`). */
+function languageClause(language: string): string {
+  const spellings = languageSpellings(language).map((s) => `"${solrEscape(s)}"`);
+  return `language:${spellings.length > 1 ? `(${spellings.join(' OR ')})` : spellings[0]}`;
+}
+
+/**
+ * The value, or `invalid_filter` before any request when it has no letter or digit: Advanced
+ * Search drops such a creator or language clause and matches everything (`creator:"-"` matched
+ * 53,136,006 of 53,136,043 texts). A collection is matched exactly, so `collection:"-"` matches
+ * nothing and is sent as given.
+ */
+function requireLetterOrDigit(value: string, field: 'creator' | 'language', ctx: Context): string {
+  if (LETTER_OR_DIGIT.test(value)) return value;
+  throw invalidParams(
+    `${field} has no letter or digit, so Advanced Search would ignore it and match every item.`,
+    { reason: 'invalid_filter', field, ...ctx.recoveryFor('invalid_filter') },
+  );
+}
+
+/**
+ * The Solr `q` for a search: the caller's query, then each filter ANDed. With a filter, the
+ * query is parenthesized so the filter binds to all of it — `tesla OR edison AND
+ * mediatype:"texts"` filters only `edison` (10,606 texts against 18,202). Every value is quoted
+ * or validated to prevent query injection; an invalid date or filter value, or a query ending in
+ * a backslash that escapes nothing, throws here, before any request. Advanced Search cannot
+ * parse that backslash: alone it is a syntax error, and inside the wrap it escapes the `)`.
+ */
+function searchQuery(params: SearchParams, ctx: Context): string {
+  const from = dateBoundary(params.dateFrom, 'date_from', ctx);
+  const to = dateBoundary(params.dateTo, 'date_to', ctx);
+  const filters: string[] = [];
+  if (params.mediatype) filters.push(`mediatype:"${solrEscape(params.mediatype)}"`);
+  if (params.collection) filters.push(`collection:"${solrEscape(params.collection)}"`);
+  if (params.creator) {
+    filters.push(creatorClause(requireLetterOrDigit(params.creator, 'creator', ctx)));
+  }
+  if (params.language) {
+    filters.push(languageClause(requireLetterOrDigit(params.language, 'language', ctx)));
+  }
+  if (from !== '*' || to !== '*') filters.push(`date:[${from} TO ${to}]`);
+  const query = params.query.trim();
+  if (endsInUnpairedBackslash(query)) {
+    throw invalidParams(
+      'query ends in a backslash that escapes nothing, which Advanced Search cannot parse.',
+      { reason: 'invalid_query', ...ctx.recoveryFor('invalid_query') },
+    );
+  }
+  if (filters.length === 0) return query;
+  return `(${query}) AND ${filters.join(' AND ')}`;
+}
+
+/** Whether the text ends in an odd run of backslashes, scanned from the end without a regex. */
+function endsInUnpairedBackslash(text: string): boolean {
+  let run = 0;
+  for (let i = text.length - 1; i >= 0 && text[i] === '\\'; i--) run++;
+  return run % 2 === 1;
 }
 
 /**
@@ -139,9 +226,12 @@ export class ArchiveSearchService {
   }
 
   /**
-   * Search the Internet Archive library. Advanced Search reports a rejected request as an
-   * HTTP 200 whose body holds `error` and no `response`; that body is answered after one
-   * request, as `invalid_query` when the error blames the query or sort and as
+   * Search the Internet Archive library. An impossible date, a creator or language with no
+   * letter or digit, or a query ending in a backslash that escapes nothing throws
+   * (`invalid_date_range`, `invalid_filter`, `invalid_query`) before any request.
+   * Advanced Search reports a rejected request as an HTTP 200 whose body holds `error` and no
+   * `response`; that body is answered after one request, as `invalid_query` when the error
+   * blames the query or sort and as
    * `search_unavailable` otherwise. An HTTP 5xx, a network error (a connection dropped
    * mid-body included), an HTML page, an unparseable body, or a body with neither key is
    * `search_unavailable` after the retry loop; a 429, another 4xx, or a request timeout
@@ -151,21 +241,9 @@ export class ArchiveSearchService {
    * A caller cancellation or caller-side deadline propagates as the fetch threw it.
    */
   search(params: SearchParams, ctx: Context): Promise<SearchResult> {
-    const from = dateBoundary(params.dateFrom, 'date_from', ctx);
-    const to = dateBoundary(params.dateTo, 'date_to', ctx);
+    const q = searchQuery(params, ctx);
     return withRetry(
       async () => {
-        // Build the Solr query string, appending metadata filters as needed.
-        // All filter values are quoted or validated to prevent Solr query injection.
-        let q = params.query.trim();
-        if (params.mediatype) q += ` AND mediatype:"${solrEscape(params.mediatype)}"`;
-        if (params.collection) q += ` AND collection:"${solrEscape(params.collection)}"`;
-        if (params.creator) q += ` AND creator:"${solrEscape(params.creator)}"`;
-        if (params.language) q += ` AND language:"${solrEscape(params.language)}"`;
-        if (from !== '*' || to !== '*') {
-          q += ` AND date:[${from} TO ${to}]`;
-        }
-
         const page = params.page ?? 1;
         const rows = params.rows ?? 50;
         const qp = new URLSearchParams({

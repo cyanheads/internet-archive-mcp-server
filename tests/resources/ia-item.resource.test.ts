@@ -73,6 +73,61 @@ describe('iaItemResource', () => {
     });
   });
 
+  it('returns a list-valued title and date unchanged', async () => {
+    mockService.getItem.mockResolvedValue({
+      metadata: {
+        identifier: '00hamigoog',
+        title: ['Afganistan ', 'Афганистанъ '],
+        date: ['1', '2'],
+      },
+      files: [],
+    });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: '00hamigoog' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({
+      identifier: '00hamigoog',
+      title: ['Afganistan ', 'Афганистанъ '],
+      date: ['1', '2'],
+      file_count: 0,
+    });
+  });
+
+  it('returns the catalog, access, and description fields the service maps, without the manifest', async () => {
+    const metadata = {
+      identifier: 'blackreconstruc00dubo',
+      description: 'First line\nSecond line',
+      publisher: 'New York, Harcourt, Brace and Company',
+      isbn: ['9780313328770', '0313328773'],
+      oclc_id: '85792390',
+      lccn: '35008545',
+      openlibrary_edition: 'OL6320138M',
+      openlibrary_work: 'OL28614W',
+      volume: '2',
+      access_restricted: true,
+      image_count: 770,
+    };
+    mockService.getItem.mockResolvedValue({
+      metadata,
+      files: [
+        {
+          name: 'blackreconstruc00dubo_djvu.txt',
+          private: true,
+          downloadUrl:
+            'https://archive.org/download/blackreconstruc00dubo/blackreconstruc00dubo_djvu.txt',
+        },
+      ],
+    });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'blackreconstruc00dubo' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({ ...metadata, file_count: 1 });
+  });
+
   it('returns only identifier and file_count=0 for sparse metadata ({})', async () => {
     mockService.getItem.mockResolvedValue({
       metadata: { identifier: 'sparse-item' },
