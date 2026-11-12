@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-10-28 07:30:29
+Generated on: 2026-11-12 12:25:33
 
 ```text
 internet-archive-mcp-server/
@@ -165,17 +165,20 @@ internet-archive-mcp-server/
 │   ├── services/
 │   │   ├── archive-metadata/
 │   │   │   ├── archive-metadata-service.ts
+│   │   │   ├── item-reference.ts
 │   │   │   ├── read-text-page.ts
 │   │   │   └── types.ts
 │   │   ├── archive-search/
 │   │   │   ├── archive-search-service.ts
+│   │   │   ├── language-spellings.ts
 │   │   │   └── types.ts
 │   │   ├── wayback/
 │   │   │   ├── html-charset.ts
-│   │   │   ├── html-entities.ts
-│   │   │   ├── html-text.ts
 │   │   │   ├── types.ts
-│   │   │   └── wayback-service.ts
+│   │   │   ├── wayback-service.ts
+│   │   │   └── wayback-timestamp.ts
+│   │   ├── html-entities.ts
+│   │   ├── html-text.ts
 │   │   └── upstream-errors.ts
 │   └── index.ts
 ├── tests/
@@ -197,8 +200,12 @@ internet-archive-mcp-server/
 │   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── archive-metadata-service.test.ts
+│   │   ├── html-text.test.ts
+│   │   ├── item-reference.test.ts
+│   │   ├── language-spellings.test.ts
 │   │   ├── wayback-content.test.ts
-│   │   └── wayback-service.test.ts
+│   │   ├── wayback-service.test.ts
+│   │   └── wayback-timestamp.test.ts
 │   ├── smoke/
 │   │   └── definitions.smoke.test.ts
 │   └── tools/

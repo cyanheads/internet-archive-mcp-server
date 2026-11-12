@@ -45,7 +45,7 @@ The Wayback Machine and Internet Archive library (40M+ items). Find and fetch ar
 
 | Resource | Description |
 |:---|:---|
-| `ia://item/{identifier}` | Metadata snapshot for an Archive item — title, creator, mediatype, description, subjects, collections, date, license, and file count |
+| `ia://item/{identifier}` | Metadata snapshot for an Archive item — title, creator, mediatype, description, subjects, collections, date, license, publisher and catalog numbers, and file count |
 
 Item resource data is also reachable via `ia_get_item`.
 
@@ -57,49 +57,53 @@ The [`internet-archive-guide`](./skills/internet-archive-guide/SKILL.md) covers 
 
 ### `ia_find_snapshots` <sub>tool</sub>
 
-- `closest` mode: returns the nearest capture to a given `timestamp` via the Availability API, falling back to one CDX closest-capture query (preferring a `200` capture, 25 s deadline) when the Availability API has no answer
+- Timestamps (`timestamp`, `from`, `to`) take 1–14 digits (`YYYYMMDDHHMMSS` or a prefix of it) or an ISO 8601 date or UTC date-time such as `2020-06-15` or `2020-06-15T12:34:56Z`. A prefix names a period: as `from` it starts the period (`2015` is January 1, 2015), as `to` it ends it (`2015` reaches December 31, 2015), and as `timestamp` it resolves to the capture nearest the period's end (`2015` can resolve to one from early January 2016)
+- `closest` mode: returns the nearest capture to a given `timestamp` via the Availability API, falling back to one CDX closest-capture query (preferring a `200` capture) when the Availability API finds no capture or answers 429, or 408, 425, or 5xx after retries, or an HTML or unreadable response. The whole lookup shares one deadline of the request timeout plus 25 s. A timeout, network error, or 4xx refusal from the Availability API does not fall back
 - `history` mode: full capture list via the CDX API; filter by date range (`from`/`to`) and HTTP status (`status_filter`)
 - For an exact URL with `timestamp:N` collapse, pass the returned `resume_key` with the same URL to continue without skipping the page boundary. The cursor expires after one hour and retains the original filters; `limit` may change between pages. An invalid cursor returns `invalid_resume_key`; conflicting explicit filters return `resume_key_conflict`. Legacy CDX keys and wildcard histories remain available with a notice that pages may omit captures
 - `collapse` is `timestamp:8` (one capture per day) when omitted or blank; adjustable to `timestamp:N`, N=1–14, with `timestamp:14` listing one row per distinct capture second
 - Up to 10,000 records per call (`limit`, default 100); a larger `limit` (up to 150,000) is served as 10,000, setting `truncated` and a `notice` naming `resume_key` when captures remain; `resume_key` pagination for large histories
 - Replay URLs are always `https://web.archive.org/web/…`
-- Typed errors: `missing_timestamp` (closest mode without a `timestamp`, answered before any lookup), `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp from either source; or, in either mode, the Wayback Machine does not serve the URL — a 403, 410, or 451, as for a site excluded from it), `cdx_unavailable` (CDX 5xx, 429, another 4xx, timeout, network error, or unreadable response, or the closest-mode CDX check did not complete), `availability_unavailable` (closest mode, Availability API 5xx, 429, another 4xx, timeout, network error, or unreadable response); a 429, another 4xx, or a request timeout is answered after one request, a 429 with a hint to wait and a 4xx with a hint that repeating the request will not help
+- Typed errors: `missing_timestamp` (closest mode without a `timestamp`, answered before any lookup), `invalid_timestamp` (a `timestamp`, `from`, or `to` that is not 1–14 digits or an ISO 8601 date or UTC date-time, or names a date or time that does not exist, answered before any request), `no_snapshots` (no matches), `no_snapshot_available` (closest mode, no capture near timestamp from either source; or, in either mode, the Wayback Machine does not serve the URL — a 403, 410, or 451, as for a site excluded from it), `cdx_unavailable` (CDX 5xx, 429, another 4xx, timeout, network error, or unreadable response, or the closest-mode CDX check did not complete after the Availability API found no capture), `availability_unavailable` (closest mode, the Availability API failed and the CDX check it fell back to failed too or ran out of time, or the Availability API answered another 4xx, timed out, or could not be reached, none of which falls back); a 429, another 4xx, or a request timeout is answered after one request, a 429 with a hint to wait and a 4xx with a hint that repeating the request will not help
 
 ---
 
 ### `ia_get_snapshot` <sub>tool</sub>
 
-- Resolves to the nearest available capture when the exact timestamp has no snapshot; exact 14-digit timestamps skip resolution
+- `timestamp` takes the forms `ia_find_snapshots` does (1–14 digits or an ISO 8601 date or UTC date-time); a blank `timestamp` reads the latest capture. Resolves to the nearest available capture when the exact timestamp has no snapshot; exact 14-digit timestamps skip resolution
 - Reports the capture Wayback served — `replay_url`, `resolved_timestamp`, and `resolved_status` follow Wayback's redirect when the requested timestamp is not itself a capture
-- Decodes the page with its declared charset (`Content-Type`, then `<meta>`, else UTF-8 when the bytes are valid UTF-8, else Wayback's guessed charset or windows-1252), then removes scripts, styles, comments, and tags and decodes character references, returning readable plain text alongside the replay URL
-- Reads at most the first 4 MiB of a page (a `notice` says when a page is longer); output capped at `IA_MAX_SNAPSHOT_CHARS` (default 50,000 characters)
-- Typed errors: `no_snapshot_available` (no capture near the timestamp, the capture is an archived error page — the message names its timestamp and archived status — or Wayback refused the replay with a 4xx, or the lookup with a 403, 410, or 451, as it does for a site excluded from the Wayback Machine), `content_fetch_failed` (Wayback unreachable, rate-limiting, refusing the lookup, or timed out during lookup or fetch)
+- An HTML page is decoded with its declared charset (byte-order mark, then `Content-Type`, then `<meta>`, else UTF-8 when the bytes are valid UTF-8, else Wayback's guessed charset or windows-1252), then scripts, styles, comments, and tags are removed and character references decoded, returning readable plain text alongside the replay URL. Another text type (plain text, JSON, XML, JavaScript) is read as stored from the capture's `id_` form, markup and line breaks kept, decoded by the same charset order without the `<meta>` step. A capture that is not text (a PDF, an image) fails as `non_text_capture`
+- Reads at most the first 4 MiB of a page (a `notice` says when a page is longer). Long text comes one page at a time: `max_chars` (default and maximum `IA_MAX_SNAPSHOT_CHARS`, 50,000 characters) sizes a page and `char_offset` starts it; `has_more`, `total_chars`, and a `notice` name the `char_offset` and the `resolved_timestamp` to pass as `timestamp` so every page comes from the same capture
+- Typed errors: `invalid_timestamp` (a `timestamp` that is not blank, 1–14 digits, or an ISO 8601 date or UTC date-time, or names a date or time that does not exist, answered before any request), `no_snapshot_available` (no capture near the timestamp, the capture is an archived error page — the message names its timestamp and archived status — or Wayback refused the replay with a 4xx, or the lookup with a 403, 410, or 451, as it does for a site excluded from the Wayback Machine), `non_text_capture` (the capture Wayback served is not text; the message names its replay URL), `content_fetch_failed` (Wayback unreachable, rate-limiting, or timed out during the page fetch, or refusing the unmodified form of a text capture it replayed; the Availability API refused the lookup, timed out, or could not be reached; or the closest-capture lookup and its CDX fallback did not complete within the lookup deadline)
 
 ---
 
 ### `ia_search_items` <sub>tool</sub>
 
-- Solr query syntax plus structured filters: `mediatype`, `collection`, `creator`, `language`, and date range (`date_from`/`date_to`)
+- Solr query syntax plus structured filters: `mediatype`, `collection`, `creator`, `language`, and date range (`date_from`/`date_to`). With a filter, `query` is parenthesized so the filter binds to all of it
+- `creator` matches a creator holding every word of the name close together, in any order and case-insensitively, so `Charles Dickens` also finds `Dickens, Charles, 1812-1870`; for an exact phrase put `creator:"Charles Dickens"` in `query`. `language` takes an ISO 639-1, ISO 639-2, or discontinued MARC code or an English name and matches a known language under any of its codes and names (`fr` also finds `fre`, `fra`, and `French`); a two-letter code that is also an English word (`am`, `an`, `as`, `be`, `he`, `hi`, `is`, `it`, `my`, `no`, `or`, `so`, `to`) is searched only when it is the value given, and an unknown value is matched as given. `collection` takes an identifier or its archive.org details URL
 - Date bounds accept `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`: `date_from` uses the period's first day and `date_to` its last day, including leap years. Blank bounds leave that side open; invalid dates return `invalid_date_range` before a search request
 - `mediatype` takes the ten Internet Archive media types — `texts`, `movies`, `audio`, `software`, `image`, `data`, `web`, `collection`, `etree`, `account` — case-insensitively, and resolves common near-misses (`text`, `book`, `books` → `texts`; `movie`, `video`, `videos` → `movies`; `images` → `image`; `collections` → `collection`)
-- Sort by downloads, date, title, or random (`sort`, Solr syntax such as `date asc` or `titleSorter asc`; default `downloads desc`; Advanced Search has no relevance sort). Ties under the sort are ordered by `identifier`, so consecutive pages neither repeat nor skip an item
+- Sort by downloads, date, title, or random (`sort`, Solr syntax such as `date asc` or `titleSorter asc`; default `downloads desc`; Advanced Search has no relevance sort). Except under `random`, ties under the sort are ordered by `identifier`, so consecutive pages neither repeat nor skip an item
 - `query` is at most 2,047 characters, the longest Advanced Search accepts; the filters count toward it, and a URL in the query must be quoted
 - Up to 200 results per call (`rows`, default 50), 1-indexed `page`; on page 1 a larger `rows` (up to 10,000) is served as 200, setting `truncated` and a `notice` naming `rows: 200, page: 2` when more results remain
 - Advanced Search serves only the first 10,000 results, so `page × rows ≤ 10,000`
-- Output carries `total_found`, `page`, and the `rows` applied for pagination; an empty page returns a `notice` rather than an error — naming the `mediatype` applied when nothing matched, or the last page when `page` is past the end
+- Output carries `total_found`, `page`, and the `rows` applied for pagination; an empty page returns a `notice` rather than an error — naming every filter applied when nothing matched, or the last page when `page` is past the end
 - `title`, `date`, `creator`, and `collection` may be a string or a list; `collection` leaves out per-account `fav-` favorites lists, and `creator` lists the first 10 names, with `creator_count` when a record has more
-- Typed errors answered before any search request: `invalid_date_range` (an invalid date bound), `invalid_mediatype` (any other `mediatype`, listing the accepted values), `rows_over_cap` (`rows` above 200 past page 1), and `page_limit_exceeded` (`page × rows` past 10,000, naming the last reachable page)
+- Typed errors answered before any search request: `invalid_date_range` (an invalid date bound), `invalid_mediatype` (any other `mediatype`, listing the accepted values), `invalid_filter` (a `creator` or `language` with no letter or digit, which Advanced Search would ignore and match every item), `invalid_query` (a `query` ending in a backslash that escapes nothing), `rows_over_cap` (`rows` above 200 past page 1), and `page_limit_exceeded` (`page × rows` past 10,000, naming the last reachable page)
 - Typed errors from Advanced Search: `invalid_query` (it rejected the query syntax, an unquoted URL, a query its filters take past 2,047 characters, or the sort field; its message is relayed) and `search_unavailable` (it failed, rate-limited the request, sent an unreadable response, timed out, or could not be reached); a 5xx or network error is retried, while a 429, another 4xx, a timeout, or an error body is answered after one request, a 4xx with a hint that repeating the request will not help
 
 ---
 
 ### `ia_get_item` <sub>tool</sub>
 
-- Returns `title`, `creator`, `description`, `subject`, `collection`, `licenseurl`, `rights`, and `language` when present in upstream metadata; `creator`, `description`, `subject`, `collection`, and `language` may be a string or a list
-- `files[]` is one page of the manifest in upstream order — `format`, `size`, `md5`, and a direct `download_url` per file; `file_count` is always the full manifest size
+- `identifier` is an item identifier or an archive.org item URL (`/details/`, `/download/`, `/metadata/`, `/stream/`, or `/embed/` form, or a storage-node `/<n>/items/<identifier>/…` form) read as the identifier it names
+- Returns `title`, `creator`, `description`, `mediatype`, `date`, `subject`, `collection`, `licenseurl`, `rights`, `language`, `publisher`, `volume`, `isbn`, `oclc_id`, `lccn`, `openlibrary_edition`, and `openlibrary_work` when present in upstream metadata; `title`, `creator`, `description`, `date`, `subject`, `collection`, `language`, `publisher`, `isbn`, `oclc_id`, and `lccn` may be a string or a list. `description` is plain text, converted from the HTML the Archive stores (paragraphs and `<br>` become line breaks, a link reads as its label followed by its URL in parentheses)
+- `image_count` (texts items only: the scanned page images, covers and calibration cards included, not a printed page count) and `access_restricted` (`true` when the item is in an access-restricted collection such as a lending library) are present when they apply
+- `files[]` is one page of the manifest in upstream order — `format`, `size`, `md5`, and a direct `download_url` per file, plus `private: true` on a file the manifest marks private, whose download the Archive refuses; `file_count` is always the full manifest size
 - `max_files` (default 50, at most 500 per call) and `file_offset` (default 0) page through large items; a larger `max_files` (up to 300,000) is served as 500. When files remain, the response sets `truncated` and names the next `file_offset`
 - `format` keeps one file type (exact match, case-insensitive — e.g. `DjVuTXT`, `Text PDF`, `VBR MP3`) before paging and reports the match count as `totalCount`; a format with no matches returns an empty page and a notice listing the formats the item has
-- Typed errors: `item_not_found` (unknown or dark identifiers), `archive_unavailable` (the Metadata API failed, rate-limited or refused the request, timed out, could not be reached, or sent an unreadable response); a first timeout is retried once, so a call waits at most two request timeouts
+- Typed errors: `invalid_identifier` (an `identifier` holding `/` or `:` that is not an archive.org item URL, answered before any request), `item_not_found` (unknown or dark identifiers), `archive_unavailable` (the Metadata API failed, rate-limited or refused the request, timed out, could not be reached, or sent an unreadable response); a first timeout is retried once, so a call waits at most two request timeouts
 
 ---
 
@@ -109,14 +113,16 @@ The [`internet-archive-guide`](./skills/internet-archive-guide/SKILL.md) covers 
 - For sequential pages, pass `next_continuation` back as `continuation` with the same `identifier`, omitting `char_offset`. The cursor expires after one hour, binds the page to the selected text file, and resumes from its byte checkpoint. If a stable file validator or cursor storage is unavailable, the response gives an offset continuation notice
 - Continuation errors: `ambiguous_pagination` when both token and offset are supplied, `invalid_continuation` for an invalid or changed-file cursor, and `range_unavailable` when the download cannot resume at the saved range. Recovery names the `char_offset` to use
 - The upstream read stops at the page's end, so memory per call is bounded by the page size
-- Locates the best available text file — DjVuTXT preferred, falls back to plain text; `source_file` names the file fetched and `source_file_bytes` its size in bytes, from the item manifest
-- Typed errors: `item_not_found`, `no_text_file`, `download_forbidden` (restricted collections), `archive_unavailable` (the Metadata API or the text download failed, rate-limited or refused the request, timed out, or could not be reached); the metadata request and the download each retry a first timeout once and stop at a second
+- `identifier` is an item identifier or an archive.org item URL (`/details/`, `/download/`, `/stream/`, `/metadata/`, or `/embed/` form, or a storage-node `/<n>/items/<identifier>/…` form); a `/download/`, `/stream/`, or storage-node URL that names a file reads that file when `file` is omitted, and a continuation must read the file it names. A Wayback Machine URL is rejected: use `ia_get_snapshot`
+- Each call reads one text file: the one `file` names, or by default the first DjVuTXT file, else Text, Plain Text, or another `.txt` file (Metadata sidecars excluded). `file` takes a name as `ia_get_item` lists it. When an item holds several readable text files, such as one per volume, a `notice` gives the count and says to pass `file` for another
+- `source_file` names the file fetched and `source_file_bytes` its size in bytes, from the item manifest
+- Typed errors: `invalid_identifier` (an `identifier` holding `/` or `:` that is not an archive.org item URL), `invalid_file` (`file`, or the file a URL names, is not in the manifest or is not readable text), `item_not_found`, `no_text_file`, `download_forbidden` (restricted collections), `archive_unavailable` (the Metadata API or the text download failed, rate-limited or refused the request, timed out, or could not be reached); the metadata request and the download each retry a first timeout once and stop at a second
 
 ---
 
 ### `ia://item/{identifier}` <sub>resource</sub>
 
-- Returns `application/json` — `title`, `creator`, `mediatype`, `description`, `subject`, `collection`, `date`, `licenseurl`, `rights`, `language`, and `file_count`
+- Returns `application/json` — `title`, `creator`, `mediatype`, `description` (plain text, as in `ia_get_item`), `subject`, `collection`, `date`, `licenseurl`, `rights`, `language`, `publisher`, `volume`, `isbn`, `oclc_id`, `lccn`, `openlibrary_edition`, `openlibrary_work`, `image_count`, `access_restricted`, and `file_count`; each field is omitted when absent
 - `identifier` comes from `ia_search_items` results
 - Typed errors: `item_not_found` for unknown identifiers, `archive_unavailable` when the Metadata API fails
 
@@ -181,7 +187,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation | `false` |
 | `IA_USER_AGENT` | Custom User-Agent for IA API requests | `internet-archive-mcp-server/{version} (github.com/cyanheads/internet-archive-mcp-server)` |
 | `IA_REQUEST_TIMEOUT_MS` | HTTP request timeout in milliseconds, headers and body. A positive integer — anything else fails startup | `30000` |
-| `IA_MAX_SNAPSHOT_CHARS` | Default and maximum characters per `ia_get_text` page (a larger `max_chars` is served at it); also caps `ia_get_snapshot` text. A positive integer — anything else fails startup | `50000` |
+| `IA_MAX_SNAPSHOT_CHARS` | Default and maximum characters per `ia_get_text` and `ia_get_snapshot` page (a larger `max_chars` is served at it). A positive integer — anything else fails startup | `50000` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 
@@ -189,7 +195,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 - **Clone and install:**
 
@@ -235,7 +241,8 @@ The image defaults to HTTP transport, stateless session mode, and logs to `/var/
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Five tools across Wayback and IA library. |
 | `src/mcp-server/resources` | Resource definitions. `ia://item/{identifier}` item metadata resource. |
-| `src/services/wayback` | `WaybackService` — Availability API + CDX API client, plus archived-page charset decoding and text extraction. |
+| `src/services/wayback` | `WaybackService` — Availability API + CDX API client, plus archived-page charset decoding and timestamp parsing. |
+| `src/services` | Shared modules: HTML-to-text extraction (archived pages and item descriptions), upstream error classification. |
 | `src/services/archive-search` | `ArchiveSearchService` — Solr Advanced Search client. |
 | `src/services/archive-metadata` | `ArchiveMetadataService` — Metadata API + file download client. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

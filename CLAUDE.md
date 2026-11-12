@@ -2,8 +2,8 @@
 
 **Server:** internet-archive-mcp-server
 **Version:** 0.5.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -117,7 +117,7 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 const ServerConfigSchema = z.object({
   userAgent: z.string().optional().describe('Custom User-Agent string for IA API requests.'),
   requestTimeoutMs: z.coerce.number().int().positive().default(30_000).describe('HTTP request timeout in milliseconds.'),
-  maxSnapshotChars: z.coerce.number().int().min(1).default(50_000).describe('Default and maximum characters per ia_get_text page (a larger max_chars is served at it); also the text cap for ia_get_snapshot.'),
+  maxSnapshotChars: z.coerce.number().int().min(1).default(50_000).describe('Default and maximum characters per ia_get_text and ia_get_snapshot page (a larger max_chars is served at it).'),
 });
 
 let _config: ServerConfig | undefined;
@@ -239,17 +239,20 @@ src/
     server-config.ts                    # IA_USER_AGENT, IA_REQUEST_TIMEOUT_MS, IA_MAX_SNAPSHOT_CHARS
   services/
     upstream-errors.ts                  # Shared transport/429 classification + retry predicate
+    html-text.ts                        # HTML → plain text (markup scan + reference decode); archived pages and item descriptions
+    html-entities.ts                    # Named character reference table
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
+      wayback-timestamp.ts              # Timestamp forms (1–14 digits, ISO 8601) → Wayback digits
       html-charset.ts                   # Archived-page charset detection + decoding
-      html-text.ts                      # Archived HTML → plain text (markup scan + reference decode)
-      html-entities.ts                  # Named character reference table
       types.ts                          # Wayback domain types
     archive-search/
       archive-search-service.ts         # ArchiveSearchService — Solr Advanced Search
+      language-spellings.ts             # Every spelling the Archive records a language under (ISO 639, MARC)
       types.ts                          # Search domain types
     archive-metadata/
       archive-metadata-service.ts       # ArchiveMetadataService — Metadata API + downloads
+      item-reference.ts                 # Identifier or archive.org item URL → item identifier + file
       read-text-page.ts                 # UTF-16 pages with UTF-8 byte checkpoints
       types.ts                          # Metadata domain types
   mcp-server/
@@ -369,7 +372,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 
