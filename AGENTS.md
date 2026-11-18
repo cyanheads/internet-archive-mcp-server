@@ -116,7 +116,7 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   userAgent: z.string().optional().describe('Custom User-Agent string for IA API requests.'),
-  requestTimeoutMs: z.coerce.number().int().positive().default(30_000).describe('HTTP request timeout in milliseconds.'),
+  requestTimeoutMs: z.coerce.number().int().positive().default(30_000).describe('Timeout for each upstream HTTP request, in milliseconds. A whole tool call or resource read ends within 55 s, or within this timeout when it is longer.'),
   maxSnapshotChars: z.coerce.number().int().min(1).default(50_000).describe('Default and maximum characters per ia_get_text and ia_get_snapshot page (a larger max_chars is served at it).'),
 });
 
@@ -239,11 +239,13 @@ src/
     server-config.ts                    # IA_USER_AGENT, IA_REQUEST_TIMEOUT_MS, IA_MAX_SNAPSHOT_CHARS
   services/
     upstream-errors.ts                  # Shared transport/429 classification + retry predicate
+    call-deadline.ts                    # One deadline per tool/resource call: 55 s, or IA_REQUEST_TIMEOUT_MS when longer
     html-text.ts                        # HTML → plain text (markup scan + reference decode); archived pages and item descriptions
     html-entities.ts                    # Named character reference table
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
       wayback-timestamp.ts              # Timestamp forms (1–14 digits, ISO 8601) → Wayback digits
+      wayback-capture-url.ts            # Wayback capture URL in url → original URL + timestamp (both Wayback tools); WAYBACK_HOSTS
       html-charset.ts                   # Archived-page charset detection + decoding
       types.ts                          # Wayback domain types
     archive-search/
@@ -256,6 +258,7 @@ src/
       read-text-page.ts                 # UTF-16 pages with UTF-8 byte checkpoints
       types.ts                          # Metadata domain types
   mcp-server/
+    tools/labelled-field.ts             # Labelled string-or-list fields and the item heading, shared by ia_get_item and ia_search_items
     tools/definitions/
       ia-find-snapshots.tool.ts         # ia_find_snapshots
       ia-get-snapshot.tool.ts           # ia_get_snapshot
