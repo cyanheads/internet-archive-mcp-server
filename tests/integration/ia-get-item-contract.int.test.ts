@@ -51,6 +51,7 @@ const CATALOG_RECORDS = {
   prideprejudice00aust: {
     metadata: {
       mediatype: 'texts',
+      creator: ['Austen, Jane, 1775-1817', 'Thomson, Hugh, 1860-1920, ill'],
       publisher: 'London : George Allen',
       openlibrary_edition: 'OL7173379M',
       openlibrary_work: 'OL66554W',
@@ -227,7 +228,9 @@ toolContractSuite(iaGetItem, {
         file_count: 1,
       },
       assert: (result) => {
-        expect(contentText(result)).toContain('**Language:** German, English, French');
+        expect(contentText(result)).toContain(
+          '**Media Type:** texts\n**Language:**\n\n- German\n- English\n- French\n\n**Files (1):**',
+        );
       },
     },
     {
@@ -260,13 +263,13 @@ toolContractSuite(iaGetItem, {
       },
     },
     {
-      name: 'relays a list-valued title as received and renders both values',
+      name: 'relays a list-valued title as received and lists both values under the identifier heading',
       input: { identifier: '00hamigoog' },
       expected: { title: ['Afganistan ', 'Афганистанъ '], date: '1908' },
       assert: (result) => {
-        const text = contentText(result);
-        expect(text).toMatch(/^# Afganistan , Афганистанъ/);
-        expect(text).toContain('**Date:** 1908');
+        expect(contentText(result)).toBe(
+          '# 00hamigoog\n**Title:**\n\n- Afganistan&#32;\n- Афганистанъ&#32;\n\n**Identifier:** 00hamigoog\n**Media Type:** texts\n**Date:** 1908\n**Publisher:**\n\n- S.-Peterburg : Izdal V. Berezovskīĭ, Komissīoner Voenno-Uchebnykh zavedenīĭ\n- С.-Петербургъ : Издалъ В. Березовскій, Комиссіонеръ Военно-Учебныхъ заведеній\n\n**OCLC ID:** 85792390\n**Page Images:** 353\n\n**Files (0):**',
+        );
       },
     },
     {
@@ -277,9 +280,9 @@ toolContractSuite(iaGetItem, {
         const sc = result.structuredContent as { title: string[]; date: string[] };
         expect(sc.title).toHaveLength(28);
         expect(sc.date).toHaveLength(10);
-        const text = contentText(result);
-        expect(text).toMatch(/^# T, u, x, C, a, s, t, D, E, N, e, w, s, /);
-        expect(text).toContain('**Date:** 6, 7, 8, 9, -, 4, 5, -, 2, 3');
+        expect(contentText(result)).toBe(
+          '# TuxCastDE-News-1-vom-23-45-6789\n**Title:**\n\n- T\n- u\n- x\n- C\n- a\n- s\n- t\n- D\n- E\n- N\n- e\n- w\n- s\n- \\#\n- 1\n- v\n- o\n- m\n- 2\n- 3\n- .\n- 4\n- 5\n- .\n- 6\n- 7\n- 8\n- 9\n\n**Identifier:** TuxCastDE-News-1-vom-23-45-6789\n**Media Type:** movies\n**Date:**\n\n- 6\n- 7\n- 8\n- 9\n- \\-\n- 4\n- 5\n- \\-\n- 2\n- 3\n\n**Files (0):**',
+        );
       },
     },
   ],
@@ -310,14 +313,18 @@ describe('ia_get_item service-thrown error envelope', () => {
 });
 
 describe('ia_get_item descriptions as plain text', () => {
-  /** The description on both surfaces: the structured value, and content[]'s line after the label. */
+  /**
+   * The description on both surfaces: the structured value, the inline value content[] renders
+   * after the label (undefined for a list, which renders as items), and the whole content[] text.
+   */
   const describeItem = async (identifier: keyof typeof DESCRIPTIONS) => {
     const result = await runToolContract(iaGetItem, { identifier });
     expect(result.isError).toBeFalsy();
     const description = (result.structuredContent as { description: string | string[] })
       .description;
-    const rendered = /\*\*Description:\*\* ([\s\S]*?)\n\n\*\*Files/.exec(contentText(result))?.[1];
-    return { description, rendered };
+    const text = contentText(result);
+    const rendered = /\*\*Description:\*\* ([\s\S]*?)\n\n\*\*Files/.exec(text)?.[1];
+    return { description, rendered, text };
   };
 
   it('splits CrackedUpNoCC into two lines and keeps its escaped anchor literal', async () => {
@@ -368,15 +375,16 @@ describe('ia_get_item descriptions as plain text', () => {
     );
   });
 
-  it('converts each value of a list and puts each on its own line', async () => {
-    const { description, rendered } = await describeItem('list-description');
+  it('converts each value of a list and renders each as its own item', async () => {
+    const { description, rendered, text } = await describeItem('list-description');
 
     expect(description).toEqual([
       'Book digitized by Google from the library of University of Michigan and uploaded to the Internet Archive by user tpb.',
       'Photocopy\nMode of access: Internet',
     ]);
-    expect(rendered).toBe(
-      'Book digitized by Google from the library of University of Michigan and uploaded to the Internet Archive by user tpb.\\\nPhotocopy\\\nMode of access: Internet',
+    expect(rendered).toBeUndefined();
+    expect(text).toBe(
+      '# list-description\n**Identifier:** list-description\n\n**Description:**\n\n- Book digitized by Google from the library of University of Michigan and uploaded to the Internet Archive by user tpb.\n- Photocopy\\\nMode of access: Internet\n\n**Files (0):**',
     );
   });
 });
@@ -393,10 +401,11 @@ describe('ia_get_item catalog identifiers and access restriction', () => {
     };
   };
 
-  it('returns prideprejudice00aust’s publisher, Open Library IDs, and image count, unrestricted', async () => {
+  it('returns prideprejudice00aust’s creators, publisher, Open Library IDs, and image count, unrestricted', async () => {
     const { sc, text } = await getItem('prideprejudice00aust');
 
     expect(sc).toMatchObject({
+      creator: ['Austen, Jane, 1775-1817', 'Thomson, Hugh, 1860-1920, ill'],
       publisher: 'London : George Allen',
       openlibrary_edition: 'OL7173379M',
       openlibrary_work: 'OL66554W',
@@ -404,7 +413,9 @@ describe('ia_get_item catalog identifiers and access restriction', () => {
     });
     expect(sc).not.toHaveProperty('access_restricted');
     expect(sc.files.some((f) => 'private' in f)).toBe(false);
-    expect(text).toContain('**Publisher:** London : George Allen');
+    expect(text).toContain(
+      '\n**Media Type:** texts\n**Creator:**\n\n- Austen, Jane, 1775-1817\n- Thomson, Hugh, 1860-1920, ill\n\n**Publisher:** London : George Allen\n',
+    );
     expect(text).toContain('**Open Library Edition:** OL7173379M');
     expect(text).toContain('**Open Library Work:** OL66554W');
     expect(text).toContain('**Page Images:** 518');
@@ -442,9 +453,8 @@ describe('ia_get_item catalog identifiers and access restriction', () => {
     expect(sc.isbn).toEqual(CATALOG_RECORDS.dictionaryofmedi0002unse_x3v6.metadata.isbn);
     expect(sc.volume).toBe('2');
     expect(text).toContain(
-      `**ISBN:** ${CATALOG_RECORDS.dictionaryofmedi0002unse_x3v6.metadata.isbn.join(', ')}`,
+      '\n**Volume:** 2\n**ISBN:**\n\n- 9780313328770\n- 0313328773\n- 9780313328787\n- 0313328781\n- 9780313328794\n- 031332879X\n- 9780313328800\n- 0313328803\n- 9780313328817\n- 0313328811\n- 9780313328824\n- 031332882X\n\n**LCCN:** 2006022953\n',
     );
-    expect(text).toContain('**Volume:** 2');
   });
 
   it('returns 00hamigoog’s publisher list and OCLC number', async () => {

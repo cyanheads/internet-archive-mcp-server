@@ -15,7 +15,8 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig, getUserAgent } from '@/config/server-config.js';
+import { getUserAgent } from '@/config/server-config.js';
+import type { CallDeadline } from '../call-deadline.js';
 import { descriptionToText } from '../html-text.js';
 import {
   bodyReadError,
@@ -122,11 +123,9 @@ const textDownload = (file: string): Upstream => ({
 
 export class ArchiveMetadataService {
   private readonly headers: Record<string, string>;
-  private readonly timeoutMs: number;
 
   constructor(config: AppConfig, _storage: StorageService) {
     this.headers = { 'User-Agent': getUserAgent(config.mcpServerVersion) };
-    this.timeoutMs = getServerConfig().requestTimeoutMs;
   }
 
   /**
@@ -137,15 +136,16 @@ export class ArchiveMetadataService {
    * left with none is omitted. Every other value is relayed as received. Throws `item_not_found` (with the caller's recovery hint)
    * when the API returns `{}`, the item is dark, or the body holds neither metadata nor
    * a file list — the `error` or `result` the API answers for an identifier with a `/`
-   * in it. Any other failure is `archive_unavailable` (see `retry` and `statusError`).
+   * in it. Any other failure is `archive_unavailable` (see `retry` and `statusError`),
+   * the call's `deadline` running out included.
    */
-  getItem(identifier: string, ctx: Context): Promise<ArchiveItem> {
-    return this.retry('getItem', METADATA_API, ctx, async () => {
+  getItem(identifier: string, ctx: Context, deadline: CallDeadline): Promise<ArchiveItem> {
+    return this.retry(METADATA_API, ctx, deadline, async (signal) => {
       const response = await fetchWithTimeout(
         `${METADATA_BASE}/${encodeURIComponent(identifier)}`,
-        this.timeoutMs,
+        deadline.nextTimeoutMs(),
         ctx,
-        { headers: this.headers, signal: ctx.signal },
+        { headers: this.headers, signal },
       ).catch((err: unknown) => {
         throw statusError(err, METADATA_API, ctx);
       });
@@ -239,13 +239,15 @@ export class ArchiveMetadataService {
    * Throws `invalid_continuation` (a `file` other than the continuation's included) or
    * `range_unavailable` for an unusable resume, plus `item_not_found`, `invalid_file`,
    * `no_text_file`, `download_forbidden`, or `archive_unavailable`; the metadata request and
-   * the download each retry a first timeout once (see `retry`).
+   * the download share the call's `deadline`, and each retries a first timeout once while
+   * time remains (see `retry`).
    */
   async getTextContent(
     identifier: string,
     maxChars: number,
     charOffset: number,
     ctx: Context,
+    deadline: CallDeadline,
     { continuation, file }: TextSelection = {},
   ): Promise<TextPage> {
     let cursor: TextCursor | undefined;
@@ -290,7 +292,7 @@ export class ArchiveMetadataService {
       charOffset = cursor.nextCharOffset;
     }
     // Step 1: locate the text file
-    const item = await this.getItem(identifier, ctx);
+    const item = await this.getItem(identifier, ctx, deadline);
 
     const name = cursor?.file ?? file;
     const readable = name === undefined ? item.files.filter(isReadableText) : undefined;
@@ -316,7 +318,7 @@ export class ArchiveMetadataService {
 
     // Step 2: stream the page out of the text file
     const download = textDownload(textFile.name);
-    return this.retry('getTextContent', download, ctx, async () => {
+    return this.retry(download, ctx, deadline, async (signal) => {
       // A 401/403 here is the expected outcome for a restricted item — IA answers
       // 401 for login-required downloads and 403 for limited collections — so both
       // remap to the declared download_forbidden contract and its recovery hint
@@ -324,7 +326,7 @@ export class ArchiveMetadataService {
       // to debug; the status-mapped McpError is still thrown, unchanged.
       let response: Response;
       try {
-        response = await fetchWithTimeout(textFile.downloadUrl, this.timeoutMs, ctx, {
+        response = await fetchWithTimeout(textFile.downloadUrl, deadline.nextTimeoutMs(), ctx, {
           headers: {
             ...this.headers,
             'Accept-Encoding': 'identity',
@@ -333,7 +335,7 @@ export class ArchiveMetadataService {
               'If-Range': cursor.etag,
             }),
           },
-          signal: ctx.signal,
+          signal,
           expectedStatuses: [401, 403],
         });
       } catch (err) {
@@ -470,29 +472,41 @@ export class ArchiveMetadataService {
   }
 
   /**
-   * Run `fn` under the framework retry loop, bound to the request's cancellation signal.
-   * A first timeout is retried once — archive.org's metadata and download hosts stall
-   * intermittently and usually answer a second request — and a second ends the call, so a
-   * call waits at most two request timeouts on them. A 429 is not retried; any other failure
-   * follows `isRetriedFailure`. A timeout, or a network error once its retries are spent,
-   * surfaces as `archive_unavailable`. Everything else leaves as it was thrown.
+   * Run `fn` under the framework retry loop, bound to the request's cancellation signal and to
+   * what remains of the call's `deadline`: no attempt is sent once it is spent, and `fn` gets the
+   * attempt's signal, which the deadline aborts. A first timeout is retried once —
+   * archive.org's metadata and download hosts stall intermittently and usually answer a second
+   * request — and a second ends the ladder; a request the deadline cut short is no first
+   * timeout. A 429 is not retried; any other failure follows `isRetriedFailure`. A timeout, a
+   * network error once its retries are spent, or the deadline running out surfaces as
+   * `archive_unavailable` (`transportError`). Everything else leaves as it was thrown. No
+   * `operation` label is passed: `withRetry` copies it into an exhausted error's `data`, which
+   * reaches the caller, and the message already names `upstream`.
    */
   private retry<T>(
-    operation: string,
     upstream: Upstream,
     ctx: Context,
-    fn: () => Promise<T>,
+    deadline: CallDeadline,
+    fn: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     let timeouts = 0;
-    return withRetry(fn, {
-      operation: `ArchiveMetadataService.${operation}`,
-      context: ctx,
-      baseDelayMs: 1_000,
-      signal: ctx.signal,
-      isTransient: (err) =>
-        transportFailure(err) === 'timeout' ? ++timeouts === 1 : isRetriedFailure(err),
-    }).catch((err: unknown) => {
-      throw transportError(err, upstream.name, this.timeoutMs, unavailable(ctx));
+    return withRetry(
+      ({ signal }) => {
+        deadline.assertTimeLeft();
+        return fn(signal);
+      },
+      {
+        context: ctx,
+        baseDelayMs: 1_000,
+        signal: ctx.signal,
+        deadlineMs: deadline.remainingMs(),
+        isTransient: (err) =>
+          transportFailure(err) === 'timeout'
+            ? !deadline.isExpiry(err) && ++timeouts === 1
+            : isRetriedFailure(err),
+      },
+    ).catch((err: unknown) => {
+      throw transportError(err, upstream.name, deadline, unavailable(ctx));
     });
   }
 }

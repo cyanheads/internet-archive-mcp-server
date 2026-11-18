@@ -12,6 +12,7 @@ import {
   type TextFileSummary,
 } from '@/services/archive-metadata/archive-metadata-service.js';
 import { requireItemReference } from '@/services/archive-metadata/item-reference.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
 
 /** Quoted values as an "or" list: `"a"`, `"a" or "b"`, `"a", "b", or "c"`. */
 const orList = (values: string[]): string => {
@@ -186,14 +187,15 @@ export const iaGetText = tool('ia_get_text', {
     {
       reason: 'archive_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Internet Archive Metadata API or the text file download did not answer within the request timeout, could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or the metadata response was unreadable.',
+      when: "The Internet Archive Metadata API or the text file download did not answer within the request timeout or the call's 55 s deadline (the request timeout when that is longer), could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or the metadata response was unreadable.",
       recovery:
-        'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes. When the message names a download timeout, a retry can time out the same way; the download_url ia_get_item lists for the file serves it whole.',
+        'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes. When the message names the download as timed out or cut off by the call deadline, a retry can stall the same way; the download_url ia_get_item lists for the file serves it whole.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    const deadline = startCallDeadline(ctx.signal);
     const svc = getArchiveMetadataService();
     // Read before a continuation's identifier is compared, so a URL matches the bare identifier.
     const item = requireItemReference(input.identifier, ctx);
@@ -205,7 +207,7 @@ export const iaGetText = tool('ia_get_text', {
     const charOffset = input.char_offset ?? 0;
     const file = input.file?.trim() ? input.file : item.file;
 
-    const result = await svc.getTextContent(item.identifier, maxChars, charOffset, ctx, {
+    const result = await svc.getTextContent(item.identifier, maxChars, charOffset, ctx, deadline, {
       continuation,
       file,
     });

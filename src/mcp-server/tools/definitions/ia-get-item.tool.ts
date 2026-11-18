@@ -6,18 +6,16 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
+import { pushItemHeading, pushLabelledField } from '@/mcp-server/tools/labelled-field.js';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
 import { requireItemReference } from '@/services/archive-metadata/item-reference.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
 
 /** Files returned per call. A larger `max_files` is served at this cap. */
 const MAX_FILES_CAP = 500;
 
 /** The largest `max_files` accepted: above the largest manifest measured (288,113 files). */
 const MAX_FILES_CEILING = 300_000;
-
-/** A string-or-list field as one line of text. */
-const listText = (value: string | string[]): string =>
-  Array.isArray(value) ? value.join(', ') : value;
 
 export const iaGetItem = tool('ia_get_item', {
   title: 'Get Internet Archive Item',
@@ -247,7 +245,7 @@ export const iaGetItem = tool('ia_get_item', {
     {
       reason: 'archive_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Internet Archive Metadata API did not answer within the request timeout, could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an unreadable response.',
+      when: "The Internet Archive Metadata API did not answer within the request timeout or the call's 55 s deadline (the request timeout when that is longer), could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an unreadable response.",
       recovery:
         'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes.',
       thrownBy: 'service',
@@ -255,9 +253,10 @@ export const iaGetItem = tool('ia_get_item', {
   ],
 
   async handler(input, ctx) {
+    const deadline = startCallDeadline(ctx.signal);
     const svc = getArchiveMetadataService();
     const { identifier } = requireItemReference(input.identifier, ctx);
-    const item = await svc.getItem(identifier, ctx);
+    const item = await svc.getItem(identifier, ctx, deadline);
 
     const format = input.format?.trim();
     const matched = format
@@ -325,8 +324,7 @@ export const iaGetItem = tool('ia_get_item', {
 
   format: (result) => {
     const lines: string[] = [];
-    const title = result.title ? listText(result.title) : result.identifier;
-    lines.push(`${/[\r\n]/.test(title) ? '' : '# '}${escapeMarkdownInline(title)}`);
+    pushItemHeading(lines, result.title, result.identifier, 1);
     const labelled: [label: string, value: string | string[] | undefined][] = [
       ['Identifier', result.identifier],
       ['Media Type', result.mediatype],
@@ -344,22 +342,19 @@ export const iaGetItem = tool('ia_get_item', {
       ['Open Library Work', result.openlibrary_work],
     ];
     for (const [label, value] of labelled) {
-      if (value) lines.push(`**${label}:** ${escapeMarkdownInline(listText(value))}`);
+      if (value) pushLabelledField(lines, label, value);
     }
     if (result.image_count !== undefined) lines.push(`**Page Images:** ${result.image_count}`);
     if (result.licenseurl)
       lines.push(`**License:** ${markdownLink(result.licenseurl, result.licenseurl)}`);
     if (result.rights) lines.push(`**Rights:** ${escapeMarkdownInline(result.rights)}`);
     if (result.access_restricted) lines.push('**Access Restricted:** true');
+    // A list of two or more values already ends with the blank line a new block needs.
     if (result.description) {
-      // One value per line; a value's own line breaks render as hard breaks.
-      const desc = Array.isArray(result.description)
-        ? result.description.join('\n')
-        : result.description;
-      lines.push('');
-      lines.push(`**Description:** ${escapeMarkdownInline(desc)}`);
+      if (lines.at(-1) !== '') lines.push('');
+      pushLabelledField(lines, 'Description', result.description);
     }
-    lines.push('');
+    if (lines.at(-1) !== '') lines.push('');
     const count =
       result.files.length === result.file_count
         ? `${result.file_count}`

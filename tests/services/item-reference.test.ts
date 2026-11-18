@@ -118,6 +118,8 @@ describe('parseItemReference', () => {
     'https://web.archive.org/web/2020/https://example.com/',
     'web.archive.org/web/20200101000000*/example.com',
     'http://web.archive.org/web/20200101000000id_/http://example.com/a?b=c',
+    'https://wayback.archive.org/web/20241231012939/https://digital.ucd.ie/',
+    'WAYBACK.ARCHIVE.ORG/web/2024/https://digital.ucd.ie/',
   ])('reads %s as a Wayback capture', (value) => {
     expect(parseItemReference(value)).toEqual({ kind: 'wayback' });
   });
@@ -213,10 +215,11 @@ describe('requireItemReference', () => {
     );
   });
 
-  it('points a Wayback capture URL to ia_get_snapshot and the inputs it takes', () => {
-    expect(() =>
-      requireItemReference('https://web.archive.org/web/2020/https://example.com/', ctx()),
-    ).toThrow(
+  it.each([
+    'https://web.archive.org/web/2020/https://example.com/',
+    'https://wayback.archive.org/web/20241231012939/https://digital.ucd.ie/',
+  ])('points the Wayback capture URL %s to ia_get_snapshot and the inputs it takes', (value) => {
+    expect(() => requireItemReference(value, ctx())).toThrow(
       expect.objectContaining({
         code: JsonRpcErrorCode.InvalidParams,
         message:

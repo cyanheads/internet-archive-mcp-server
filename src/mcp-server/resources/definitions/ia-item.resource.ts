@@ -6,6 +6,7 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
 
 export const iaItemResource = resource('ia://item/{identifier}', {
   name: 'Internet Archive Item Metadata',
@@ -31,7 +32,7 @@ export const iaItemResource = resource('ia://item/{identifier}', {
     {
       reason: 'archive_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Internet Archive Metadata API did not answer within the request timeout, could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an unreadable response.',
+      when: "The Internet Archive Metadata API did not answer within the request timeout or the read's 55 s deadline (the request timeout when that is longer), could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or sent an unreadable response.",
       recovery:
         'The Internet Archive is temporarily unavailable or overloaded; read the resource again in a few minutes.',
       thrownBy: 'service',
@@ -39,8 +40,9 @@ export const iaItemResource = resource('ia://item/{identifier}', {
   ],
 
   async handler(params, ctx) {
+    const deadline = startCallDeadline(ctx.signal);
     const svc = getArchiveMetadataService();
-    const item = await svc.getItem(params.identifier, ctx);
+    const item = await svc.getItem(params.identifier, ctx, deadline);
     // The same metadata fields as ia_get_item, each omitted when absent; the manifest stays out.
     return { ...item.metadata, file_count: item.files.length };
   },

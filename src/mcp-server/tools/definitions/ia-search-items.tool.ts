@@ -6,8 +6,10 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { pushItemHeading, pushLabelledField } from '@/mcp-server/tools/labelled-field.js';
 import { parseItemReference } from '@/services/archive-metadata/item-reference.js';
 import { getArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
 
 /** The complete Advanced Search mediatype vocabulary. Solr matches it exactly and case-sensitively. */
 const MEDIATYPES = [
@@ -41,10 +43,6 @@ const MEDIATYPE_BY_SPELLING = new Map<string, string>([
   ['images', 'image'],
   ['collections', 'collection'],
 ]);
-
-/** A string-or-list field as one line of text. */
-const listText = (value: string | string[]): string =>
-  Array.isArray(value) ? value.join(', ') : value;
 
 /** A collection given as its archive.org details URL, as the identifier it names; any other value as given. */
 const collectionIdentifier = (value: string): string => {
@@ -267,7 +265,7 @@ export const iaSearchItems = tool('ia_search_items', {
     {
       reason: 'search_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Advanced Search failed, rate-limited the request, returned an unreadable response, timed out, or could not be reached (network error).',
+      when: "Advanced Search failed, rate-limited the request, returned an unreadable response, timed out, did not finish within the call's 55 s deadline (the request timeout when that is longer), or could not be reached (network error).",
       recovery:
         'The search backend fails on a bare operator (AND, OR, NOT), an empty field prefix (title:), a doubled operator (AND AND), or &, %, /, !, or ; inside a word (AT&T, 100%, 1/2): quote such a phrase behind a field prefix (title:"AT&T") or replace the character with a space. A query with none of these hit a backend fault; try a simpler query.',
       thrownBy: 'service',
@@ -275,6 +273,7 @@ export const iaSearchItems = tool('ia_search_items', {
   ],
 
   async handler(input, ctx) {
+    const deadline = startCallDeadline(ctx.signal);
     const svc = getArchiveSearchService();
 
     const requestedMediatype = input.mediatype?.trim();
@@ -325,6 +324,7 @@ export const iaSearchItems = tool('ia_search_items', {
         page: input.page,
       },
       ctx,
+      deadline,
     );
 
     ctx.log.info('Item search completed', {
@@ -372,8 +372,7 @@ export const iaSearchItems = tool('ia_search_items', {
       '',
     ];
     for (const item of result.items) {
-      const title = item.title ? listText(item.title) : item.identifier;
-      lines.push(`${/[\r\n]/.test(title) ? '' : '## '}${escapeMarkdownInline(title)}`);
+      pushItemHeading(lines, item.title, item.identifier, 2);
       lines.push(`**Identifier:** ${escapeMarkdownInline(item.identifier)}`);
       if (item.mediatype) lines.push(`**Media Type:** ${escapeMarkdownInline(item.mediatype)}`);
       if (item.creator) {
@@ -381,13 +380,13 @@ export const iaSearchItems = tool('ia_search_items', {
           item.creator_count != null
             ? ` (${Array.isArray(item.creator) ? item.creator.length : 1} of ${item.creator_count}; ia_get_item lists all)`
             : '';
-        lines.push(`**Creator:** ${escapeMarkdownInline(listText(item.creator))}${cut}`);
+        pushLabelledField(lines, 'Creator', item.creator, cut);
       }
-      if (item.date) lines.push(`**Date:** ${escapeMarkdownInline(listText(item.date))}`);
+      if (item.date) pushLabelledField(lines, 'Date', item.date);
       if (item.downloads != null) lines.push(`**Downloads:** ${item.downloads.toLocaleString()}`);
-      if (item.collection)
-        lines.push(`**Collection:** ${escapeMarkdownInline(listText(item.collection))}`);
-      lines.push('');
+      if (item.collection) pushLabelledField(lines, 'Collection', item.collection);
+      // A list of two or more values already ends with the blank line between items.
+      if (lines.at(-1) !== '') lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

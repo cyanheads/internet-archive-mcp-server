@@ -7,7 +7,7 @@
  * @module tests/services/wayback-service.test
  */
 
-import type { z } from '@cyanheads/mcp-ts-core';
+import type { Context, z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
@@ -22,7 +22,8 @@ const fetchWithTimeout = vi.fn();
 
 /**
  * Pass-through retry by default — one attempt, on the caller's signal, with no deadline — and
- * a test flips `real` to run the framework's retry loop.
+ * a test flips `real` to run the framework's retry loop. Async like the real loop, so a throw
+ * inside an attempt arrives as a rejection.
  */
 const retryMode = { real: false };
 
@@ -32,23 +33,24 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   return {
     ...actual,
     fetchWithTimeout: (...args: Parameters<typeof fetchWithTimeout>) => fetchWithTimeout(...args),
-    withRetry: <T>(
+    withRetry: async <T>(
       fn: (attempt: Attempt) => Promise<T>,
       options?: Parameters<typeof actual.withRetry>[1],
-    ) =>
-      retryMode.real
+    ): Promise<T> =>
+      await (retryMode.real
         ? actual.withRetry(fn, options)
         : fn({
             signal: options?.signal ?? new AbortController().signal,
             remainingMs: Number.POSITIVE_INFINITY,
-          }),
+          })),
   };
 });
 
 import { getServerConfig } from '@/config/server-config.js';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
-import { WaybackService } from '@/services/wayback/wayback-service.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
+import { type FetchHistoryParams, WaybackService } from '@/services/wayback/wayback-service.js';
 
 const CDX_HEADER = ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'];
 
@@ -68,8 +70,24 @@ const RESUME_KEY = 'eJxLzs_VSa1IzC3ISdXUVzAyMDAyMDMwAUILAzMAf1cHkA';
 const cdxResponse = (rows: unknown[][]): Response =>
   ({ text: async () => JSON.stringify(rows) }) as Response;
 
-const buildService = (): WaybackService =>
-  new WaybackService({ mcpServerVersion: '0.0.0-test' } as AppConfig, {} as StorageService);
+/**
+ * The service as a handler drives it: each call runs under its own call deadline, started as
+ * the call begins — on the fake clock when a test has installed one.
+ */
+const buildService = () => {
+  const svc = new WaybackService(
+    { mcpServerVersion: '0.0.0-test' } as AppConfig,
+    {} as StorageService,
+  );
+  return {
+    fetchContent: (snapshotUrl: string, ctx: Context) =>
+      svc.fetchContent(snapshotUrl, ctx, startCallDeadline(ctx.signal)),
+    fetchHistory: (params: FetchHistoryParams, ctx: Context) =>
+      svc.fetchHistory(params, ctx, startCallDeadline(ctx.signal)),
+    findClosest: (url: string, timestamp: string | undefined, ctx: Context) =>
+      svc.findClosest(url, timestamp, ctx, startCallDeadline(ctx.signal)),
+  };
+};
 
 const fetchHistory = (limit: number) => {
   const svc = buildService();
@@ -93,6 +111,12 @@ const availability = (body: unknown): Response => Response.json(body);
 /** An Availability API 200 carrying `text` verbatim. */
 const availabilityText = (text: string): Response =>
   new Response(text, { headers: { 'content-type': 'text/html' } });
+
+/** An Availability API 200 whose own lookup timed out, as the API sends it. */
+const AVAILABILITY_TIMED_OUT = {
+  archived_snapshots: {},
+  error: { code: 'timeout', message: 'client timeout at 5.0 seconds' },
+};
 
 /** A CDX body the service reads as text. */
 const cdxText = (text: string): Response => ({ text: async () => text }) as Response;
@@ -324,17 +348,18 @@ describe('WaybackService exact collapsed continuation', () => {
   });
 
   it.each([JsonRpcErrorCode.ServiceUnavailable, JsonRpcErrorCode.Timeout])(
-    'uses one deadline and original-limit fallback after storage error %s',
+    'runs the lookahead and the original-limit fallback after storage error %s under one call deadline',
     async (code) => {
-      const deadline = new AbortController();
-      const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal);
+      vi.useFakeTimers();
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
       const ctx = createMockContext();
       vi.spyOn(ctx.state, 'set').mockRejectedValue(new McpError(code, 'store unavailable'));
+      fetchWithTimeout.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 40_000);
+        return cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]);
+      });
       fetchWithTimeout.mockResolvedValueOnce(
-        cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
-      );
-      fetchWithTimeout.mockImplementationOnce(() =>
-        Promise.resolve(cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]])),
+        cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]]),
       );
       try {
         const result = await buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx);
@@ -344,18 +369,39 @@ describe('WaybackService exact collapsed continuation', () => {
           requestedUrl(0).searchParams.get('limit'),
           requestedUrl(1).searchParams.get('limit'),
         ]).toEqual(['2', '1']);
-        expect(ctx.signal.aborted).toBe(false);
-        expect(timeout).toHaveBeenCalledWith(45_000);
-        expect(fetchWithTimeout.mock.calls[0]![3].signal).toBe(
-          fetchWithTimeout.mock.calls[1]![3].signal,
-        );
-        deadline.abort();
-        expect(fetchWithTimeout.mock.calls[1]![3].signal.aborted).toBe(true);
+        // The fallback gets what the lookahead left of the 55 s call deadline.
+        expect(fetchWithTimeout.mock.calls.map((c) => c[1])).toEqual([30_000, 15_000]);
+        expect(timeout).not.toHaveBeenCalled();
+        for (const call of fetchWithTimeout.mock.calls) expect(call[3].signal).toBe(ctx.signal);
       } finally {
         timeout.mockRestore();
       }
     },
   );
+
+  it('fails the storage fallback as cdx_unavailable naming the deadline when the lookahead spent it', async () => {
+    vi.useFakeTimers();
+    const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+    vi.spyOn(ctx.state, 'set').mockRejectedValue(
+      new McpError(JsonRpcErrorCode.ServiceUnavailable, 'store unavailable'),
+    );
+    fetchWithTimeout.mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 55_000);
+      return cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]);
+    });
+
+    await expect(
+      buildService().fetchHistory({ url: 'example.com', limit: 1 }, ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'CDX API did not finish within the 55 s call deadline.',
+      data: {
+        reason: 'cdx_unavailable',
+        recovery: { hint: declaredRecovery(iaFindSnapshots.errors, 'cdx_unavailable') },
+      },
+    });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
 
   it.each(Array.from({ length: 14 }, (_, i) => i + 1))(
     'uses lookahead for precision %i, without leaking equal-timestamp/trailer rows',
@@ -1211,6 +1257,7 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
     ['a 425', async () => Promise.reject(await upstreamError(425))],
     ['an HTML page', async () => availabilityText('<html><body>Temporarily Offline</body></html>')],
     ['unparseable JSON', async () => availabilityText('{"url": "example.com", "archived_snap')],
+    ['an error in place of a capture', async () => availability(AVAILABILITY_TIMED_OUT)],
   ];
 
   it.each(failedAnswers)(
@@ -1226,6 +1273,61 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
       expect(cdx.searchParams.get('closest')).toBe('20200101');
     },
   );
+
+  describe('an Availability answer carrying an error in place of a capture', () => {
+    it.each([
+      [AVAILABILITY_TIMED_OUT, ' (its own lookup timed out)'],
+      [{ archived_snapshots: {}, error: 'overloaded' }, ''],
+    ])(
+      'is a failed answer: availability_unavailable when the CDX fallback fails too (%j)',
+      async (body, why) => {
+        fetchWithTimeout
+          .mockResolvedValueOnce(availability(body))
+          .mockRejectedValueOnce(await upstreamError(503));
+
+        await expect(lookup()).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: `The closest-capture lookup for example.com near 20200101 did not complete: Availability API answered with an error${why} in place of a capture. The CDX closest-capture check it fell back to did not complete either: CDX API returned HTTP 503.`,
+          data: {
+            reason: 'availability_unavailable',
+            recovery: { hint: expect.stringMatching(/^Retry later, or list nearby captures/) },
+          },
+        });
+        expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it('falls back at once, without the retries a 5xx gets', async () => {
+      retryMode.real = true;
+      vi.useFakeTimers();
+      const start = Date.now();
+      fetchWithTimeout
+        .mockResolvedValueOnce(availability(AVAILABILITY_TIMED_OUT))
+        .mockResolvedValueOnce(CDX_CAPTURE());
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+      expect(Date.now() - start).toBe(0);
+    });
+
+    it('keeps a usable capture the same answer names', async () => {
+      fetchWithTimeout.mockResolvedValueOnce(
+        availability({
+          ...AVAILABILITY_TIMED_OUT,
+          archived_snapshots: {
+            closest: {
+              url: 'http://web.archive.org/web/20200101231916/https://example.com/',
+              timestamp: '20200101231916',
+              status: '200',
+            },
+          },
+        }),
+      );
+
+      await expect(lookup()).resolves.toEqual(RESOLVED);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    });
+  });
 
   it.each([
     ['ia_find_snapshots', iaFindSnapshots.errors],
@@ -1320,6 +1422,21 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
     });
   });
 
+  it('points a lookup with no timestamp at history mode from a recent year, oldest first', async () => {
+    fetchWithTimeout
+      .mockRejectedValueOnce(await upstreamError(503))
+      .mockRejectedValueOnce(await upstreamError(503));
+    const ctx = createMockContext({ errors: findErrors });
+
+    const err = (await buildService()
+      .findClosest('example.com', undefined, ctx)
+      .catch((e: unknown) => e)) as McpError;
+
+    expect(err.data?.recovery).toMatchObject({
+      hint: 'Retry later, or list captures with ia_find_snapshots in history mode and status_filter "200", from a recent year (rows run oldest first; pass an earlier year when none are listed), then read one with ia_get_snapshot and its exact 14-digit timestamp, which needs no lookup.',
+    });
+  });
+
   it('keeps a 5xx Retry-After when neither source was rate-limited', async () => {
     fetchWithTimeout
       .mockRejectedValueOnce(await upstreamError(503, { 'retry-after': '120' }))
@@ -1400,7 +1517,7 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
     expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
   });
 
-  describe('under one deadline: the request timeout plus 25 s', () => {
+  describe('under the call deadline: 55 s, or the request timeout when longer', () => {
     it('gives the CDX attempt what remains of it when less than 25 s does', async () => {
       vi.useFakeTimers();
       fetchWithTimeout
@@ -1426,7 +1543,7 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
       expect(err).toMatchObject({
         code: JsonRpcErrorCode.ServiceUnavailable,
         message:
-          'The closest-capture lookup for example.com near 20200101 did not complete: Availability API returned HTTP 429 (rate limited). No time remained for the CDX closest-capture check within the 55 s lookup deadline.',
+          'The closest-capture lookup for example.com near 20200101 did not complete: Availability API returned HTTP 429 (rate limited). No time remained for the CDX closest-capture check within the 55 s call deadline.',
         data: {
           reason: 'availability_unavailable',
           status: 429,
@@ -1448,7 +1565,7 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
       await expect(lookup()).rejects.toMatchObject({
         code: JsonRpcErrorCode.ServiceUnavailable,
         message:
-          'The Availability API found no capture of example.com near 20200101, and no time remained for the CDX closest-capture check within the 55 s lookup deadline.',
+          'The Availability API found no capture of example.com near 20200101, and no time remained for the CDX closest-capture check within the 55 s call deadline.',
         data: { reason: 'cdx_unavailable', recovery: { hint: FALLBACK_INCOMPLETE.hint } },
       });
       expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
@@ -1535,6 +1652,40 @@ describe('WaybackService.findClosest falls back to CDX when the Availability API
 
       await expect(lookup()).resolves.toEqual(RESOLVED);
       expect(fetchWithTimeout.mock.calls.map((c) => c[1])).toEqual([30_000, 200]);
+    });
+
+    it('reports an Availability refusal that completed as the deadline ran out as the refusal, never falling back', async () => {
+      retryMode.real = true;
+      vi.useFakeTimers();
+      const start = Date.now();
+      const refusal = await upstreamError(400);
+      // An attempt that ignores its signal and answers the 400 as the deadline fires.
+      fetchWithTimeout.mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            setTimeout(() => reject(refusal), 55_000);
+          }),
+      );
+
+      const pending = lookup().catch((e: unknown) => e);
+      await vi.runAllTimersAsync();
+      const err = (await pending) as McpError;
+
+      expect(Date.now() - start).toBe(55_000);
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: 'Availability API returned HTTP 400.',
+        data: {
+          reason: 'availability_unavailable',
+          status: 400,
+          retryable: false,
+          recovery: {
+            hint: 'The Availability API refused this request with HTTP 400, so repeating it unchanged will not help; check url and timestamp.',
+          },
+        },
+      });
+      expect(err.message).not.toMatch(/call deadline/);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
     });
 
     it('bounds the CDX attempt by a request timeout shorter than 25 s', async () => {

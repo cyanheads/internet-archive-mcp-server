@@ -3,10 +3,13 @@
  * @module tests/tools/ia-get-snapshot.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
+import { cpuMsPerCall } from '../helpers/cpu-time.js';
 
 vi.mock('@/services/wayback/wayback-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/wayback/wayback-service.js')>()),
@@ -30,6 +33,9 @@ const mockService = {
   fetchContent: vi.fn(),
   buildReplayUrl: vi.fn(),
 };
+
+/** The call deadline the handler starts and passes on: 55 s at the 30 s request timeout. */
+const CALL_DEADLINE = expect.objectContaining({ budgetSeconds: 55, requestTimeoutMs: 30_000 });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -87,7 +93,12 @@ describe('iaGetSnapshot', () => {
     });
     const result = await iaGetSnapshot.handler(input, ctx);
 
-    expect(mockService.findClosest).toHaveBeenCalledWith('https://example.com', '20200101', ctx);
+    expect(mockService.findClosest).toHaveBeenCalledWith(
+      'https://example.com',
+      '20200101',
+      ctx,
+      CALL_DEADLINE,
+    );
     expect(mockService.buildReplayUrl).not.toHaveBeenCalled();
     expect(result.resolved_timestamp).toBe('20200101120000');
     expect(result.resolved_status).toBe('200');
@@ -109,7 +120,12 @@ describe('iaGetSnapshot', () => {
     });
     await iaGetSnapshot.handler(input, ctx);
 
-    expect(mockService.findClosest).toHaveBeenCalledWith('https://example.com', '20200101', ctx);
+    expect(mockService.findClosest).toHaveBeenCalledWith(
+      'https://example.com',
+      '20200101',
+      ctx,
+      CALL_DEADLINE,
+    );
   });
 
   it('throws no_snapshot_available when Availability API returns no closest capture', async () => {
@@ -523,6 +539,105 @@ describe('iaGetSnapshot', () => {
     ).rejects.toBe(cancelled);
   });
 
+  describe('the call deadline (#55)', () => {
+    it('starts one deadline and passes that same one to the lookup and the page fetch', async () => {
+      const replayUrl = 'https://web.archive.org/web/20200101120000/https://example.com';
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: replayUrl,
+        timestamp: '20200101120000',
+        status: '200',
+      });
+      mockService.fetchContent.mockResolvedValue({ text: 'page', replayUrl, status: '200' });
+
+      await runToolContract(iaGetSnapshot, { url: 'https://example.com', timestamp: '20200101' });
+
+      expect(mockService.fetchContent).toHaveBeenCalledWith(
+        replayUrl,
+        expect.anything(),
+        CALL_DEADLINE,
+      );
+      expect(mockService.fetchContent.mock.calls[0]?.[2]).toBe(
+        mockService.findClosest.mock.calls[0]?.[3],
+      );
+    });
+
+    it('passes the deadline to the page fetch of an exact timestamp, which needs no lookup', async () => {
+      const replayUrl = 'https://web.archive.org/web/20200101120000/https://example.com';
+      mockService.buildReplayUrl.mockReturnValue(replayUrl);
+      mockService.fetchContent.mockResolvedValue({ text: 'page', replayUrl, status: '200' });
+
+      await runToolContract(iaGetSnapshot, {
+        url: 'https://example.com',
+        timestamp: '20200101120000',
+      });
+
+      expect(mockService.fetchContent).toHaveBeenCalledWith(
+        replayUrl,
+        expect.anything(),
+        CALL_DEADLINE,
+      );
+    });
+
+    it('answers a page fetch the deadline cut as content_fetch_failed with its message, on both surfaces', async () => {
+      const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+      mockService.buildReplayUrl.mockReturnValue(
+        'https://web.archive.org/web/20200101120000/https://example.com',
+      );
+      // Shaped as the service's transportError throws it for the replay: no reason, no `retryable`.
+      mockService.fetchContent.mockRejectedValue(
+        serviceUnavailable('Wayback Machine did not finish within the 55 s call deadline.'),
+      );
+
+      const result = await runToolContract(iaGetSnapshot, {
+        url: 'example.com',
+        timestamp: '20200101120000',
+      });
+
+      const message =
+        'Could not fetch the archived page for example.com near 20200101120000: Wayback Machine did not finish within the 55 s call deadline.';
+      const recovery = iaGetSnapshot.errors?.find((e) => e.reason === 'content_fetch_failed')
+        ?.recovery as string;
+      const { error } = result.structuredContent as { error: { data: object } };
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message,
+        data: { reason: 'content_fetch_failed', recovery: { hint: recovery } },
+      });
+      expect(error.data).not.toHaveProperty('retryable');
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(`Error: ${message}`);
+      expect(text).toContain(`Recovery: ${recovery}`);
+      expect(text).not.toContain('not retryable');
+    });
+
+    it('binds the deadline to the caller’s signal, so once the caller cancels it neither refuses a request nor claims a failure', async () => {
+      vi.useFakeTimers();
+      try {
+        const replayUrl = 'https://web.archive.org/web/20200101120000/https://example.com';
+        mockService.buildReplayUrl.mockReturnValue(replayUrl);
+        mockService.fetchContent.mockResolvedValue({ text: 'page', replayUrl, status: '200' });
+        const caller = new AbortController();
+
+        await runToolContract(
+          iaGetSnapshot,
+          { url: 'https://example.com', timestamp: '20200101120000' },
+          { context: { signal: caller.signal } },
+        );
+        const deadline = mockService.fetchContent.mock.calls[0]?.[2] as CallDeadline;
+        const expiry = timeout('Deadline exceeded.', { reason: 'retry_deadline_exceeded' });
+        vi.advanceTimersByTime(55_000);
+
+        expect(() => deadline.assertTimeLeft()).toThrow(/call deadline ran out/);
+        expect(deadline.isExpiry(expiry)).toBe(true);
+        caller.abort();
+        expect(() => deadline.assertTimeLeft()).not.toThrow();
+        expect(deadline.isExpiry(expiry)).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe('blank inputs', () => {
     it.each([
       ['empty', ''],
@@ -584,6 +699,7 @@ describe('iaGetSnapshot', () => {
           'https://example.com',
           undefined,
           expect.anything(),
+          CALL_DEADLINE,
         );
       },
     );
@@ -616,6 +732,208 @@ describe('iaGetSnapshot', () => {
         message: 'No capture found at example.com for timestamp 20260101000000.',
         data: { reason: 'no_snapshot_available' },
       });
+    });
+  });
+
+  describe('a Wayback capture URL as url (#59)', () => {
+    const ORIGINAL = 'https://digital.ucd.ie/';
+    const CAPTURE = `https://web.archive.org/web/20241231012939/${ORIGINAL}`;
+    const serveCapture = (timestamp = '20241231012939') => {
+      const replayUrl = `https://web.archive.org/web/${timestamp}/${ORIGINAL}`;
+      mockService.buildReplayUrl.mockReturnValue(replayUrl);
+      mockService.fetchContent.mockResolvedValue({
+        text: 'UCD',
+        replayUrl,
+        timestamp,
+        status: '200',
+      });
+    };
+    const errorOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.structuredContent as { error: unknown }).error;
+    const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+    it.each([
+      ['blank', ''],
+      ['its own digits', '20241231012939'],
+      ['its own digits as an ISO date-time', '2024-12-31T01:29:39Z'],
+    ])(
+      'reads the capture it names, by its original URL, for a timestamp %s',
+      async (_label, timestamp) => {
+        serveCapture();
+
+        const result = await runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp });
+
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          text: 'UCD',
+          resolved_timestamp: '20241231012939',
+        });
+        expect(mockService.buildReplayUrl).toHaveBeenCalledWith('20241231012939', ORIGINAL);
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+      },
+    );
+
+    it('resolves a capture URL’s shorter timestamp through the closest lookup on the original', async () => {
+      const replayUrl = `https://web.archive.org/web/20250101010646/${ORIGINAL}`;
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: replayUrl,
+        timestamp: '20250101010646',
+        status: '200',
+      });
+      mockService.fetchContent.mockResolvedValue({ text: 'UCD', replayUrl, status: '200' });
+
+      await runToolContract(iaGetSnapshot, {
+        url: `https://web.archive.org/web/2024/${ORIGINAL}`,
+        timestamp: '',
+      });
+
+      expect(mockService.findClosest).toHaveBeenCalledWith(
+        ORIGINAL,
+        '2024',
+        expect.anything(),
+        CALL_DEADLINE,
+      );
+    });
+
+    it.each([
+      ['a prefix of the URL’s timestamp', CAPTURE, '2024'],
+      ['another capture', CAPTURE, '20250101000000'],
+      [
+        'a capture inside the URL’s period',
+        `https://web.archive.org/web/2024/${ORIGINAL}`,
+        '20241231012939',
+      ],
+    ])(
+      'fails a timestamp naming %s as ambiguous_timestamp on both surfaces, before any request',
+      async (_label, url, timestamp) => {
+        const result = await runToolContract(iaGetSnapshot, { url, timestamp });
+
+        const recovery = iaGetSnapshot.errors?.find(
+          (e) => e.reason === 'ambiguous_timestamp',
+        )?.recovery;
+        expect(recovery).toBeDefined();
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining(ORIGINAL),
+          data: { reason: 'ambiguous_timestamp', recovery: { hint: recovery } },
+        });
+        const text = textOf(result);
+        expect(text).toContain(`Recovery: ${recovery}`);
+        expect(text).toContain('(reason ambiguous_timestamp');
+        expect(mockService.buildReplayUrl).not.toHaveBeenCalled();
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+        expect(mockService.fetchContent).not.toHaveBeenCalled();
+      },
+    );
+
+    it('fails a capture URL’s impossible timestamp as invalid_timestamp naming url and that timestamp, before any request', async () => {
+      const result = await runToolContract(iaGetSnapshot, {
+        url: `https://web.archive.org/web/20241399/${ORIGINAL}`,
+        timestamp: '',
+      });
+
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining('20241399'),
+        data: {
+          reason: 'invalid_timestamp',
+          field: 'url',
+          recovery: { hint: expect.stringContaining('/web/') },
+        },
+      });
+      const text = textOf(result);
+      expect(text).toContain('20241399');
+      expect(text).toMatch(/^Recovery: .*\/web\//m);
+      expect(mockService.findClosest).not.toHaveBeenCalled();
+      expect(mockService.fetchContent).not.toHaveBeenCalled();
+    });
+
+    it('names the original URL when the capture it names cannot be read', async () => {
+      const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+      mockService.buildReplayUrl.mockReturnValue(CAPTURE);
+      mockService.fetchContent.mockRejectedValue(notFound('Not found.'));
+
+      const result = await runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp: '' });
+
+      expect(errorOf(result)).toMatchObject({
+        message: `No capture found at ${ORIGINAL} for timestamp 20241231012939.`,
+        data: { reason: 'no_snapshot_available' },
+      });
+    });
+
+    it('names the original URL, never the capture URL, when the capture it names cannot be fetched', async () => {
+      const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+      mockService.buildReplayUrl.mockReturnValue(CAPTURE);
+      // The replay answered 503 on every attempt, as the service reports it once retries are spent.
+      mockService.fetchContent.mockRejectedValue(
+        serviceUnavailable('Wayback Machine returned HTTP 503. (failed after 4 attempts)', {
+          status: 503,
+          retryAttempts: 4,
+        }),
+      );
+
+      const result = await runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp: '' });
+
+      const message = `Could not fetch the archived page for ${ORIGINAL} near 20241231012939: Wayback Machine returned HTTP 503. (failed after 4 attempts)`;
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message,
+        data: { reason: 'content_fetch_failed' },
+      });
+      expect(textOf(result)).toContain(`Error: ${message}`);
+    });
+
+    it('names the original URL in the next-page notice, which then reads the next page', async () => {
+      const PAGE_URL = 'https://en.wikipedia.org/wiki/World_War_II';
+      const served = `https://web.archive.org/web/20200101030925/${PAGE_URL}`;
+      mockService.buildReplayUrl.mockReturnValue(served);
+      mockService.fetchContent.mockResolvedValue({
+        text: 'x'.repeat(60_000),
+        replayUrl: served,
+        timestamp: '20200101030925',
+        status: '200',
+      });
+
+      const first = await runToolContract(iaGetSnapshot, {
+        url: `https://web.archive.org/web/20200101030000/${PAGE_URL}`,
+        timestamp: '',
+      });
+      const notice = (first.structuredContent as { notice?: string }).notice;
+      expect(notice).toBe(
+        `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030925 (resolved_timestamp), and char_offset 50000 for the next page.`,
+      );
+
+      const next = await runToolContract(iaGetSnapshot, {
+        url: PAGE_URL,
+        timestamp: '20200101030925',
+        char_offset: 50_000,
+      });
+      expect(next.isError).toBeFalsy();
+      expect(next.structuredContent).toMatchObject({ char_offset: 50_000, has_more: false });
+    });
+  });
+
+  describe('Wayback URLs that name no single capture', () => {
+    it('looks up a timegate URL itself, unchanged', async () => {
+      const url = 'https://web.archive.org/web/https://digital.ucd.ie/';
+      const replayUrl = `https://web.archive.org/web/20200101000000/${url}`;
+      mockService.findClosest.mockResolvedValue({
+        snapshotUrl: replayUrl,
+        timestamp: '20200101000000',
+        status: '200',
+      });
+      mockService.fetchContent.mockResolvedValue({ text: 'page', replayUrl, status: '200' });
+
+      const result = await runToolContract(iaGetSnapshot, { url, timestamp: '20200101' });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.findClosest).toHaveBeenCalledWith(
+        url,
+        '20200101',
+        expect.anything(),
+        CALL_DEADLINE,
+      );
     });
   });
 
@@ -656,6 +974,7 @@ describe('iaGetSnapshot', () => {
         'https://www.nasa.gov/',
         '20200615',
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
 
@@ -854,7 +1173,7 @@ describe('iaGetSnapshot', () => {
 
       expect(page.max_chars).toBe(50_000);
       expect(page.notice).toBe(
-        'More text follows: call ia_get_snapshot again with the same url, timestamp 20200101030920 (resolved_timestamp), and char_offset 50000 for the next page.',
+        `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030920 (resolved_timestamp), and char_offset 50000 for the next page.`,
       );
     });
 
@@ -875,11 +1194,26 @@ describe('iaGetSnapshot', () => {
       const { page, content } = await read({ timestamp: '20200101030000', char_offset: 50_000 });
 
       expect(page.notice).toBe(
-        'More text follows: call ia_get_snapshot again with the same url, timestamp 20200101030925 (resolved_timestamp), and char_offset 100000 for the next page.',
+        `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030925 (resolved_timestamp), and char_offset 100000 for the next page.`,
+      );
+      expect(content).toContain(
+        `> More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030925`,
       );
       expect(content).toContain(
         '**Offset:** 50,000 | **Max Chars:** 50,000 | **Total Chars:** 177,671 — more follows (next offset: 100,000)',
       );
+    });
+
+    it('names a url holding a backtick in a code span that reads back as exactly that url, on both surfaces', async () => {
+      serve();
+
+      const { page, content } = await read({ url: 'https://example.com/a`b' });
+
+      // CommonMark: a span opened by two backticks ends at the next run of exactly two, so the one inside stays literal.
+      const notice =
+        'More text follows: call ia_get_snapshot again with url ``https://example.com/a`b``, timestamp 20200101030920 (resolved_timestamp), and char_offset 50000 for the next page.';
+      expect(page.notice).toBe(notice);
+      expect(content).toContain(`> ${notice}`);
     });
 
     it('pages by UTF-16 code units, as ia_get_text does, so split surrogate pairs rejoin', async () => {
@@ -944,5 +1278,52 @@ describe('iaGetSnapshot', () => {
       );
       expect(text).toContain(output.text);
     });
+  });
+
+  describe('next-page notice url code span in linear time', () => {
+    const fill = (unit: string, n: number): string =>
+      unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+
+    /** Worst cases for sizing a code span's delimiters: backtick runs, edge spaces, and line breaks. */
+    const WORST_CASES: [name: string, build: (n: number) => string][] = [
+      ['one backtick run', (n) => fill('`', n)],
+      ['alternating backticks', (n) => fill('a`', n)],
+      ['spaces at both ends', (n) => ` ${fill('a', n - 2)} `],
+      ['a long URL', (n) => `https://example.com/${fill('a/', n - 20)}`],
+      ['one long line ending in a break', (n) => `${fill('§1 x', n - 2)}\ny`],
+      ['breaks throughout', (n) => fill('  \r\n', n)],
+    ];
+
+    /** Smallest input; each larger size doubles it, up to 64× at 320k. */
+    const BASE = 5_000;
+    const LARGEST = 320_000;
+
+    /** CPU ceiling per call: 0.5 µs per character, about 35× the slowest shape measured (4.5 ms at 320k). */
+    const MAX_CPU_MS_PER_CHAR = 0.0005;
+
+    it.each(WORST_CASES)(
+      'wraps %s in linear time',
+      async (_name, build) => {
+        const span = (url: string) => () => markdown().inlineCode(url).build();
+        const base = span(build(BASE));
+        for (let n = BASE * 2; n <= LARGEST; n *= 2) {
+          const large = span(build(n));
+          let growth = Number.POSITIVE_INFINITY;
+          for (let round = 0; round < 3; round++) {
+            const tBase = await cpuMsPerCall(base);
+            const tLarge = await cpuMsPerCall(large);
+            expect(tLarge, `${tLarge.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(
+              n * MAX_CPU_MS_PER_CHAR,
+            );
+            growth = Math.min(growth, tLarge / tBase);
+          }
+          // Linear work grows ×(n / BASE); the bound leaves it 4× headroom, 256 at the full span.
+          expect(growth, `×${growth.toFixed(1)} from ${BASE} to ${n} characters`).toBeLessThan(
+            4 * (n / BASE),
+          );
+        }
+      },
+      0,
+    );
   });
 });

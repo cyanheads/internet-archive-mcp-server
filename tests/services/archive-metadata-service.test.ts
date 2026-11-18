@@ -21,7 +21,8 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   return {
     ...actual,
     fetchWithTimeout: (...args: Parameters<typeof fetchWithTimeout>) => fetchWithTimeout(...args),
-    withRetry: <T>(fn: () => Promise<T>): Promise<T> => fn(),
+    withRetry: <T>(fn: (attempt: { signal: AbortSignal }) => Promise<T>): Promise<T> =>
+      fn({ signal: new AbortController().signal }),
   };
 });
 
@@ -29,6 +30,10 @@ import { iaItemResource } from '@/mcp-server/resources/definitions/ia-item.resou
 import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
 import { iaGetText } from '@/mcp-server/tools/definitions/ia-get-text.tool.js';
 import { ArchiveMetadataService } from '@/services/archive-metadata/archive-metadata-service.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
+
+/** A call deadline at the default request timeout, started now. */
+const deadline = () => startCallDeadline(new AbortController().signal);
 
 /** Metadata API response for an item with one readable text file. */
 const metadataResponse = {
@@ -58,7 +63,7 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
 
     const svc = buildService();
     const ctx = createMockContext({ errors: iaGetText.errors });
-    await svc.getTextContent('restricted-item', 100, 0, ctx).catch(() => undefined);
+    await svc.getTextContent('restricted-item', 100, 0, ctx, deadline()).catch(() => undefined);
 
     expect(fetchWithTimeout).toHaveBeenCalledWith(
       expect.stringContaining('https://archive.org/download/restricted-item'),
@@ -74,7 +79,9 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
     const svc = buildService();
     const ctx = createMockContext({ errors: iaGetText.errors });
 
-    await expect(svc.getTextContent('restricted-item', 100, 0, ctx)).rejects.toMatchObject({
+    await expect(
+      svc.getTextContent('restricted-item', 100, 0, ctx, deadline()),
+    ).rejects.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
       data: {
         reason: 'download_forbidden',
@@ -93,7 +100,7 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
     const svc = buildService();
     const ctx = createMockContext({ errors: iaGetText.errors });
 
-    await expect(svc.getTextContent('login-item', 100, 0, ctx)).rejects.toMatchObject({
+    await expect(svc.getTextContent('login-item', 100, 0, ctx, deadline())).rejects.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
       data: {
         reason: 'download_forbidden',
@@ -112,10 +119,12 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
     const svc = buildService();
     const ctx = createMockContext({ errors: iaGetText.errors });
 
-    await expect(svc.getTextContent('gone-item', 100, 0, ctx)).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBe(upstream);
-      return true;
-    });
+    await expect(svc.getTextContent('gone-item', 100, 0, ctx, deadline())).rejects.toSatisfy(
+      (err: unknown) => {
+        expect(err).toBe(upstream);
+        return true;
+      },
+    );
   });
 });
 
@@ -142,7 +151,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       }),
     );
 
-    const item = await buildService().getItem('multi-lang', createMockContext());
+    const item = await buildService().getItem('multi-lang', createMockContext(), deadline());
 
     expect(item.metadata.language).toEqual(['German', 'English', 'French']);
   });
@@ -152,7 +161,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       jsonBody({ metadata: { title: 'Pride and prejudice', language: 'eng' }, files: [] }),
     );
 
-    const item = await buildService().getItem('one-lang', createMockContext());
+    const item = await buildService().getItem('one-lang', createMockContext(), deadline());
 
     expect(item.metadata.language).toBe('eng');
   });
@@ -165,7 +174,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       }),
     );
 
-    const item = await buildService().getItem('00hamigoog', createMockContext());
+    const item = await buildService().getItem('00hamigoog', createMockContext(), deadline());
 
     expect(item.metadata.title).toEqual(['Afganistan ', 'Афганистанъ ']);
     expect(item.metadata.date).toEqual(['6', '7']);
@@ -176,7 +185,11 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       jsonBody({ metadata: { title: 'Pride and prejudice', date: '1894' }, files: [] }),
     );
 
-    const item = await buildService().getItem('prideprejudice00aust', createMockContext());
+    const item = await buildService().getItem(
+      'prideprejudice00aust',
+      createMockContext(),
+      deadline(),
+    );
 
     expect(item.metadata.title).toBe('Pride and prejudice');
     expect(item.metadata.date).toBe('1894');
@@ -196,6 +209,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
     const item = await buildService().getItem(
       'elmo-612-r-1018-r-users-manual-j',
       createMockContext(),
+      deadline(),
     );
 
     expect(item.metadata.description).toBe(
@@ -213,7 +227,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       }),
     );
 
-    const item = await buildService().getItem('list-desc', createMockContext());
+    const item = await buildService().getItem('list-desc', createMockContext(), deadline());
 
     expect(item.metadata.description).toEqual(['One\ntwo', 'Plain\n\ntext', 'a & b']);
   });
@@ -223,7 +237,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       jsonBody({ metadata: { title: 'x', description: '<div><br /></div>' }, files: [] }),
     );
 
-    const item = await buildService().getItem('empty-desc', createMockContext());
+    const item = await buildService().getItem('empty-desc', createMockContext(), deadline());
 
     expect(item.metadata).not.toHaveProperty('description');
   });
@@ -236,7 +250,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       }),
     );
 
-    const item = await buildService().getItem('sparse-desc', createMockContext());
+    const item = await buildService().getItem('sparse-desc', createMockContext(), deadline());
 
     expect(item.metadata.description).toEqual(['Kept']);
   });
@@ -246,7 +260,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       jsonBody({ metadata: { title: 'x', description: ['<p></p>', '  '] }, files: [] }),
     );
 
-    const item = await buildService().getItem('blank-list-desc', createMockContext());
+    const item = await buildService().getItem('blank-list-desc', createMockContext(), deadline());
 
     expect(item.metadata).not.toHaveProperty('description');
   });
@@ -256,7 +270,7 @@ describe('ArchiveMetadataService.getItem field mapping', () => {
       jsonBody({ metadata: { title: 'A <b>bold</b> &amp; title' }, files: [] }),
     );
 
-    const item = await buildService().getItem('markup-title', createMockContext());
+    const item = await buildService().getItem('markup-title', createMockContext(), deadline());
 
     expect(item.metadata.title).toBe('A <b>bold</b> &amp; title');
   });
@@ -268,7 +282,7 @@ describe('ArchiveMetadataService.getItem catalog and access fields', () => {
   /** getItem over one Metadata API body. */
   const itemFor = async (body: unknown) => {
     fetchWithTimeout.mockResolvedValueOnce(jsonBody(body));
-    return buildService().getItem('an-item', createMockContext());
+    return buildService().getItem('an-item', createMockContext(), deadline());
   };
 
   it('maps publisher, Open Library IDs, and the image count of a texts item', async () => {
@@ -424,7 +438,13 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
     fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: { title: 'Big' }, files }));
     fetchWithTimeout.mockResolvedValueOnce(new Response('Full OCR text.'));
 
-    const result = await buildService().getTextContent('big-item', 100, 0, createMockContext());
+    const result = await buildService().getTextContent(
+      'big-item',
+      100,
+      0,
+      createMockContext(),
+      deadline(),
+    );
 
     expect(result.sourceFile).toBe('big-item_djvu.txt');
     expect(result.text).toBe('Full OCR text.');
@@ -440,7 +460,8 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
   const defaultPick = async (files: { name: string; format?: string }[]) => {
     fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
     fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
-    return (await buildService().getTextContent('an-item', 10, 0, createMockContext())).sourceFile;
+    return (await buildService().getTextContent('an-item', 10, 0, createMockContext(), deadline()))
+      .sourceFile;
   };
 
   const caption = { name: 'film.cc5.txt', format: 'Closed Caption Text' };
@@ -504,6 +525,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
         10,
         0,
         createMockContext({ errors: iaGetText.errors }),
+        deadline(),
       ),
     ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound, data: { reason: 'no_text_file' } });
     expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
@@ -530,6 +552,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
       100,
       0,
       createMockContext({ errors: iaGetText.errors }),
+      deadline(),
       { file },
     );
   };
@@ -605,7 +628,13 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
     fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
     fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
 
-    const result = await buildService().getTextContent('an-item', 10, 0, createMockContext());
+    const result = await buildService().getTextContent(
+      'an-item',
+      10,
+      0,
+      createMockContext(),
+      deadline(),
+    );
 
     expect(result).not.toHaveProperty('textFiles');
   });
@@ -706,7 +735,13 @@ describe('ArchiveMetadataService.getTextContent streamed page read', () => {
     fetchWithTimeout.mockResolvedValueOnce(
       new Response(new Uint8Array([0xef, 0xbb, 0xbf, 0xe2, 0x41, 0x42])),
     );
-    const result = await buildService().getTextContent('a-volume', 1, 1, createMockContext());
+    const result = await buildService().getTextContent(
+      'a-volume',
+      1,
+      1,
+      createMockContext(),
+      deadline(),
+    );
     expect(result.text).toBe('A');
     expect(result.hasMore).toBe(true);
   });
@@ -716,7 +751,13 @@ describe('ArchiveMetadataService.getTextContent streamed page read', () => {
     fetchWithTimeout.mockResolvedValueOnce(
       new Response('abcdef', { headers: { etag: '"stable"' } }),
     );
-    const result = await buildService().getTextContent('a-volume', 2, 0, createMockContext());
+    const result = await buildService().getTextContent(
+      'a-volume',
+      2,
+      0,
+      createMockContext(),
+      deadline(),
+    );
     expect(result).toHaveProperty('nextContinuation', expect.any(String));
   });
 
@@ -737,6 +778,7 @@ describe('ArchiveMetadataService.getTextContent streamed page read', () => {
       maxChars,
       charOffset,
       createMockContext({ errors: iaGetText.errors }),
+      deadline(),
     );
     return { result, stats };
   };
@@ -912,7 +954,7 @@ describe('ArchiveMetadataService.getTextContent streamed page read', () => {
     fetchWithTimeout.mockResolvedValueOnce(new Response(body));
 
     await expect(
-      buildService().getTextContent('a-volume', 100, 0, createMockContext()),
+      buildService().getTextContent('a-volume', 100, 0, createMockContext(), deadline()),
     ).rejects.toBe(stalled);
   });
 
@@ -1007,7 +1049,9 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     let token: string | undefined;
     let offset = 0;
     for (let n = 0; n < expected.length; n++) {
-      const page = await svc.getTextContent('a-volume', 1, 0, ctx, { continuation: token });
+      const page = await svc.getTextContent('a-volume', 1, 0, ctx, deadline(), {
+        continuation: token,
+      });
       expect(page.text, `page ${n}`).toBe(expected.slice(offset, offset + 1));
       expect(page.charOffset).toBe(offset);
       expect(page.hasMore).toBe(offset + 1 < expected.length);
@@ -1037,7 +1081,9 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
       let offset = 0;
       do {
         const count = 1 + Math.floor(random() * 7);
-        const page = await svc.getTextContent('a-volume', count, 0, ctx, { continuation: token });
+        const page = await svc.getTextContent('a-volume', count, 0, ctx, deadline(), {
+          continuation: token,
+        });
         expect(page.text).toBe(expected.slice(offset, offset + count));
         expect(page.hasMore).toBe(offset + count < expected.length);
         offset += count;
@@ -1062,19 +1108,25 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
         };
         tenant.state.set = (key, value, options) => shared.set(key, value, tenant, options);
       }
-      const first = await svc.getTextContent('a-volume', 2, 0, ctx);
+      const first = await svc.getTextContent('a-volume', 2, 0, ctx, deadline());
       const token = first.nextContinuation!;
       const before = fetchWithTimeout.mock.calls.length;
       const resume = { continuation: token };
-      await expect(svc.getTextContent('a-volume', 2, 0, other, resume)).rejects.toMatchObject({
+      await expect(
+        svc.getTextContent('a-volume', 2, 0, other, deadline(), resume),
+      ).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
-      await expect(svc.getTextContent('other-item', 2, 0, ctx, resume)).rejects.toMatchObject({
+      await expect(
+        svc.getTextContent('other-item', 2, 0, ctx, deadline(), resume),
+      ).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
       await vi.advanceTimersByTimeAsync(3_600_001);
       await expect(ctx.state.get(`ia-text/${token}`)).resolves.toBeNull();
-      await expect(svc.getTextContent('a-volume', 2, 0, ctx, resume)).rejects.toMatchObject({
+      await expect(
+        svc.getTextContent('a-volume', 2, 0, ctx, deadline(), resume),
+      ).rejects.toMatchObject({
         data: { reason: 'invalid_continuation' },
       });
       expect(fetchWithTimeout.mock.calls.length).toBe(before);
@@ -1092,7 +1144,7 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     source(new TextEncoder().encode('abcdef'));
     const ctx = createMockContext();
     vi.spyOn(ctx.state, 'set').mockRejectedValue(error);
-    const pending = buildService().getTextContent('a-volume', 2, 0, ctx);
+    const pending = buildService().getTextContent('a-volume', 2, 0, ctx, deadline());
     if (degrades)
       await expect(pending).resolves.toMatchObject({
         text: 'ab',
@@ -1110,7 +1162,7 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     vi.spyOn(ctx.state, 'set').mockImplementation((key, value, options) =>
       storage.set(key, value, ctx, options),
     );
-    const page = await buildService().getTextContent('a-volume', 2, 0, ctx);
+    const page = await buildService().getTextContent('a-volume', 2, 0, ctx, deadline());
     expect(page.text).toBe('ab');
     expect(page.nextContinuation).toBeUndefined();
     expect(page.continuationNotice).toContain('char_offset 2');
@@ -1127,11 +1179,13 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     source(new TextEncoder().encode('abcdef'));
     const ctx = createMockContext();
     const svc = buildService();
-    const first = await svc.getTextContent('a-volume', 2, 0, ctx);
+    const first = await svc.getTextContent('a-volume', 2, 0, ctx, deadline());
     fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
     const before = fetchWithTimeout.mock.calls.length;
     await expect(
-      svc.getTextContent('a-volume', 2, 0, ctx, { continuation: first.nextContinuation }),
+      svc.getTextContent('a-volume', 2, 0, ctx, deadline(), {
+        continuation: first.nextContinuation,
+      }),
     ).rejects.toMatchObject({ data: { reason: 'invalid_continuation', char_offset: 2 } });
     expect(fetchWithTimeout.mock.calls.length).toBe(before + 1);
   });
@@ -1178,10 +1232,14 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     });
     const ctx = createMockContext();
     const svc = buildService();
-    let page = await svc.getTextContent('strabo', 3, 0, ctx, { file: 'Vol 02_djvu.txt' });
+    let page = await svc.getTextContent('strabo', 3, 0, ctx, deadline(), {
+      file: 'Vol 02_djvu.txt',
+    });
     const pages = [page];
     while (page.nextContinuation) {
-      page = await svc.getTextContent('strabo', 3, 0, ctx, { continuation: page.nextContinuation });
+      page = await svc.getTextContent('strabo', 3, 0, ctx, deadline(), {
+        continuation: page.nextContinuation,
+      });
       pages.push(page);
     }
 
@@ -1197,8 +1255,8 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     volumes({ 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' });
     const ctx = createMockContext();
     const svc = buildService();
-    const first = await svc.getTextContent('strabo', 5, 0, ctx);
-    const second = await svc.getTextContent('strabo', 5, 0, ctx, {
+    const first = await svc.getTextContent('strabo', 5, 0, ctx, deadline());
+    const second = await svc.getTextContent('strabo', 5, 0, ctx, deadline(), {
       continuation: first.nextContinuation,
     });
 
@@ -1212,8 +1270,8 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     const ctx = createMockContext();
     const svc = buildService();
     const file = 'Vol 02_djvu.txt';
-    const first = await svc.getTextContent('strabo', 6, 0, ctx, { file });
-    const second = await svc.getTextContent('strabo', 6, 0, ctx, {
+    const first = await svc.getTextContent('strabo', 6, 0, ctx, deadline(), { file });
+    const second = await svc.getTextContent('strabo', 6, 0, ctx, deadline(), {
       continuation: first.nextContinuation,
       file,
     });
@@ -1225,11 +1283,13 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     volumes({ 'Vol 01_djvu.txt': 'first volume', 'Vol 02_djvu.txt': 'second volume' });
     const ctx = createMockContext({ errors: iaGetText.errors });
     const svc = buildService();
-    const first = await svc.getTextContent('strabo', 6, 0, ctx, { file: 'Vol 02_djvu.txt' });
+    const first = await svc.getTextContent('strabo', 6, 0, ctx, deadline(), {
+      file: 'Vol 02_djvu.txt',
+    });
     const before = fetchWithTimeout.mock.calls.length;
 
     await expect(
-      svc.getTextContent('strabo', 6, 0, ctx, {
+      svc.getTextContent('strabo', 6, 0, ctx, deadline(), {
         continuation: first.nextContinuation,
         file: 'Vol 01_djvu.txt',
       }),
@@ -1254,9 +1314,9 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
     );
     const ctx = createMockContext();
     const svc = buildService();
-    const first = await svc.getTextContent('strabo', 6, 0, ctx);
+    const first = await svc.getTextContent('strabo', 6, 0, ctx, deadline());
     listed = ['Vol 01_djvu.txt', 'Vol 02_djvu.txt'];
-    const second = await svc.getTextContent('strabo', 6, 0, ctx, {
+    const second = await svc.getTextContent('strabo', 6, 0, ctx, deadline(), {
       continuation: first.nextContinuation,
     });
 
@@ -1282,7 +1342,7 @@ describe('ArchiveMetadataService service-thrown reasons carry the caller’s rec
       fetchWithTimeout.mockResolvedValueOnce(jsonBody({}));
 
       await expect(
-        buildService().getItem('no-such-item', createMockContext({ errors })),
+        buildService().getItem('no-such-item', createMockContext({ errors }), deadline()),
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         message: 'Item "no-such-item" not found in the Internet Archive.',
@@ -1296,7 +1356,7 @@ describe('ArchiveMetadataService service-thrown reasons carry the caller’s rec
       );
 
       await expect(
-        buildService().getItem('dark-item', createMockContext({ errors })),
+        buildService().getItem('dark-item', createMockContext({ errors }), deadline()),
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         message: 'Item "dark-item" is dark (restricted) in the Internet Archive.',
@@ -1325,6 +1385,7 @@ describe('ArchiveMetadataService service-thrown reasons carry the caller’s rec
         100,
         0,
         createMockContext({ errors: iaGetText.errors }),
+        deadline(),
       ),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,

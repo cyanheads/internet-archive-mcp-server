@@ -61,7 +61,7 @@ describe('upstream Markdown syntax', () => {
     ]);
   });
 
-  it('escapes list titles, catalog fields, and descriptions in item Markdown', () => {
+  it('escapes list titles, catalog fields, and descriptions in item Markdown, one item per list value', () => {
     const item = {
       identifier: 'a',
       title: ['*one*', '[two](x)'],
@@ -72,10 +72,9 @@ describe('upstream Markdown syntax', () => {
       files: [],
     };
     const [block] = iaGetItem.format!(item) as [{ text: string }];
-    expect(block.text).toMatch(/^# \\\*one\\\*, \\\[two\\\]\(x\)\n/);
-    expect(block.text).toContain('**Publisher:** \\<i>Press\\</i>');
-    expect(block.text).toContain('**Volume:** \\*2\\*');
-    expect(block.text).toContain('**Description:** \\# heading\\\n\\- item');
+    expect(block.text).toBe(
+      '# a\n**Title:**\n\n- \\*one\\*\n- \\[two\\](x)\n\n**Identifier:** a\n**Publisher:** \\<i>Press\\</i>\n**Volume:** \\*2\\*\n\n**Description:**\n\n- \\# heading\n- \\- item\n\n**Files (0):**',
+    );
     expect(item.title).toEqual(['*one*', '[two](x)']);
   });
 

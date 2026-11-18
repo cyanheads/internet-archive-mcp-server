@@ -16,7 +16,9 @@ const ServerConfigSchema = z.object({
     .int()
     .positive()
     .default(30_000)
-    .describe('HTTP request timeout in milliseconds.'),
+    .describe(
+      'Timeout for each upstream HTTP request, in milliseconds. A whole tool call or resource read ends within 55 s, or within this timeout when it is longer.',
+    ),
   maxSnapshotChars: z.coerce
     .number()
     .int()

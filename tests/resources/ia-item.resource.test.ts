@@ -3,9 +3,11 @@
  * @module tests/resources/ia-item.resource.test
  */
 
+import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaItemResource } from '@/mcp-server/resources/definitions/ia-item.resource.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
 
 vi.mock('@/services/archive-metadata/archive-metadata-service.js', () => ({
   getArchiveMetadataService: vi.fn(),
@@ -175,6 +177,43 @@ describe('iaItemResource', () => {
 
     await expect(iaItemResource.handler(params, ctx)).rejects.toMatchObject({
       data: { reason: 'item_not_found' },
+    });
+  });
+
+  describe('the call deadline (#55)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("binds the deadline to the reader's signal, so a reader who left past 55 s gets the cancellation", async () => {
+      const caller = new AbortController();
+      const cancelled = requestCancelled(
+        'fetch GET https://archive.org/metadata/pg1342 was aborted.',
+      );
+      /**
+       * The read outlives its deadline and the reader leaves; the service checks the deadline
+       * before its next request, which then fails as the cancellation it is.
+       */
+      mockService.getItem.mockImplementation(
+        (_identifier: string, _ctx: unknown, deadline: CallDeadline) => {
+          vi.advanceTimersByTime(56_000);
+          caller.abort();
+          deadline.assertTimeLeft();
+          return Promise.reject(cancelled);
+        },
+      );
+      const ctx = createMockContext({ errors: iaItemResource.errors, signal: caller.signal });
+
+      await expect(
+        iaItemResource.handler(iaItemResource.params.parse({ identifier: 'pg1342' }), ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: cancelled.message,
+      });
     });
   });
 

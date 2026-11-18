@@ -4,8 +4,9 @@
  * fetchWithTimeout, and the real retry loop, with only the upstream HTTP boundary
  * stubbed. Covers closest resolution (Availability, then CDX), the capture Wayback
  * actually served, charset and text extraction, routing by the replay's media type,
- * snapshot paging, upstream 5xx, timeout, and network-error reasons, archived error
- * captures, and caller cancellation, on both the structuredContent and content[] surfaces.
+ * snapshot paging, upstream 5xx, timeout, and network-error reasons, the one deadline
+ * each call runs under, archived error captures, and caller cancellation, on both the
+ * structuredContent and content[] surfaces.
  * @module tests/integration/wayback-contract.int.test
  */
 
@@ -317,7 +318,7 @@ describe('ia_find_snapshots closest mode', () => {
     expect(calls(isCdx)).toHaveLength(1);
   });
 
-  it('surfaces cdx_unavailable when the CDX fallback outlasts its deadline', async () => {
+  it('surfaces cdx_unavailable when the CDX fallback outlasts its 25 s ceiling', async () => {
     routeAvailability(EMPTY_AVAILABILITY);
     routeCdx(hang);
     vi.useFakeTimers();
@@ -474,7 +475,7 @@ describe('ia_find_snapshots closest mode', () => {
     expect(calls(isCdx)).toHaveLength(1);
   });
 
-  describe('under one deadline: the request timeout plus 25 s (#53)', () => {
+  describe('under the 55 s call deadline (#53, #55)', () => {
     /** Runs the lookup under fake timers to completion, reporting the fake time it took. */
     const runTimed = async () => {
       vi.useFakeTimers();
@@ -496,7 +497,7 @@ describe('ia_find_snapshots closest mode', () => {
         error: {
           code: JsonRpcErrorCode.ServiceUnavailable,
           message:
-            'The closest-capture lookup for nasa.gov near 20200101 did not finish within its 55 s deadline: the Availability API did not answer in time.',
+            'The closest-capture lookup for nasa.gov near 20200101 did not finish within the 55 s call deadline: the Availability API did not answer in time.',
           data: {
             reason: 'availability_unavailable',
             retryAttempts: 2,
@@ -504,7 +505,7 @@ describe('ia_find_snapshots closest mode', () => {
           },
         },
       });
-      expect(contentText(result)).toMatch(/did not finish within its 55 s deadline/);
+      expect(contentText(result)).toMatch(/did not finish within the 55 s call deadline/);
       expect(calls(isAvailability)).toHaveLength(2);
       expect(calls(isCdx)).toHaveLength(0);
     });
@@ -519,18 +520,47 @@ describe('ia_find_snapshots closest mode', () => {
         const { result, elapsedMs } = await runTimed();
 
         expect(elapsedMs).toBe(55_000);
+        const message =
+          'The closest-capture lookup for nasa.gov near 20200101 did not complete: Availability API returned HTTP 503. (failed after 4 attempts) The CDX closest-capture check it fell back to did not finish within the 55 s call deadline.';
         expect(result.structuredContent).toMatchObject({
           error: {
             code: JsonRpcErrorCode.ServiceUnavailable,
-            message: expect.stringMatching(LOOKUP_FAILED_MESSAGE),
+            message,
             data: { reason: 'availability_unavailable', status: 503, retryAttempts: 4 },
           },
         });
+        expect(contentText(result)).toContain(`Error: ${message}`);
         expect(calls(isAvailability)).toHaveLength(4);
         expect(calls(isCdx)).toHaveLength(1);
       } finally {
         random.mockRestore();
       }
+    });
+
+    it('fails as cdx_unavailable naming the deadline when the CDX check after a late empty answer runs out of it', async () => {
+      // A 503 at 29.9 s, then an empty answer at about 40 s: the CDX check gets the ~15 s left.
+      http.route({ match: isAvailability, once: true, respond: answerAfter(29_900, UNAVAILABLE) });
+      routeAvailability(answerAfter(9_100, EMPTY_AVAILABILITY));
+      routeCdx(hang);
+
+      const { result, elapsedMs } = await runTimed();
+
+      expect(elapsedMs).toBe(55_000);
+      const message =
+        'The Availability API found no capture of nasa.gov near 20200101, and the CDX closest-capture check did not finish within the 55 s call deadline.';
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message,
+          data: {
+            reason: 'cdx_unavailable',
+            recovery: { hint: expect.stringMatching(/^Retry later, or list nearby captures/) },
+          },
+        },
+      });
+      expect(contentText(result)).toContain(`Error: ${message}`);
+      expect(calls(isAvailability)).toHaveLength(2);
+      expect(calls(isCdx)).toHaveLength(1);
     });
 
     it('keeps the 25 s CDX ceiling after a fast 429', async () => {
@@ -565,6 +595,9 @@ describe('ia_find_snapshots history mode', () => {
         data: { reason: 'cdx_unavailable', retryAttempts: 4, recovery: { hint: recovery } },
       },
     });
+    expect((result.structuredContent as { error: { data: object } }).error.data).not.toHaveProperty(
+      'operation',
+    );
     expect(contentText(result)).toContain(`Recovery: ${recovery}`);
     expect(calls(isCdx)).toHaveLength(4);
   });
@@ -1078,7 +1111,9 @@ describe('ia_get_snapshot', () => {
     expect(Date.now() - start).toBe(55_000);
     expect(result.structuredContent).toMatchObject({
       error: {
-        message: expect.stringMatching(/^The closest-capture lookup for nasa\.gov .*55 s deadline/),
+        message: expect.stringMatching(
+          /^The closest-capture lookup for nasa\.gov .*55 s call deadline/,
+        ),
         data: {
           reason: 'content_fetch_failed',
           recovery: { hint: expect.stringMatching(NO_LOOKUP_ROUTE) },
@@ -2003,6 +2038,259 @@ describe('Wayback timeouts and network errors surface under the declared reason'
   });
 });
 
+describe('one call deadline spans every request a Wayback call chains (#55)', () => {
+  /** 100 ms inside the default 30 s request timeout. */
+  const JUST_INSIDE = 29_900;
+
+  /** The `id_` form of a capture, read after the plain replay of a non-HTML text capture. */
+  const isRaw = (r: Request) => /^https:\/\/web\.archive\.org\/web\/\d{14}id_\//.test(r.url);
+  const isPlainReplay = (r: Request) => isReplay(r) && !isRaw(r);
+
+  const CDX_CAPTURE = cdxRows(['20200101000000', 'https://example.com/', '200']);
+
+  /** Answers each request with the next responder, repeating the last. */
+  const inSequence = (...sequence: FetchMockResponder[]): FetchMockResponder => {
+    let n = 0;
+    return (request, ...rest) =>
+      (sequence[Math.min(n++, sequence.length - 1)] as FetchMockResponder)(request, ...rest);
+  };
+
+  const getLookup = (signal?: AbortSignal) =>
+    runToolContract(
+      iaGetSnapshot,
+      { url: 'example.com', timestamp: '2020' },
+      signal && { context: { signal } },
+    );
+  const getExact = (signal?: AbortSignal) =>
+    runToolContract(
+      iaGetSnapshot,
+      { url: 'example.com', timestamp: '20200101000000' },
+      signal && { context: { signal } },
+    );
+  const history = (url = 'example.com', signal?: AbortSignal) =>
+    runToolContract(iaFindSnapshots, { url, mode: 'history' }, signal && { context: { signal } });
+
+  const errorOf = (result: ToolResult) =>
+    (
+      result.structuredContent as {
+        error: { code: number; message: string; data?: Record<string, unknown> };
+      }
+    ).error;
+
+  /** Runs a call to completion on the fake clock, reporting the fake time it took. */
+  const runTimed = async (run: () => Promise<ToolResult>) => {
+    const start = Date.now();
+    const pending = run();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    return { result, elapsedMs: Date.now() - start };
+  };
+
+  /** The declared `reason`, its message naming the deadline, on both surfaces and still retryable. */
+  const expectDeadline = (
+    result: ToolResult,
+    errors: readonly { reason: string; recovery: string }[] | undefined,
+    reason: string,
+    message: string,
+  ) => {
+    const recovery = hint(errors, reason);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message,
+      data: { reason, recovery: { hint: recovery } },
+    });
+    expect(errorOf(result).data).not.toHaveProperty('retryable');
+    const text = contentText(result);
+    expect(text).toContain(`Error: ${message}`);
+    expect(text).toContain(`Recovery: ${recovery}`);
+    expect(text).not.toMatch(/timed out after|not retryable/);
+  };
+
+  const REPLAY_EXPIRED = (near: string, budgetSeconds = 55) =>
+    `Could not fetch the archived page for example.com near ${near}: Wayback Machine did not finish within the ${budgetSeconds} s call deadline.`;
+  const CDX_EXPIRED = 'CDX API did not finish within the 55 s call deadline.';
+
+  let random: ReturnType<typeof vi.spyOn>;
+  let abortTimeout: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // Backoff without jitter: exactly 1 s, 2 s, then 4 s.
+    random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    // AbortSignal.timeout on the fake clock too, so a deadline of a path's own can't hide in real time.
+    abortTimeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+      const controller = new AbortController();
+      setTimeout(
+        () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+        ms,
+      );
+      return controller.signal;
+    });
+  });
+
+  afterEach(() => {
+    random.mockRestore();
+    abortTimeout.mockRestore();
+  });
+
+  it('fails a slow lookup and the replay after it as content_fetch_failed at 55 s', async () => {
+    routeAvailability(answerAfter(JUST_INSIDE, EMPTY_AVAILABILITY));
+    routeCdx(answerAfter(24_900, CDX_CAPTURE));
+    routeReplay(answerAfter(JUST_INSIDE, UNAVAILABLE));
+
+    const { result, elapsedMs } = await runTimed(() => getLookup());
+
+    // The lookup answers at 54.8 s, leaving the replay 0.2 s.
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(result, iaGetSnapshot.errors, 'content_fetch_failed', REPLAY_EXPIRED('2020'));
+    expect(calls(isAvailability)).toHaveLength(1);
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(calls(isReplay)).toHaveLength(1);
+  });
+
+  it('fails the id_ read of a text capture after a slow lookup as content_fetch_failed at 55 s', async () => {
+    routeAvailability(answerAfter(JUST_INSIDE, EMPTY_AVAILABILITY));
+    routeCdx(answerAfter(24_900, CDX_CAPTURE));
+    http.route({
+      match: isPlainReplay,
+      respond: () => new Response('plain text body', { headers: { 'content-type': 'text/plain' } }),
+    });
+    http.route({ match: isRaw, respond: answerAfter(JUST_INSIDE, UNAVAILABLE) });
+
+    const { result, elapsedMs } = await runTimed(() => getLookup());
+
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(result, iaGetSnapshot.errors, 'content_fetch_failed', REPLAY_EXPIRED('2020'));
+    expect(calls(isPlainReplay)).toHaveLength(1);
+    expect(calls(isRaw)).toHaveLength(1);
+  });
+
+  it('fails an exact timestamp whose replay answers 503 just inside the request timeout at 55 s, after two requests', async () => {
+    routeReplay(answerAfter(JUST_INSIDE, UNAVAILABLE));
+
+    const { result, elapsedMs } = await runTimed(() => getExact());
+
+    // The second attempt, sent at 30.9 s, gets the 24.1 s that remain.
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(
+      result,
+      iaGetSnapshot.errors,
+      'content_fetch_failed',
+      REPLAY_EXPIRED('20200101000000'),
+    );
+    expect(calls(isReplay)).toHaveLength(2);
+  });
+
+  it('fails history mode cut mid-request as cdx_unavailable at 55 s, never a bare Timeout', async () => {
+    routeCdx(inSequence(answerAfter(JUST_INSIDE, UNAVAILABLE), hang));
+
+    const { result, elapsedMs } = await runTimed(() => history());
+
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(result, iaFindSnapshots.errors, 'cdx_unavailable', CDX_EXPIRED);
+    expect(calls(isCdx)).toHaveLength(2);
+  });
+
+  it('fails history mode cut mid-backoff as cdx_unavailable at 55 s, never a bare Timeout', async () => {
+    // Attempts end at 26 s and 53 s; the 2 s backoff after the second lands on the deadline.
+    routeCdx(answerAfter(26_000, UNAVAILABLE));
+
+    const { result, elapsedMs } = await runTimed(() => history());
+
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(result, iaFindSnapshots.errors, 'cdx_unavailable', CDX_EXPIRED);
+    expect(calls(isCdx)).toHaveLength(2);
+  });
+
+  it('bounds history mode on its legacy path, a wildcard URL, by the same deadline', async () => {
+    routeCdx(answerAfter(JUST_INSIDE, UNAVAILABLE));
+
+    const { result, elapsedMs } = await runTimed(() => history('example.com/*'));
+
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(result, iaFindSnapshots.errors, 'cdx_unavailable', CDX_EXPIRED);
+    expect(calls(isCdx)).toHaveLength(2);
+  });
+
+  it('lets one request run its whole IA_REQUEST_TIMEOUT_MS of 90 s and still ends the call by 90 s', async () => {
+    const config = getServerConfig();
+    const configured = config.requestTimeoutMs;
+    config.requestTimeoutMs = 90_000;
+    try {
+      routeReplay(answerAfter(89_900, UNAVAILABLE));
+
+      const { result, elapsedMs } = await runTimed(() => getExact());
+
+      // The one request answers at 89.9 s; the 1 s backoff after it would pass the deadline.
+      expect(elapsedMs).toBe(89_900);
+      expectDeadline(
+        result,
+        iaGetSnapshot.errors,
+        'content_fetch_failed',
+        REPLAY_EXPIRED('20200101000000', 90),
+      );
+      expect(calls(isReplay)).toHaveLength(1);
+    } finally {
+      config.requestTimeoutMs = configured;
+    }
+  });
+
+  describe('a caller cancellation stays RequestCancelled, never the deadline', () => {
+    /** Aborts the caller's signal at `atMs` of fake time, reporting when the call settled. */
+    const cancelAt = async (atMs: number, run: (signal: AbortSignal) => Promise<ToolResult>) => {
+      const controller = new AbortController();
+      const start = Date.now();
+      const pending = run(controller.signal);
+      await vi.advanceTimersByTimeAsync(atMs);
+      controller.abort();
+      const result = await pending;
+      return { result, elapsedMs: Date.now() - start };
+    };
+
+    const expectCancelled = (result: ToolResult) => {
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(error.data?.reason).toBeUndefined();
+      expect(error.message).not.toMatch(/deadline|timed out|did not (finish|complete)/);
+      expect(contentText(result)).not.toMatch(/deadline|timed out/);
+    };
+
+    it('mid-request, on an attempt the deadline had cut short', async () => {
+      routeReplay(inSequence(answerAfter(JUST_INSIDE, UNAVAILABLE), hang));
+
+      const { result, elapsedMs } = await cancelAt(40_000, getExact);
+
+      expectCancelled(result);
+      expect(elapsedMs).toBe(40_000);
+      expect(calls(isReplay)).toHaveLength(2);
+    });
+
+    it('mid-backoff', async () => {
+      routeCdx(answerAfter(JUST_INSIDE, UNAVAILABLE));
+
+      const { result, elapsedMs } = await cancelAt(30_400, (signal) =>
+        history('example.com', signal),
+      );
+
+      expectCancelled(result);
+      expect(elapsedMs).toBe(30_400);
+      expect(calls(isCdx)).toHaveLength(1);
+    });
+
+    it('mid-lookup, during the CDX fallback', async () => {
+      routeAvailability(answerAfter(JUST_INSIDE, EMPTY_AVAILABILITY));
+      routeCdx(hang);
+
+      const { result, elapsedMs } = await cancelAt(40_000, getLookup);
+
+      expectCancelled(result);
+      expect(elapsedMs).toBe(40_000);
+      expect(calls(isCdx)).toHaveLength(1);
+      expect(calls(isReplay)).toHaveLength(0);
+    });
+  });
+});
+
 describe('ia_get_snapshot on an archived error capture', () => {
   const recovery = () => hint(iaGetSnapshot.errors, 'no_snapshot_available');
 
@@ -2637,27 +2925,62 @@ describe('input rejected before any Wayback request', () => {
     routeReplay(replay('<html><body>page</body></html>'));
   });
 
-  it.each([
-    ['omitted', {}],
-    ['empty', { timestamp: '' }],
-    ['whitespace-only', { timestamp: '   ' }],
-  ])(
-    'ia_find_snapshots closest mode with the timestamp %s fails as missing_timestamp',
-    async (_label, ts) => {
-      const result = await runToolContract(iaFindSnapshots, {
-        url: 'example.com',
-        mode: 'closest',
-        ...ts,
-      });
+  const CAPTURE = 'https://web.archive.org/web/20200104000551/https://example.com/';
 
-      const recovery = hint(iaFindSnapshots.errors, 'missing_timestamp');
+  it.each([
+    [
+      'ia_find_snapshots closest mode',
+      () => runToolContract(iaFindSnapshots, { url: CAPTURE, mode: 'closest', timestamp: '2020' }),
+      iaFindSnapshots.errors,
+    ],
+    [
+      'ia_get_snapshot',
+      () => runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp: '2020-01-04' }),
+      iaGetSnapshot.errors,
+    ],
+  ])(
+    '%s fails a timestamp naming another than its capture URL’s as ambiguous_timestamp',
+    async (_label, run, errors) => {
+      const result = await run();
+
+      const recovery = hint(errors, 'ambiguous_timestamp');
       expect(result.structuredContent).toMatchObject({
         error: {
-          code: JsonRpcErrorCode.InvalidParams,
-          data: { reason: 'missing_timestamp', recovery: { hint: recovery } },
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining('https://example.com/ at 20200104000551'),
+          data: { reason: 'ambiguous_timestamp', recovery: { hint: recovery } },
         },
       });
       expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  const IMPOSSIBLE = 'https://web.archive.org/web/20241399/https://example.com/';
+
+  it.each([
+    [
+      'ia_find_snapshots closest mode',
+      () => runToolContract(iaFindSnapshots, { url: IMPOSSIBLE, mode: 'closest' }),
+    ],
+    [
+      'ia_find_snapshots history mode',
+      () => runToolContract(iaFindSnapshots, { url: IMPOSSIBLE, mode: 'history' }),
+    ],
+    ['ia_get_snapshot', () => runToolContract(iaGetSnapshot, { url: IMPOSSIBLE, timestamp: '' })],
+  ])(
+    '%s fails a capture URL’s impossible timestamp as invalid_timestamp naming url',
+    async (_label, run) => {
+      const result = await run();
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining('20241399'),
+          data: { reason: 'invalid_timestamp', field: 'url' },
+        },
+      });
+      expect(contentText(result)).toMatch(/^Recovery: .*digits after \/web\//m);
       expect(http.calls).toHaveLength(0);
     },
   );
@@ -2859,5 +3182,236 @@ describe('timestamp forms reach every Wayback endpoint as digits (#48)', () => {
     expect(calls(isAvailability)).toHaveLength(1);
     expect(searchOf(calls(isAvailability)[0]?.request).has('timestamp')).toBe(false);
     expect(calls(isCdx)).toHaveLength(0);
+  });
+});
+
+/** The search parameters a recorded request carried. */
+const searchOf = (request: Request | undefined) => new URL(request?.url ?? '').searchParams;
+
+describe('ia_find_snapshots closest mode with no timestamp reads the latest capture (#60)', () => {
+  const ROBOTS = 'https://www.parliament.uk/robots.txt';
+  const LATEST = `https://web.archive.org/web/20260515165835/${ROBOTS}`;
+  /** Answers only a lookup sent with no timestamp; one carrying a timestamp draws a 500. */
+  const latestOnly = (request: Request) =>
+    searchOf(request).has('timestamp')
+      ? new Response('<html><body>Internal Server Error</body></html>', { status: 500 })
+      : Response.json({
+          archived_snapshots: {
+            closest: {
+              url: `http://web.archive.org/web/20260515165835/${ROBOTS}`,
+              timestamp: '20260515165835',
+              status: '200',
+              available: true,
+            },
+          },
+        });
+
+  it.each([
+    ['omitted', {}],
+    ['empty', { timestamp: '' }],
+    ['whitespace-only', { timestamp: '   ' }],
+  ])(
+    'returns the latest capture for a timestamp %s, asking for it with none, on both surfaces',
+    async (_label, ts) => {
+      routeAvailability(latestOnly);
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: ROBOTS,
+        mode: 'closest',
+        ...ts,
+      });
+
+      expect(result.structuredContent).toEqual({
+        snapshots: [{ timestamp: '20260515165835', replay_url: LATEST, statuscode: '200' }],
+      });
+      const text = contentText(result);
+      expect(text).toContain('## 20260515165835');
+      expect(text).toContain(`**Replay URL:** [${LATEST}](<${LATEST}>)`);
+      expect(calls(isAvailability)).toHaveLength(1);
+      expect(searchOf(calls(isAvailability)[0]?.request).get('url')).toBe(ROBOTS);
+      expect(calls(isCdx)).toHaveLength(0);
+    },
+  );
+
+  it('sends the same lookup ia_get_snapshot sends for a blank timestamp, and finds the capture it reads', async () => {
+    routeAvailability(latestOnly);
+    routeReplay(replay('User-agent: *', LATEST));
+
+    const found = await runToolContract(iaFindSnapshots, { url: ROBOTS, mode: 'closest' });
+    const read = await runToolContract(iaGetSnapshot, { url: ROBOTS, timestamp: '' });
+
+    expect(found.structuredContent).toMatchObject({ snapshots: [{ timestamp: '20260515165835' }] });
+    expect(read.structuredContent).toMatchObject({ resolved_timestamp: '20260515165835' });
+    const [findQuery, getQuery] = calls(isAvailability).map((c) => searchOf(c.request).toString());
+    expect(findQuery).toBe(getQuery);
+  });
+
+  it('fails a URL with no captures at all as no_snapshot_available on both surfaces', async () => {
+    routeAvailability(EMPTY_AVAILABILITY);
+    routeCdx(cdxRows());
+
+    const result = await runToolContract(iaFindSnapshots, { url: 'example.com', mode: 'closest' });
+
+    const recovery = hint(iaFindSnapshots.errors, 'no_snapshot_available');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message: 'No snapshot available for example.com.',
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery } },
+      },
+    });
+    const text = contentText(result);
+    expect(text).toContain('No snapshot available for example.com.');
+    expect(text).toContain(`Recovery: ${recovery}`);
+    expect(searchOf(calls(isCdx)[0]?.request).get('closest')).toBe('');
+  });
+});
+
+describe('a Wayback capture URL as url (#59)', () => {
+  const UCD = 'https://digital.ucd.ie/';
+  const CAPTURE = `https://web.archive.org/web/20241231012939/${UCD}`;
+  const HEADER = ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'];
+  const CALENDAR =
+    'https://web.archive.org/web/2*/http://abcnews.go.com/Technology/wireStory/plastic-surgery-clinics-hacked-25000-photos-data-online-47728631';
+
+  it.each([
+    ['blank', ''],
+    ['its own digits', '20241231012939'],
+    ['its own digits as an ISO date-time', '2024-12-31T01:29:39Z'],
+  ])(
+    'ia_get_snapshot reads the capture a capture URL names for a timestamp %s, keyed on its original',
+    async (_label, timestamp) => {
+      routeReplay(replay('<html><body>UCD Digital Library</body></html>', CAPTURE));
+
+      const result = await runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp });
+
+      expect(result.structuredContent).toMatchObject({
+        text: 'UCD Digital Library',
+        replay_url: CAPTURE,
+        resolved_timestamp: '20241231012939',
+        resolved_status: '200',
+      });
+      expect(contentText(result)).toContain('**Resolved Timestamp:** 20241231012939');
+      expect(calls(isReplay).map((c) => c.request.url)).toEqual([CAPTURE]);
+      expect(calls(isAvailability)).toHaveLength(0);
+      expect(calls(isCdx)).toHaveLength(0);
+    },
+  );
+
+  it('ia_find_snapshots closest mode looks up the original at its capture URL’s timestamp', async () => {
+    routeAvailability(() =>
+      Response.json({
+        archived_snapshots: {
+          closest: {
+            url: `http://web.archive.org/web/20241231012939/${UCD}`,
+            timestamp: '20241231012939',
+            status: '200',
+            available: true,
+          },
+        },
+      }),
+    );
+
+    const result = await runToolContract(iaFindSnapshots, { url: CAPTURE, mode: 'closest' });
+
+    expect(result.structuredContent).toEqual({
+      snapshots: [{ timestamp: '20241231012939', replay_url: CAPTURE, statuscode: '200' }],
+    });
+    const query = searchOf(calls(isAvailability)[0]?.request);
+    expect(query.get('url')).toBe(UCD);
+    expect(query.get('timestamp')).toBe('20241231012939');
+  });
+
+  it.each([
+    ['a capture URL', CAPTURE, UCD],
+    [
+      'a capture URL with a percent-encoded original',
+      'https://web.archive.org/web/20241231012939/https%3A%2F%2Fdigital.ucd.ie%2F',
+      UCD,
+    ],
+    ['an alias-host capture URL with a modifier', `wayback.archive.org/web/2024id_/${UCD}`, UCD],
+    ['a calendar URL, as given', CALENDAR, CALENDAR],
+  ])('ia_find_snapshots history mode sends CDX the URL %s names', async (_label, url, key) => {
+    routeCdx(() =>
+      Response.json([HEADER, ['20190831230825', '200', 'text/html', key, 'D1', '1000']]),
+    );
+
+    const result = await runToolContract(iaFindSnapshots, { url, mode: 'history' });
+
+    expect(result.isError).toBeFalsy();
+    expect(contentText(result)).toContain('## 20190831230825');
+    expect(calls(isCdx)).toHaveLength(1);
+    expect(searchOf(calls(isCdx)[0]?.request).get('url')).toBe(key);
+  });
+
+  it('continues a capture URL’s history resume_key with either spelling of url', async () => {
+    const shared = createMockContext();
+    const definition = {
+      ...iaFindSnapshots,
+      handler: (
+        input: Parameters<typeof iaFindSnapshots.handler>[0],
+        ctx: Parameters<typeof iaFindSnapshots.handler>[1],
+      ) => iaFindSnapshots.handler(input, { ...ctx, state: shared.state }),
+    };
+    const rows = ['20200101000000', '20210101000000', '20220101000000'].map((timestamp, i) => [
+      timestamp,
+      '200',
+      'text/html',
+      UCD,
+      `D${i}`,
+      String(i),
+    ]);
+    routeCdx((request) => {
+      const qp = searchOf(request);
+      const selected = rows.filter((row) => row[0]! >= (qp.get('from') ?? ''));
+      return Response.json([HEADER, ...selected.slice(0, Number(qp.get('limit')))]);
+    });
+    type History = { snapshots: { timestamp: string }[]; resume_key?: string };
+
+    const first = await runToolContract(definition, { url: CAPTURE, mode: 'history', limit: 1 });
+    const resume_key = (first.structuredContent as History).resume_key;
+    expect(resume_key).toBeDefined();
+
+    for (const url of [CAPTURE, UCD]) {
+      const next = await runToolContract(definition, {
+        url,
+        mode: 'history',
+        resume_key,
+        limit: 1,
+      });
+      expect(next.isError, contentText(next)).toBeFalsy();
+      expect((next.structuredContent as History).snapshots.map((s) => s.timestamp)).toEqual([
+        '20210101000000',
+      ]);
+    }
+    expect(calls(isCdx).map((c) => searchOf(c.request).get('url'))).toEqual([UCD, UCD, UCD]);
+  });
+
+  it('ia_get_snapshot names the original URL in its next-page notice, and following it reads the next page', async () => {
+    const PAGE_URL = 'https://en.wikipedia.org/wiki/World_War_II';
+    const asked = `https://web.archive.org/web/20200101030000/${PAGE_URL}`;
+    const served = `https://web.archive.org/web/20200101030925/${PAGE_URL}`;
+    routeReplay(replay(`<html><body><p>${'a'.repeat(60_000)}</p></body></html>`, served));
+
+    const first = await runToolContract(iaGetSnapshot, { url: asked, timestamp: '' });
+    const notice = `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030925 (resolved_timestamp), and char_offset 50000 for the next page.`;
+    expect(first.structuredContent).toMatchObject({
+      resolved_timestamp: '20200101030925',
+      has_more: true,
+      notice,
+    });
+    expect(contentText(first)).toContain(`> ${notice}`);
+
+    const next = await runToolContract(iaGetSnapshot, {
+      url: PAGE_URL,
+      timestamp: '20200101030925',
+      char_offset: 50_000,
+    });
+    expect(next.structuredContent).toMatchObject({
+      char_offset: 50_000,
+      has_more: false,
+      total_chars: 60_000,
+    });
+    expect(calls(isReplay).map((c) => c.request.url)).toEqual([asked, served]);
   });
 });

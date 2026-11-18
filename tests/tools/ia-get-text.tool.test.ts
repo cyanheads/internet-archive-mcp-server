@@ -3,10 +3,11 @@
  * @module tests/tools/ia-get-text.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetText } from '@/mcp-server/tools/definitions/ia-get-text.tool.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
 
 vi.mock('@/services/archive-metadata/archive-metadata-service.js', () => ({
   getArchiveMetadataService: vi.fn(),
@@ -27,6 +28,9 @@ import { getArchiveMetadataService } from '@/services/archive-metadata/archive-m
 const mockService = {
   getTextContent: vi.fn(),
 };
+
+/** The call deadline the handler starts and passes on: 55 s at the 30 s request timeout. */
+const CALL_DEADLINE = expect.objectContaining({ budgetSeconds: 55, requestTimeoutMs: 30_000 });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -96,6 +100,7 @@ describe('iaGetText', () => {
       500,
       1000,
       expect.anything(),
+      CALL_DEADLINE,
       {},
     );
     expect(result.has_more).toBe(true);
@@ -124,6 +129,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        CALL_DEADLINE,
         {},
       );
       expect(result.isError).toBeFalsy();
@@ -159,6 +165,7 @@ describe('iaGetText', () => {
           maxChars,
           0,
           expect.anything(),
+          CALL_DEADLINE,
           {},
         );
         expect((result.structuredContent as { max_chars: number }).max_chars).toBe(maxChars);
@@ -207,6 +214,7 @@ describe('iaGetText', () => {
         50_000,
         250_000,
         expect.anything(),
+        CALL_DEADLINE,
         {},
       );
       expect(noticeOf(result)).toContain('char_offset 300,000');
@@ -233,6 +241,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        CALL_DEADLINE,
         { continuation: 'previous-token' },
       );
       expect(result.structuredContent).toMatchObject({
@@ -325,6 +334,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        CALL_DEADLINE,
         { file: 'Strabo 02 Geography 3-5_djvu.txt' },
       );
     });
@@ -337,7 +347,7 @@ describe('iaGetText', () => {
 
       await runToolContract(iaGetText, { identifier: 'strabo', file });
 
-      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({});
+      expect(mockService.getTextContent.mock.calls[0]?.[5]).toEqual({});
     });
 
     it('names the readable file count and the format that lists them on both surfaces', async () => {
@@ -432,6 +442,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        CALL_DEADLINE,
         { file: 'Strabo 02 Geography 3-5_djvu.txt' },
       );
     });
@@ -444,7 +455,7 @@ describe('iaGetText', () => {
         file: 'Strabo 03 Geography_djvu.txt',
       });
 
-      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({
+      expect(mockService.getTextContent.mock.calls[0]?.[5]).toEqual({
         file: 'Strabo 03 Geography_djvu.txt',
       });
     });
@@ -457,7 +468,7 @@ describe('iaGetText', () => {
       });
 
       expect(mockService.getTextContent.mock.calls[0]?.[0]).toBe('prideprejudice00aust');
-      expect(mockService.getTextContent.mock.calls[0]?.[4]).toEqual({});
+      expect(mockService.getTextContent.mock.calls[0]?.[5]).toEqual({});
     });
 
     it.each([
@@ -539,6 +550,49 @@ describe('iaGetText', () => {
     });
   });
 
+  describe('the call deadline (#55)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("binds the deadline to the caller's signal, so a caller who left past 55 s gets the cancellation", async () => {
+      const caller = new AbortController();
+      const cancelled = requestCancelled(
+        'fetch GET https://archive.org/download/pg1342/pg1342_djvu.txt was aborted.',
+      );
+      /**
+       * The call outlives its deadline and the caller leaves; the service checks the deadline
+       * before its next request, which then fails as the cancellation it is.
+       */
+      mockService.getTextContent.mockImplementation(
+        (
+          _identifier: string,
+          _maxChars: number,
+          _charOffset: number,
+          _ctx: unknown,
+          deadline: CallDeadline,
+        ) => {
+          vi.advanceTimersByTime(56_000);
+          caller.abort();
+          deadline.assertTimeLeft();
+          return Promise.reject(cancelled);
+        },
+      );
+      const ctx = createMockContext({ errors: iaGetText.errors, signal: caller.signal });
+
+      await expect(
+        iaGetText.handler(iaGetText.input.parse({ identifier: 'pg1342' }), ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: cancelled.message,
+      });
+    });
+  });
+
   describe('blank identifier', () => {
     it.each([
       ['empty', ''],
@@ -577,6 +631,7 @@ describe('iaGetText', () => {
         50_000,
         0,
         expect.anything(),
+        CALL_DEADLINE,
         {},
       );
     });

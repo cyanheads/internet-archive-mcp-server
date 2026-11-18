@@ -754,12 +754,40 @@ describe('ia_search_items list-valued title and date', () => {
     ]);
     expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
 
-    const text = contentText(result);
-    expect(text).toContain(`## ${TUXCAST.title.join(', ')}`);
-    expect(text).toContain(`**Date:** ${TUXCAST.date.join(', ')}`);
-    expect(text).toContain(`**Date:** ${PIRACY.date.join(', ')}`);
-    expect(text).toContain('## Plain Title');
-    expect(text).toContain('**Date:** 1998-01-01T00:00:00Z');
+    expect(contentText(result)).toBe(
+      "**3 total results** — Page 1 (3 shown, 50 per page)\n\n## TuxCastDE-News-1-vom-23-45-6789\n**Title:**\n\n- T\n- u\n- x\n- C\n- a\n- s\n- t\n- D\n- E\n- N\n- e\n- w\n- \\#\n- 1\n- v\n- o\n- m\n- 2\n- 3\n- .\n- 4\n- 5\n- 6\n- 7\n- 8\n- 9\n\n**Identifier:** TuxCastDE-News-1-vom-23-45-6789\n**Media Type:** movies\n**Date:**\n\n- 0006-01-01T00:00:00Z\n- 0007-01-01T00:00:00Z\n- 0008-01-01T00:00:00Z\n- 0009-01-01T00:00:00Z\n- 0004-01-01T00:00:00Z\n- 0005-01-01T00:00:00Z\n- 0002-01-01T00:00:00Z\n- 0003-01-01T00:00:00Z\n\n## Piracy\n**Identifier:** ArchiveIt-Collection-3226\n**Media Type:** collection\n**Creator:** Seamen's Church Institute of NY & NJ\n**Date:**\n\n- 2012-06-26T00:00:00Z\n- 2012-08-14T00:00:00Z\n\n## Plain Title\n**Identifier:** plain\n**Date:** 1998-01-01T00:00:00Z\n",
+    );
+  });
+
+  it('lists each creator and collection of a record, and keeps a one-value list inline', async () => {
+    // Advanced Search records as returned on 2026-11-17, downloads left out.
+    routeSearch(2, [
+      {
+        identifier: 'prideprejudice00aust',
+        title: 'Pride and prejudice',
+        creator: ['Austen, Jane, 1775-1817', 'Thomson, Hugh, 1860-1920, ill'],
+        mediatype: 'texts',
+        date: '1894-01-01T00:00:00Z',
+        collection: ['newyorkpubliclibrary', 'americana'],
+      },
+      {
+        identifier: '00hamigoog',
+        title: ['Afganistan', 'Афганистанъ'],
+        creator: 'Hamilton, A. (Angus), 1874-1913',
+        mediatype: 'texts',
+        date: '1908-01-01T00:00:00Z',
+        collection: ['americana'],
+      },
+    ]);
+
+    const result = await runToolContract(iaSearchItems, {
+      query: 'identifier:(prideprejudice00aust OR 00hamigoog)',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(contentText(result)).toBe(
+      '**2 total results** — Page 1 (2 shown, 50 per page)\n\n## Pride and prejudice\n**Identifier:** prideprejudice00aust\n**Media Type:** texts\n**Creator:**\n\n- Austen, Jane, 1775-1817\n- Thomson, Hugh, 1860-1920, ill\n\n**Date:** 1894-01-01T00:00:00Z\n**Collection:**\n\n- newyorkpubliclibrary\n- americana\n\n## 00hamigoog\n**Title:**\n\n- Afganistan\n- Афганистанъ\n\n**Identifier:** 00hamigoog\n**Media Type:** texts\n**Creator:** Hamilton, A. (Angus), 1874-1913\n**Date:** 1908-01-01T00:00:00Z\n**Collection:** americana\n',
+    );
   });
 });
 
@@ -800,8 +828,9 @@ describe('ia_search_items collection and creator lists', () => {
     const result = await runToolContract(iaSearchItems, { query: 'tesla' });
 
     expect(itemsOf(result)[0]?.collection).toEqual(['americana', 'library_of_congress']);
-    expect(contentText(result)).toContain('**Collection:** americana, library_of_congress');
-    expect(contentText(result)).not.toContain('fav-');
+    expect(contentText(result)).toBe(
+      '**1 total results** — Page 1 (1 shown, 50 per page)\n\n## mixed\n**Identifier:** mixed\n**Collection:**\n\n- americana\n- library_of_congress\n',
+    );
   });
 
   it('serves a heavily favorited record in under 1 KB per surface', async () => {
@@ -851,10 +880,10 @@ describe('ia_search_items collection and creator lists', () => {
       expect(item?.creator_count).toBe(total);
       expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
       const text = contentText(result);
-      expect(text).toContain(`**Creator:** ${authors(kept).join(', ')}`);
-      expect(text).toContain(`${kept} of ${total}`);
-      expect(text).toContain('ia_get_item');
-      expect(text).not.toContain(`Author ${kept + 1},`);
+      expect(text).toContain(
+        `**Creator:** (${kept} of ${total}; ia_get_item lists all)\n\n- Author 1\n- Author 2\n- Author 3\n- Author 4\n- Author 5\n- Author 6\n- Author 7\n- Author 8\n- Author 9\n- Author 10\n`,
+      );
+      expect(text).not.toContain(`Author ${kept + 1}`);
     },
   );
 
@@ -1191,6 +1220,7 @@ describe('ia_search_items Advanced Search error bodies', () => {
           },
         },
       });
+      expect(errorOf(result).data).not.toHaveProperty('operation');
       expect(contentText(result)).toContain(`Recovery: ${OUTAGE_HINT}`);
       expect(contentText(result)).not.toContain('bare operator');
       expect(contentText(result)).not.toContain('not retryable');
@@ -1393,6 +1423,34 @@ describe('ia_search_items timeouts and network errors surface as search_unavaila
     expect(http.calls).toHaveLength(4);
   });
 
+  it('settles at the 55 s call deadline when every answer is a 503 just inside the request timeout', async () => {
+    routeSearchWith(
+      (request) =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => resolve(new Response('Service Unavailable', { status: 503 })),
+            29_900,
+          );
+          request.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(request.signal.reason);
+          });
+        }),
+    );
+
+    const { result, elapsedMs } = await runTimed({ query: 'tesla' });
+
+    expectUnavailable(result);
+    expect(errorOf(result)).toMatchObject({
+      message: 'Advanced Search did not finish within the 55 s call deadline.',
+    });
+    expect(contentText(result)).toContain(
+      'Advanced Search did not finish within the 55 s call deadline.',
+    );
+    expect(http.calls).toHaveLength(2);
+    expect(elapsedMs).toBe(55_000);
+  });
+
   it('keeps a caller cancellation a cancellation after one request', async () => {
     routeSearchWith(hang);
     const controller = new AbortController();
@@ -1415,9 +1473,10 @@ describe('ia_search_items timeouts and network errors surface as search_unavaila
     expect(http.calls).toHaveLength(1);
   });
 
-  it('states timeouts and network errors in the search_unavailable when text', () => {
+  it('states timeouts, the call deadline, and network errors in the search_unavailable when text', () => {
     const entry = iaSearchItems.errors?.find((e) => e.reason === 'search_unavailable');
     expect(entry?.when).toMatch(/timed out/);
+    expect(entry?.when).toMatch(/55 s deadline/);
     expect(entry?.when).toMatch(/network error/);
   });
 });

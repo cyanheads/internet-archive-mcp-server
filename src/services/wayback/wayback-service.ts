@@ -13,8 +13,9 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { fetchWithTimeout, type RetryOptions, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig, getUserAgent } from '@/config/server-config.js';
+import { fetchWithTimeout, isRecord, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { getUserAgent } from '@/config/server-config.js';
+import type { CallDeadline } from '../call-deadline.js';
 import { htmlToText } from '../html-text.js';
 import {
   bodyReadError,
@@ -93,7 +94,6 @@ const CDX_FIELDS = 'timestamp,statuscode,mimetype,original,digest,length';
 /** Cursor keys use the tenant-scoped store; expiry is in seconds. */
 const HISTORY_CURSOR_PREFIX = 'ia-history-v1/';
 const HISTORY_CURSOR_TTL = 3_600;
-const HISTORY_DEADLINE_MS = 45_000;
 const LEGACY_HISTORY_NOTICE =
   'CDX raw continuation can omit captures when collapse is enabled. For complete paging on a stable index, restart with an exact URL and timestamp:N collapse (N=1–14).';
 const HistoryCursor = z.object({
@@ -109,31 +109,37 @@ const HistoryCursor = z.object({
 const CDX_CLOSEST_WINDOW = 10;
 
 /**
- * The most the CDX closest-capture fallback's single attempt gets, and how far past the
- * request timeout a closest-capture lookup's deadline reaches. Measured `sort=closest`
- * latencies ran 2.5–23 s for about half the URLs tried and 31 s to over 60 s for the rest,
- * so 25 s keeps every answer the default 30 s request timeout could have allowed while
- * leaving headroom under it. At that default the whole lookup ends within 55 s, inside the
- * 60 s MCP SDK clients wait for a tool call.
+ * The most the CDX closest-capture fallback's single attempt gets, when the request timeout
+ * and what remains of the call deadline both allow more. Measured `sort=closest` latencies
+ * ran 2.5–23 s for about half the URLs tried and 31 s to over 60 s for the rest, so 25 s
+ * keeps every answer the default 30 s request timeout could have allowed while leaving
+ * headroom under it.
  */
-const CDX_FALLBACK_DEADLINE_MS = 25_000;
+const CDX_FALLBACK_CEILING_MS = 25_000;
 
-/** A closest-capture lookup: what it resolves, and when its attempts, backoffs, and fallback must be done. */
+/** A closest-capture lookup: what it resolves, and the call deadline its requests run under. */
 interface ClosestLookup {
-  /** Epoch milliseconds past which no request of the lookup runs. */
-  deadlineAtMs: number;
+  deadline: CallDeadline;
   timestamp: string | undefined;
   url: string;
 }
 
+/** What one request is sent under: the abort signal it honors and its timeout. */
+interface RequestLimits {
+  signal: AbortSignal;
+  timeoutMs: number;
+}
+
 /**
  * Where a caller can go when the closest-capture lookup cannot answer: captures listed in
- * history mode, then read by an exact timestamp, which needs no lookup.
+ * history mode, then read by an exact timestamp, which needs no lookup. History rows run
+ * oldest first and a URL's latest capture can predate this year, so the latest-capture
+ * route names no fixed year and says to step back when a year lists nothing.
  */
 function nearbyCaptures(timestamp: string | undefined): string {
   const list =
     timestamp === undefined
-      ? `list recent captures with ia_find_snapshots in history mode, passing from "${new Date().getUTCFullYear()}"`
+      ? 'list captures with ia_find_snapshots in history mode and status_filter "200", from a recent year (rows run oldest first; pass an earlier year when none are listed)'
       : 'list nearby captures with ia_find_snapshots in history mode, passing from and to around the timestamp';
   return `${list}, then read one with ia_get_snapshot and its exact 14-digit timestamp, which needs no lookup`;
 }
@@ -153,53 +159,46 @@ export const REPLAY_BYTE_CEILING = 4 * 1024 * 1024;
 
 export class WaybackService {
   private readonly headers: Record<string, string>;
-  private readonly timeoutMs: number;
-  /** How long a closest-capture lookup may take: the request timeout plus the fallback's ceiling. */
-  private readonly lookupBudgetMs: number;
 
   constructor(config: AppConfig, _storage: StorageService) {
     this.headers = { 'User-Agent': getUserAgent(config.mcpServerVersion) };
-    this.timeoutMs = getServerConfig().requestTimeoutMs;
-    this.lookupBudgetMs = this.timeoutMs + CDX_FALLBACK_DEADLINE_MS;
   }
 
   /**
    * Find the capture nearest `timestamp`, a 1–14 digit Wayback timestamp, or the latest
    * capture when it is undefined. The Availability API answers first. When it answers
    * without a usable capture, or answers with a failure — a 429, a 5xx, 408, or 425 after
-   * its retries, or an HTML or unparseable body — CDX's closest query (`closest` +
-   * `sort=closest`, on a different host) answers instead; it also finds captures the
-   * Availability API sometimes misses. No answer at all (a timeout or a network error), a
-   * 4xx refusal, and a caller cancellation never fall back.
+   * its retries, an HTML or unparseable body, or an `error` in place of a capture, which is
+   * not retried — CDX's closest query (`closest` + `sort=closest`, on a different host)
+   * answers instead; it also finds captures the Availability API sometimes misses. No answer
+   * at all (a timeout or a network error), a 4xx refusal, and a caller cancellation never
+   * fall back.
    *
-   * One deadline, the request timeout plus `CDX_FALLBACK_DEADLINE_MS`, spans every
-   * Availability attempt and backoff, which run under the retry loop's clock, and the
-   * fallback's single attempt, which gets that ceiling or what remains, whichever is less.
-   * Throws `no_snapshot_available`, carrying the calling tool's recovery hint, when the
-   * sources that answered have no capture or either answers 403, 410, or 451. A lookup that
-   * cannot answer is never a miss: `availability_unavailable` when the Availability API
-   * failed and its fallback did not answer either, or the deadline ran out on it;
-   * `cdx_unavailable` when only the fallback after an empty answer failed.
+   * The Availability attempts and backoffs run under what remains of the call's `deadline`,
+   * and the fallback's single attempt gets `CDX_FALLBACK_CEILING_MS`, the request timeout, or
+   * what remains, whichever is least. Throws `no_snapshot_available`, carrying the calling
+   * tool's recovery hint, when the sources that answered have no capture or either answers
+   * 403, 410, or 451. A lookup that cannot answer is never a miss: `availability_unavailable`
+   * when the Availability API failed and its fallback did not answer either, or the deadline
+   * ran out on it; `cdx_unavailable` when only the fallback after an empty answer failed.
    */
   async findClosest(
     url: string,
     timestamp: string | undefined,
     ctx: Context,
+    deadline: CallDeadline,
   ): Promise<ClosestSnapshot> {
-    const lookup: ClosestLookup = {
-      url,
-      timestamp,
-      deadlineAtMs: Date.now() + this.lookupBudgetMs,
-    };
+    const lookup: ClosestLookup = { url, timestamp, deadline };
     let answer: ClosestSnapshot | undefined;
     let failure: McpError | undefined;
     try {
-      answer = await withRetry(({ signal }) => this.queryAvailability(lookup, signal, ctx), {
-        ...this.retryOptions('findClosest', ctx),
-        deadlineMs: this.lookupBudgetMs,
-      });
+      const answered = await this.attempts(ctx, deadline, (limits) =>
+        this.queryAvailability(lookup, limits, ctx),
+      );
+      if (answered instanceof McpError) failure = answered;
+      else answer = answered;
     } catch (err) {
-      failure = failedAnswer(err, ctx);
+      failure = failedAnswer(err, lookup, ctx);
       if (!failure) throw this.availabilityError(err, lookup, ctx);
     }
     const closest = answer ?? (await this.closestFromCdx(lookup, ctx, failure));
@@ -214,11 +213,17 @@ export class WaybackService {
   }
 
   /**
-   * Fetch paginated capture history from the CDX API.
-   * Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429 or a
-   * timeout (after one request), an HTML page, or an unparseable body.
+   * Fetch paginated capture history from the CDX API. Every CDX request — the page, and the
+   * re-query a cursor-storage outage falls back to — runs under what remains of the call's
+   * `deadline`. Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a
+   * 429 or a timeout (after one request), an HTML page, an unparseable body, or the deadline
+   * running out, mid-request or mid-backoff.
    */
-  async fetchHistory(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
+  async fetchHistory(
+    params: FetchHistoryParams,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<CdxHistoryResult> {
     let query = params;
     let originalBounds = params.from;
     const token = params.resumeKey;
@@ -259,16 +264,11 @@ export class WaybackService {
       (!token || serverCursor) &&
       !!ctx.state;
     if (!eligible) {
-      const result = await this.historyPage(query, ctx);
+      const result = await this.historyPage(query, ctx, deadline);
       return { ...result, ...((token || result.resumeKey) && { notice: LEGACY_HISTORY_NOTICE }) };
     }
-    // Both the lookahead and a storage-outage fallback share this total deadline.
-    const bounded = {
-      ...ctx,
-      signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(HISTORY_DEADLINE_MS)]),
-    };
     const limit = query.limit ?? 100;
-    const result = await this.historyPage({ ...query, limit: limit + 1 }, bounded);
+    const result = await this.historyPage({ ...query, limit: limit + 1 }, ctx, deadline);
     const lookahead = result.records[limit];
     if (!lookahead)
       return {
@@ -286,9 +286,9 @@ export class WaybackService {
       nextTimestamp: lookahead.timestamp,
     };
     try {
-      await bounded.state.set(key, cursor, { ttl: HISTORY_CURSOR_TTL });
+      await ctx.state.set(key, cursor, { ttl: HISTORY_CURSOR_TTL });
     } catch (error) {
-      bounded.signal.throwIfAborted();
+      ctx.signal.throwIfAborted();
       // Generated cursor values are JSON-safe; a typed storage failure can degrade to
       // the legacy path. Re-query at the original limit so its raw key loses no extra row.
       if (
@@ -301,15 +301,19 @@ export class WaybackService {
         ].includes(error.code)
       )
         throw error;
-      const raw = await this.historyPage(query, bounded);
+      const raw = await this.historyPage(query, ctx, deadline);
       return { ...raw, notice: `History cursor storage is unavailable. ${LEGACY_HISTORY_NOTICE}` };
     }
     return { records: result.records.slice(0, limit), resumeKey: key };
   }
 
   /** One CDX page, retaining the raw trailer for legacy paging and storage fallback. */
-  private historyPage(params: FetchHistoryParams, ctx: Context): Promise<CdxHistoryResult> {
-    return this.retry('fetchHistory', CDX_API, ctx, async () => {
+  private historyPage(
+    params: FetchHistoryParams,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<CdxHistoryResult> {
+    return this.retry(CDX_API, ctx, deadline, async (limits) => {
       const qp = new URLSearchParams({
         url: params.url,
         output: 'json',
@@ -323,7 +327,7 @@ export class WaybackService {
       if (params.statusFilter) qp.set('filter', `statuscode:${params.statusFilter}`);
       if (params.resumeKey) qp.set('resumeKey', params.resumeKey);
 
-      const rows = await this.queryCdx(qp, ctx);
+      const rows = await this.queryCdx(qp, ctx, limits);
       if (rows.length === 0) {
         return { records: [] };
       }
@@ -384,11 +388,11 @@ export class WaybackService {
    * its text. Any other text type — `text/*`, JSON, XML, JavaScript, a `+xml` or `+json`
    * type — has its replay body cancelled unread, because that form rewrites the URLs inside
    * it, and is read as stored from the capture's `id_` form in a second request with the
-   * same timeout and retries. A body of any other type is cancelled unread and throws
-   * `NotFound` with `mediaType` and `replayUrl`. The body read is streamed up to
-   * `REPLAY_BYTE_CEILING` bytes — a longer body is cut there, the upstream read cancelled,
-   * and `truncatedAtBytes` set — then decoded with the charset the response declares, or
-   * the one Wayback guessed for the capture.
+   * same retries, within what remains of the call's `deadline`. A body of any other type is
+   * cancelled unread and throws `NotFound` with `mediaType` and `replayUrl`. The body read is
+   * streamed up to `REPLAY_BYTE_CEILING` bytes — a longer body is cut there, the upstream
+   * read cancelled, and `truncatedAtBytes` set — then decoded with the charset the response
+   * declares, or the one Wayback guessed for the capture.
    *
    * A non-2xx carrying `Memento-Datetime` is an archived error page, not a Wayback failure:
    * it is not retried and throws `NotFound` with `status` and `captureTimestamp`. Any other
@@ -397,12 +401,19 @@ export class WaybackService {
    * after one request. Otherwise a 5xx, 408, 425, or network error is retried, and a 429
    * or a timeout answered after one request, each as `ServiceUnavailable` (a 429 with a
    * hint to wait), which `ia_get_snapshot` remaps onto its declared `content_fetch_failed`;
-   * a 404 and a caller cancellation propagate as the fetch threw them. No error carries
-   * the replay's body. The text is returned whole; `ia_get_snapshot` pages it.
+   * so is the call's `deadline` running out, mid-request, mid-backoff, or before a request,
+   * its message naming the deadline. A 404 and a caller cancellation propagate as the fetch
+   * threw them. No error carries the replay's body. The text is returned whole;
+   * `ia_get_snapshot` pages it.
    */
-  async fetchContent(snapshotUrl: string, ctx: Context): Promise<SnapshotContent> {
-    const served = await this.retry('fetchContent', REPLAY, ctx, async () => {
+  async fetchContent(
+    snapshotUrl: string,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<SnapshotContent> {
+    const served = await this.retry(REPLAY, ctx, deadline, async (limits) => {
       const response = await this.fetchUpstream(snapshotUrl, REPLAY, ctx, {
+        ...limits,
         errorHeaders: [MEMENTO_DATETIME],
       });
       const replayUrl = waybackUrl(response.url) ?? snapshotUrl;
@@ -425,7 +436,7 @@ export class WaybackService {
     const body =
       'body' in served
         ? served.body
-        : await this.readRawText(served.replayUrl, served.guessedCharset, ctx);
+        : await this.readRawText(served.replayUrl, served.guessedCharset, ctx, deadline);
 
     return {
       text: body.text,
@@ -443,20 +454,23 @@ export class WaybackService {
 
   /**
    * A text capture's body as stored, from the `id_` form of `replayUrl`, under the same
-   * timeout and retries as the replay request. The `id_` response carries no guessed
-   * charset, so the one Wayback sent with the replay stands in for it. The replay already
-   * served this capture, so an `id_` 4xx — a refusal, a 404, or an archived error page — says
-   * nothing about the capture: it is `ServiceUnavailable` marked `retryable: false`, with a
-   * hint naming the replay URL, never the `NotFound` `ia_get_snapshot` reads as no capture.
+   * retries as the replay request and within what remains of the call's `deadline`. The
+   * `id_` response carries no guessed charset, so the one Wayback sent with the replay stands
+   * in for it. The replay already served this capture, so an `id_` 4xx — a refusal, a 404, or
+   * an archived error page — says nothing about the capture: it is `ServiceUnavailable` marked
+   * `retryable: false`, with a hint naming the replay URL, never the `NotFound`
+   * `ia_get_snapshot` reads as no capture.
    */
   private readRawText(
     replayUrl: string,
     guessedCharset: string | null,
     ctx: Context,
+    deadline: CallDeadline,
   ): Promise<ReplayBody> {
     const rawUrl = rawReplayUrl(replayUrl);
-    return this.retry('fetchContent', REPLAY, ctx, async () => {
+    return this.retry(REPLAY, ctx, deadline, async (limits) => {
       const response = await this.fetchUpstream(rawUrl, REPLAY, ctx, {
+        ...limits,
         errorHeaders: [MEMENTO_DATETIME],
       }).catch((err: unknown) => {
         if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.NotFound) throw err;
@@ -476,44 +490,59 @@ export class WaybackService {
   }
 
   /**
-   * One attempt at the Availability API's closest capture, aborted by `signal` — the retry
-   * loop's, which carries the lookup's deadline and the caller's cancellation. Undefined when
-   * the API names no capture on web.archive.org.
+   * One attempt at the Availability API's closest capture, sent under `limits` — the retry
+   * loop's signal, which the call deadline and the caller's cancellation abort, and the
+   * request timeout or what remains of the deadline. Undefined when the API names no capture
+   * on web.archive.org; the declared `availability_unavailable` failure, returned for the CDX
+   * fallback to stand in for, when it answers with an `error` in place of a capture.
    */
   private async queryAvailability(
     { url, timestamp }: ClosestLookup,
-    signal: AbortSignal,
+    limits: RequestLimits,
     ctx: Context,
-  ): Promise<ClosestSnapshot | undefined> {
+  ): Promise<ClosestSnapshot | McpError | undefined> {
     // Without a timestamp the API answers with the latest capture; a blank one draws HTTP 500.
     const params = new URLSearchParams({ url, ...(timestamp !== undefined && { timestamp }) });
     const response = await this.fetchUpstream(
       `${AVAILABILITY_BASE}?${params}`,
       AVAILABILITY_API,
       ctx,
-      { target: url, signal },
+      { ...limits, target: url },
     );
     const raw = (await readJson(response, AVAILABILITY_API, ctx)) as {
       archived_snapshots?: {
         closest?: { url?: string; timestamp?: string; status?: string; available?: boolean };
       };
+      error?: unknown;
     } | null;
 
     // An empty archived_snapshots means no answer, and so does a URL off web.archive.org:
     // the service fetches only Wayback replay URLs.
     const closest = raw?.archived_snapshots?.closest;
     const snapshotUrl = closest?.url ? waybackUrl(closest.url) : undefined;
-    if (!snapshotUrl || !closest?.timestamp) return;
-
-    return { snapshotUrl, timestamp: closest.timestamp, status: closest.status ?? '200' };
+    if (snapshotUrl && closest?.timestamp) {
+      return { snapshotUrl, timestamp: closest.timestamp, status: closest.status ?? '200' };
+    }
+    /**
+     * An HTTP 200 whose body carries an `error` — the API's own lookup timing out, as
+     * `{"code": "timeout"}` — is a failed answer, not an empty one. It is returned rather
+     * than thrown, so the retry loop leaves it alone: a lookup the API could not finish in
+     * its own time is what the CDX fallback's longer ceiling is for.
+     */
+    if (raw?.error == null) return;
+    const code = isRecord(raw.error) ? raw.error.code : undefined;
+    return serviceUnavailable(
+      `${AVAILABILITY_API.name} answered with an error${code === 'timeout' ? ' (its own lookup timed out)' : ''} in place of a capture.`,
+      declaredReason(AVAILABILITY_API, ctx),
+    );
   }
 
   /**
    * The CDX fallback, after an empty Availability answer or a `failure`: one attempt, no
-   * retries, under `CDX_FALLBACK_DEADLINE_MS`, the request timeout, or what remains of the
-   * lookup's deadline, whichever is least. With none remaining it sends nothing, since the
-   * request could only time out — unless the caller has already left, when the fetch fails
-   * at once as the cancellation it is. Any upstream failure or timeout becomes
+   * retries, under `CDX_FALLBACK_CEILING_MS`, the request timeout, or what remains of the
+   * call deadline, whichever is least. With 1 ms or less remaining it sends nothing, since
+   * the request could only time out — unless the caller has already left, when the fetch
+   * fails at once as the cancellation it is. Any upstream failure or timeout becomes
    * `lookupFailed`'s declared failure, never a miss. A URL the Wayback Machine does not
    * serve and a caller cancellation pass through untouched.
    */
@@ -522,14 +551,13 @@ export class WaybackService {
     ctx: Context,
     failure?: McpError,
   ): Promise<ClosestSnapshot | undefined> {
-    const remainingMs = lookup.deadlineAtMs - Date.now();
-    if (remainingMs <= 0 && !ctx.signal.aborted) throw this.lookupFailed(lookup, failure);
     try {
-      return await this.queryCdxClosest(
-        lookup,
-        Math.min(CDX_FALLBACK_DEADLINE_MS, this.timeoutMs, remainingMs),
-        ctx,
-      );
+      lookup.deadline.assertTimeLeft();
+    } catch {
+      throw this.lookupFailed(lookup, failure);
+    }
+    try {
+      return await this.queryCdxClosest(lookup, ctx);
     } catch (err) {
       if (
         !(err instanceof McpError) ||
@@ -553,7 +581,7 @@ export class WaybackService {
    * answer refused the request outright.
    */
   private lookupFailed(
-    { url, timestamp }: ClosestLookup,
+    { url, timestamp, deadline }: ClosestLookup,
     failure?: McpError,
     fallbackErr?: McpError,
   ): McpError {
@@ -567,10 +595,24 @@ export class WaybackService {
       : refused
         ? `A retry will not help; ${nearby}.`
         : `Retry later, or ${nearby}.`;
-    const unsent = `time remained for the CDX closest-capture check within the ${this.lookupBudgetMs / 1000} s lookup deadline.`;
+    // The CDX check went unsent, was cut off by the call deadline, or failed on its own.
+    const within = `within the ${deadline.budgetSeconds} s call deadline.`;
+    const cutOff = fallbackErr !== undefined && deadline.isExpiry(fallbackErr);
+    const afterFailure =
+      fallbackErr === undefined
+        ? `No time remained for the CDX closest-capture check ${within}`
+        : cutOff
+          ? `The CDX closest-capture check it fell back to did not finish ${within}`
+          : `The CDX closest-capture check it fell back to did not complete either: ${fallbackErr.message}`;
+    const afterEmpty =
+      fallbackErr === undefined
+        ? `no time remained for the CDX closest-capture check ${within}`
+        : cutOff
+          ? `the CDX closest-capture check did not finish ${within}`
+          : `the CDX closest-capture check did not complete: ${fallbackErr.message}`;
     const message = failure
-      ? `The closest-capture lookup for ${url}${near(timestamp)} did not complete: ${failure.message} ${fallbackErr ? `The CDX closest-capture check it fell back to did not complete either: ${fallbackErr.message}` : `No ${unsent}`}`
-      : `The Availability API found no capture of ${url}${near(timestamp)}, and ${fallbackErr ? `the CDX closest-capture check did not complete: ${fallbackErr.message}` : `no ${unsent}`}`;
+      ? `The closest-capture lookup for ${url}${near(timestamp)} did not complete: ${failure.message} ${afterFailure}`
+      : `The Availability API found no capture of ${url}${near(timestamp)}, and ${afterEmpty}`;
     const { status, retryAttempts } = failure?.data ?? {};
     return serviceUnavailable(
       message,
@@ -588,26 +630,26 @@ export class WaybackService {
 
   /**
    * An Availability failure the CDX fallback does not stand in for, as callers see it: the
-   * lookup's deadline expiring mid-request or mid-backoff, which leaves the fallback no time,
-   * or a timeout or network error under the declared reason (`transportError`). A refusal, a
-   * URL the Wayback Machine does not serve, and a cancellation leave as thrown.
+   * call deadline expiring mid-request, mid-backoff, or before a request, which leaves the
+   * fallback no time, or a timeout or network error under the declared reason
+   * (`transportError`). A refusal, a URL the Wayback Machine does not serve, and a
+   * cancellation leave as thrown — a refusal that completed as the deadline ran out included.
    */
   private availabilityError(
     err: unknown,
-    { url, timestamp }: ClosestLookup,
+    { url, timestamp, deadline }: ClosestLookup,
     ctx: Context,
   ): unknown {
-    if (!isDeadlineExpiry(err)) {
-      return transportError(
-        err,
-        AVAILABILITY_API.name,
-        this.timeoutMs,
-        declaredReason(AVAILABILITY_API, ctx),
-      );
-    }
-    const { retryAttempts } = err.data ?? {};
+    const mapped = transportError(
+      err,
+      AVAILABILITY_API.name,
+      deadline,
+      declaredReason(AVAILABILITY_API, ctx),
+    );
+    if (!deadline.isExpiry(err) || mapped === (err as McpError).cause) return mapped;
+    const { retryAttempts } = (err as McpError).data ?? {};
     return serviceUnavailable(
-      `The closest-capture lookup for ${url}${near(timestamp)} did not finish within its ${this.lookupBudgetMs / 1000} s deadline: the Availability API did not answer in time.`,
+      `The closest-capture lookup for ${url}${near(timestamp)} did not finish within the ${deadline.budgetSeconds} s call deadline: the Availability API did not answer in time.`,
       {
         reason: AVAILABILITY_API.reason,
         ...(retryAttempts !== undefined && { retryAttempts }),
@@ -619,11 +661,12 @@ export class WaybackService {
 
   /**
    * The capture CDX ranks nearest `timestamp`, preferring a 200 within the first rows, in one
-   * request bounded by `timeoutMs`. CDX reads a blank `closest` as the latest capture.
+   * request on the caller's signal, bounded by `CDX_FALLBACK_CEILING_MS`, the request timeout,
+   * or what remains of the call deadline, whichever is least. CDX reads a blank `closest` as
+   * the latest capture.
    */
   private async queryCdxClosest(
-    { url, timestamp }: ClosestLookup,
-    timeoutMs: number,
+    { url, timestamp, deadline }: ClosestLookup,
     ctx: Context,
   ): Promise<ClosestSnapshot | undefined> {
     const rows = await this.queryCdx(
@@ -636,7 +679,10 @@ export class WaybackService {
         fl: 'timestamp,original,statuscode',
       }),
       ctx,
-      timeoutMs,
+      {
+        signal: ctx.signal,
+        timeoutMs: Math.min(CDX_FALLBACK_CEILING_MS, deadline.nextTimeoutMs()),
+      },
     );
 
     const captures = rows.slice(1) as string[][];
@@ -654,10 +700,10 @@ export class WaybackService {
   private async queryCdx(
     params: URLSearchParams,
     ctx: Context,
-    timeoutMs = this.timeoutMs,
+    limits: RequestLimits,
   ): Promise<unknown[][]> {
     const response = await this.fetchUpstream(`${CDX_BASE}?${params}`, CDX_API, ctx, {
-      timeoutMs,
+      ...limits,
       target: params.get('url') ?? '',
     });
     const rows = await readJson(response, CDX_API, ctx);
@@ -682,11 +728,11 @@ export class WaybackService {
     api: UpstreamApi,
     ctx: Context,
     {
-      timeoutMs = this.timeoutMs,
+      timeoutMs,
+      signal,
       errorHeaders,
       target = url,
-      signal = ctx.signal,
-    }: { errorHeaders?: string[]; signal?: AbortSignal; target?: string; timeoutMs?: number } = {},
+    }: RequestLimits & { errorHeaders?: string[]; target?: string },
   ): Promise<Response> {
     try {
       return await fetchWithTimeout(url, timeoutMs, ctx, {
@@ -720,52 +766,66 @@ export class WaybackService {
   }
 
   /**
-   * Run `fn` under the framework retry loop (`retryOptions`). A timeout, or a network error
-   * once its retries are spent, surfaces as `api`'s declared reason; everything else leaves
-   * as it was thrown.
+   * Run `fn` under `attempts`. A timeout, a network error once its retries are spent, or the
+   * call `deadline` running out surfaces as `api`'s declared reason (`transportError`);
+   * everything else leaves as it was thrown.
    */
   private retry<T>(
-    operation: string,
     api: UpstreamApi,
     ctx: Context,
-    fn: () => Promise<T>,
+    deadline: CallDeadline,
+    fn: (limits: RequestLimits) => Promise<T>,
   ): Promise<T> {
-    return withRetry(fn, this.retryOptions(operation, ctx)).catch((err: unknown) => {
-      throw transportError(err, api.name, this.timeoutMs, declaredReason(api, ctx));
+    return this.attempts(ctx, deadline, fn).catch((err: unknown) => {
+      throw transportError(err, api.name, deadline, declaredReason(api, ctx));
     });
   }
 
   /**
-   * The framework retry loop's options for `operation`, bound to the request's cancellation
-   * signal: a timeout or a 429 is not retried (`isRetriedFailure`).
+   * Run `fn` under the framework retry loop for what remains of the call's `deadline`, every
+   * attempt, backoff, and honored `Retry-After` included. An attempt is sent only while more
+   * than 1 ms remains, with the request timeout or what remains, whichever is less, and the
+   * loop's signal, which the deadline and the caller's cancellation abort; the loop itself
+   * takes only the caller's signal, so it tells the two apart. A timeout or a 429 is not
+   * retried (`isRetriedFailure`). Failures leave as thrown. No `operation` label is passed:
+   * `withRetry` copies it into an exhausted error's `data`, which reaches the caller.
    */
-  private retryOptions(operation: string, ctx: Context): RetryOptions {
-    return {
-      operation: `WaybackService.${operation}`,
-      context: ctx,
-      baseDelayMs: 1_000,
-      signal: ctx.signal,
-      isTransient: isRetriedFailure,
-    };
+  private attempts<T>(
+    ctx: Context,
+    deadline: CallDeadline,
+    fn: (limits: RequestLimits) => Promise<T>,
+  ): Promise<T> {
+    return withRetry(
+      ({ signal }) => {
+        deadline.assertTimeLeft();
+        return fn({ signal, timeoutMs: deadline.nextTimeoutMs() });
+      },
+      {
+        context: ctx,
+        baseDelayMs: 1_000,
+        signal: ctx.signal,
+        deadlineMs: deadline.remainingMs(),
+        isTransient: isRetriedFailure,
+      },
+    );
   }
-}
-
-/** The retry loop's own deadline running out, mid-attempt or mid-backoff. */
-function isDeadlineExpiry(err: unknown): err is McpError {
-  return err instanceof McpError && err.data?.reason === 'retry_deadline_exceeded';
 }
 
 /**
  * The failed Availability answer the CDX closest query stands in for: a 429, a 5xx, 408, or
- * 425 after its retries, or an HTML page or unparseable body — including one the lookup's
+ * 425 after its retries, or an HTML page or unparseable body — including one the call
  * deadline overtook before the retry loop could report it. Before `transportError` maps
  * them, the only other Availability failures declared `availability_unavailable` are 4xx
  * refusals; a timeout, a network error, a URL the Wayback Machine does not serve, and a
  * cancellation carry no such reason. Undefined for all of those, and once the caller left.
  */
-function failedAnswer(err: unknown, ctx: Context): McpError | undefined {
+function failedAnswer(
+  err: unknown,
+  { deadline }: ClosestLookup,
+  ctx: Context,
+): McpError | undefined {
   if (ctx.signal.aborted) return;
-  const answer = isDeadlineExpiry(err) ? err.cause : err;
+  const answer = deadline.isExpiry(err) ? (err as McpError).cause : err;
   if (!(answer instanceof McpError) || answer.data?.reason !== AVAILABILITY_API.reason) return;
   const status = answer.data?.status;
   const refusal = typeof status === 'number' && status < 500 && ![408, 425, 429].includes(status);

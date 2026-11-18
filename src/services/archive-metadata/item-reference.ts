@@ -7,6 +7,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { invalidParams } from '@cyanheads/mcp-ts-core/errors';
+import { WAYBACK_HOSTS } from '@/services/wayback/wayback-capture-url.js';
 
 /** The archive.org path an item URL names it by: `/<route>/<identifier>`, or a storage node's `/<n>/items/<identifier>`. */
 export type ItemRoute = 'details' | 'download' | 'embed' | 'metadata' | 'stream' | 'storage';
@@ -58,8 +59,9 @@ const decodeSegment = (segment: string): string => {
  * `/metadata`, or `/stream` followed by the identifier, or a storage-node URL
  * (`<node>.archive.org/<n>/items/<identifier>`), names that item; any further path names a file
  * for the download, stream, and storage-node forms (each segment percent-decoded, rejoined with
- * `/`) and is dropped for the others, as are the query and fragment. A `web.archive.org/web/…`
- * URL is a Wayback capture; anything else is unrecognized. Linear in the length of `value`.
+ * `/`) and is dropped for the others, as are the query and fragment. A `/web/…` URL on a
+ * Wayback host (`WAYBACK_HOSTS`: `web.archive.org`, `wayback.archive.org`) is a Wayback
+ * capture; anything else is unrecognized. Linear in the length of `value`.
  */
 export function parseItemReference(value: string): ItemReference {
   if (!value.includes('/') && !value.includes(':')) return { kind: 'item', identifier: value };
@@ -72,7 +74,7 @@ export function parseItemReference(value: string): ItemReference {
   let route: ItemRoute | undefined;
   let identifier = '';
   let fileSegments: string[] = [];
-  if (host === 'web.archive.org') {
+  if (WAYBACK_HOSTS.has(host)) {
     if (first === 'web') return { kind: 'wayback' };
   } else if (ITEM_HOSTS.has(host)) {
     route = ROUTES.get(first);

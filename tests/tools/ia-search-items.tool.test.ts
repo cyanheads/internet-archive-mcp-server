@@ -3,10 +3,11 @@
  * @module tests/tools/ia-search-items.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaSearchItems } from '@/mcp-server/tools/definitions/ia-search-items.tool.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
 
 vi.mock('@/services/archive-search/archive-search-service.js', () => ({
   getArchiveSearchService: vi.fn(),
@@ -90,6 +91,7 @@ describe('iaSearchItems blank query', () => {
     expect(mockService.search).toHaveBeenCalledWith(
       expect.objectContaining({ query: 'tesla' }),
       expect.anything(),
+      expect.objectContaining({ budgetSeconds: 55 }),
     );
   });
 });
@@ -403,6 +405,7 @@ describe('iaSearchItems', () => {
         page: 2,
       }),
       expect.anything(),
+      expect.objectContaining({ budgetSeconds: 55 }),
     );
   });
 
@@ -420,7 +423,45 @@ describe('iaSearchItems', () => {
     expect(mockService.search).toHaveBeenCalledWith(
       expect.objectContaining({ mediatype: undefined, collection: undefined }),
       expect.anything(),
+      expect.objectContaining({ budgetSeconds: 55 }),
     );
+  });
+
+  describe('the call deadline (#55)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("binds the deadline to the caller's signal, so a caller who left past 55 s gets the cancellation", async () => {
+      const caller = new AbortController();
+      const cancelled = requestCancelled(
+        'fetch GET https://archive.org/advancedsearch.php?q=tesla was aborted.',
+      );
+      /**
+       * The call outlives its deadline and the caller leaves; the service checks the deadline
+       * before its next request, which then fails as the cancellation it is.
+       */
+      mockService.search.mockImplementation(
+        (_params: unknown, _ctx: unknown, deadline: CallDeadline) => {
+          vi.advanceTimersByTime(56_000);
+          caller.abort();
+          deadline.assertTimeLeft();
+          return Promise.reject(cancelled);
+        },
+      );
+      const ctx = createMockContext({ signal: caller.signal });
+
+      await expect(
+        iaSearchItems.handler(iaSearchItems.input.parse({ query: 'tesla' }), ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: cancelled.message,
+      });
+    });
   });
 
   describe('format', () => {
@@ -450,7 +491,7 @@ describe('iaSearchItems', () => {
       expect(text).toContain('1');
     });
 
-    it('renders items with array creator and collection', () => {
+    it('renders each list of two or more values as one item per value between blank lines', () => {
       const output = {
         items: [
           {
@@ -458,18 +499,19 @@ describe('iaSearchItems', () => {
             creator: ['A', 'B'],
             collection: ['c1', 'c2'],
           },
+          { identifier: 'next' },
         ],
-        total_found: 1,
+        total_found: 2,
         page: 1,
         rows: 50,
       };
-      const blocks = iaSearchItems.format!(output);
-      const text = blocks.map((b) => (b as { type: string; text: string }).text).join('');
-      expect(text).toContain('A, B');
-      expect(text).toContain('c1, c2');
+      const [block] = iaSearchItems.format!(output) as [{ text: string }];
+      expect(block.text).toBe(
+        '**2 total results** — Page 1 (2 shown, 50 per page)\n\n## multi\n**Identifier:** multi\n**Creator:**\n\n- A\n- B\n\n**Collection:**\n\n- c1\n- c2\n\n## next\n**Identifier:** next\n',
+      );
     });
 
-    it('renders list-valued title and date, and names a cut creator list', () => {
+    it('lists list-valued title and date under the identifier heading, and names a cut creator list on its label line', () => {
       const output = {
         items: [
           {
@@ -484,12 +526,32 @@ describe('iaSearchItems', () => {
         page: 1,
         rows: 50,
       };
-      const text = iaSearchItems.format!(output)
-        .map((b) => (b as { type: string; text: string }).text)
-        .join('');
-      expect(text).toContain('## Part One, Part Two');
-      expect(text).toContain('**Date:** 2012-06-26T00:00:00Z, 2012-08-14T00:00:00Z');
-      expect(text).toContain('**Creator:** A, B (2 of 409; ia_get_item lists all)');
+      const [block] = iaSearchItems.format!(output) as [{ text: string }];
+      expect(block.text).toBe(
+        '**1 total results** — Page 1 (1 shown, 50 per page)\n\n## listy\n**Title:**\n\n- Part One\n- Part Two\n\n**Identifier:** listy\n**Creator:** (2 of 409; ia_get_item lists all)\n\n- A\n- B\n\n**Date:**\n\n- 2012-06-26T00:00:00Z\n- 2012-08-14T00:00:00Z\n',
+      );
+    });
+
+    it('renders a string or one-value list inline after its label, and a one-value title as the heading', () => {
+      const output = {
+        items: [
+          {
+            identifier: '00hamigoog',
+            title: ['Afganistan'],
+            creator: 'Berezovskīĭ, V.',
+            date: ['1908'],
+            downloads: 12,
+            collection: ['americana'],
+          },
+        ],
+        total_found: 1,
+        page: 1,
+        rows: 50,
+      };
+      const [block] = iaSearchItems.format!(output) as [{ text: string }];
+      expect(block.text).toBe(
+        '**1 total results** — Page 1 (1 shown, 50 per page)\n\n## Afganistan\n**Identifier:** 00hamigoog\n**Creator:** Berezovskīĭ, V.\n**Date:** 1908\n**Downloads:** 12\n**Collection:** americana\n',
+      );
     });
   });
 });

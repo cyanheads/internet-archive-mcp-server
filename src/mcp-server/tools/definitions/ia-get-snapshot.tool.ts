@@ -5,20 +5,21 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
+import { readCaptureTarget } from '@/services/wayback/wayback-capture-url.js';
 import {
   getWaybackService,
   NOT_SERVED,
   NOT_SERVED_HINT,
   notServedMessage,
 } from '@/services/wayback/wayback-service.js';
-import { TIMESTAMP_FORMS, waybackTimestamp } from '@/services/wayback/wayback-timestamp.js';
 
 export const iaGetSnapshot = tool('ia_get_snapshot', {
   title: 'Get Wayback Machine Snapshot Content',
   description:
-    'Fetch the archived content of a URL at a specific Wayback Machine timestamp. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text with its markup stripped, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass resolved_timestamp as timestamp so every page comes from the same capture. Use ia_find_snapshots first to discover valid timestamps for a URL.',
+    'Fetch the archived content of a URL at a specific Wayback Machine timestamp, or of the capture a Wayback capture URL such as a replay_url names. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text with its markup stripped, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass resolved_timestamp as timestamp so every page comes from the same capture. Use ia_find_snapshots first to discover valid timestamps for a URL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -26,11 +27,13 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .string()
       .trim()
       .min(1, 'Must not be blank — provide the URL whose archived content to retrieve.')
-      .describe('The URL whose archived content to retrieve.'),
+      .describe(
+        'The URL whose archived content to retrieve. A Wayback capture URL — web.archive.org/web/<timestamp>/<url>, such as a replay_url — reads as the URL it archives at its timestamp; a timestamp naming a different one fails as ambiguous_timestamp.',
+      ),
     timestamp: z
       .string()
       .describe(
-        'Target Wayback timestamp: 1–14 digits — YYYYMMDDHHMMSS or a prefix of it — or an ISO 8601 date or UTC date-time such as "2020-01-01" or "2020-01-01T12:00:00Z". A full 14 digits, such as resolved_timestamp or a timestamp from ia_find_snapshots, reads that capture, or the one Wayback redirects it to; a shorter value names a period and resolves to the capture nearest its end ("2015" can resolve to one from early January 2016); blank reads the latest capture. Example: "20200101120000" for noon on January 1, 2020.',
+        'Target Wayback timestamp: 1–14 digits — YYYYMMDDHHMMSS or a prefix of it — or an ISO 8601 date or UTC date-time such as "2020-01-01" or "2020-01-01T12:00:00Z". A full 14 digits, such as resolved_timestamp or a timestamp from ia_find_snapshots, reads that capture, or the one Wayback redirects it to; a shorter value names a period and resolves to the capture nearest its end ("2015" can resolve to one from early January 2016); blank reads the timestamp of a Wayback capture URL passed as url, else the latest capture. Example: "20200101120000" for noon on January 1, 2020.',
       ),
     char_offset: z
       .number()
@@ -102,9 +105,17 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     {
       reason: 'invalid_timestamp',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'timestamp is not blank, 1–14 digits, or an ISO 8601 date or UTC date-time, or names a month, day, hour, minute, or second no Gregorian date and time has.',
+      when: 'timestamp is not blank, 1–14 digits, or an ISO 8601 date or UTC date-time, or names a month, day, hour, minute, or second no Gregorian date and time has; or url is a Wayback capture URL whose timestamp is not 1–14 digits naming a real date and time (field "url").',
       recovery:
         'Set timestamp to 1–14 digits (YYYYMMDDHHMMSS or a prefix of it, such as "20200615"), an ISO 8601 date or UTC date-time such as "2020-06-15" or "2020-06-15T12:34:56Z", or blank for the latest capture.',
+      severity: 'warning',
+    },
+    {
+      reason: 'ambiguous_timestamp',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'url is a Wayback capture URL and timestamp names a different timestamp than the one the URL carries.',
+      recovery:
+        'Pass the URL the capture archives as url with the timestamp meant, or leave timestamp blank to read the capture the URL names.',
       severity: 'warning',
     },
     {
@@ -126,22 +137,28 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     {
       reason: 'content_fetch_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The archived page could not be fetched — the Wayback Machine answered HTTP 5xx after retries or 429, did not answer within the request timeout, or could not be reached, or refused the unmodified (id_) form of a text capture it had replayed — or its nearest capture could not be looked up: the closest-capture lookup found no capture or answered HTTP 429, or 408, 425, or 5xx after retries, or an unreadable response, and its CDX fallback failed or had no time left within the lookup deadline (the request timeout plus 25 s); or the lookup refused the request with another 4xx, did not answer within the request timeout, or could not be reached.',
+      when: "The archived page could not be fetched — the Wayback Machine answered HTTP 429, or 408, 425, or 5xx after retries, did not answer within the request timeout, or could not be reached, or refused the unmodified (id_) form of a text capture it had replayed — or its nearest capture could not be looked up: the closest-capture lookup found no capture or answered HTTP 429, or 408, 425, or 5xx after retries, an unreadable response, or an error in place of a capture, and its CDX fallback failed or had no time left; or the lookup refused the request with another 4xx, did not answer within the request timeout, or could not be reached; or the lookup and the fetch together did not finish within the call's 55 s deadline (the request timeout when that is longer).",
       recovery: 'The Wayback Machine is temporarily unavailable; retry in a few seconds.',
     },
   ],
 
   async handler(input, ctx) {
+    const deadline = startCallDeadline(ctx.signal);
     const svc = getWaybackService();
-    // Blank reads the latest capture, so only a non-blank timestamp is checked — before any request.
-    const text = input.timestamp.trim();
-    const timestamp = text ? waybackTimestamp(text) : undefined;
-    if (text && timestamp === undefined) {
-      throw ctx.fail('invalid_timestamp', `timestamp must be ${TIMESTAMP_FORMS}.`, {
-        field: 'timestamp',
+    // Before any request: a Wayback capture URL reads as its original URL at its own
+    // timestamp; otherwise a blank timestamp reads the latest capture.
+    const target = readCaptureTarget(input.url, input.timestamp);
+    if (target.kind === 'invalid_timestamp') {
+      throw ctx.fail('invalid_timestamp', target.message, {
+        field: target.field,
         ...ctx.recoveryFor('invalid_timestamp'),
+        ...(target.hint && { recovery: { hint: target.hint } }),
       });
     }
+    if (target.kind === 'ambiguous_timestamp') {
+      throw ctx.fail('ambiguous_timestamp', target.message, ctx.recoveryFor('ambiguous_timestamp'));
+    }
+    const { url, timestamp } = target;
 
     // When the caller passes a full 14-digit timestamp (returned by ia_find_snapshots),
     // the Wayback Availability API can spuriously return {} for that exact timestamp —
@@ -160,10 +177,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     let fetching: string | undefined;
     try {
       const resolved = exact
-        ? { snapshotUrl: svc.buildReplayUrl(exact, input.url), timestamp: exact }
-        : await svc.findClosest(input.url, timestamp, ctx);
+        ? { snapshotUrl: svc.buildReplayUrl(exact, url), timestamp: exact }
+        : await svc.findClosest(url, timestamp, ctx, deadline);
       fetching = timestamp ?? resolved.timestamp;
-      const content = await svc.fetchContent(resolved.snapshotUrl, ctx);
+      const content = await svc.fetchContent(resolved.snapshotUrl, ctx, deadline);
       const resolvedTimestamp = content.timestamp ?? resolved.timestamp;
 
       // Pages count UTF-16 code units, as ia_get_text's do, and never exceed the ceiling.
@@ -187,13 +204,15 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         );
       }
       if (hasMore) {
+        // Names the URL looked up, never a capture URL, whose own timestamp could differ from
+        // the one served; as a code span, so it reads back exactly from either surface.
         notices.push(
-          `More text follows: call ia_get_snapshot again with the same url, timestamp ${resolvedTimestamp} (resolved_timestamp), and char_offset ${nextOffset} for the next page.`,
+          `More text follows: call ia_get_snapshot again with url ${markdown().inlineCode(url).build()}, timestamp ${resolvedTimestamp} (resolved_timestamp), and char_offset ${nextOffset} for the next page.`,
         );
       }
       if (notices.length) ctx.enrich.notice(notices.join(' '));
       ctx.log.info('Snapshot content fetched', {
-        url: input.url,
+        url,
         resolvedTimestamp,
         totalChars,
         hasMore,
@@ -219,7 +238,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         if (mediaType !== undefined) {
           throw ctx.fail(
             'non_text_capture',
-            `The capture of ${input.url} that Wayback served is ${mediaType}, not text, so it has no text to return; the original file is at ${replayUrl}.`,
+            `The capture of ${url} that Wayback served is ${mediaType}, not text, so it has no text to return; the original file is at ${replayUrl}.`,
             { mediaType, replayUrl, ...ctx.recoveryFor('non_text_capture') },
             { cause: err },
           );
@@ -228,7 +247,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         if (NOT_SERVED.has(refusal)) {
           throw ctx.fail(
             'no_snapshot_available',
-            notServedMessage(input.url, refusal),
+            notServedMessage(url, refusal),
             { recovery: { hint: NOT_SERVED_HINT } },
             { cause: err },
           );
@@ -236,10 +255,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         throw ctx.fail(
           'no_snapshot_available',
           captureTimestamp !== undefined
-            ? `The capture of ${input.url} at ${captureTimestamp} is an archived HTTP ${status} error page — the site returned that error when it was captured, so the capture holds no copy of the page itself.`
+            ? `The capture of ${url} at ${captureTimestamp} is an archived HTTP ${status} error page — the site returned that error when it was captured, so the capture holds no copy of the page itself.`
             : refusal && refusal !== 404
-              ? `The Wayback Machine refused the replay request for ${input.url} at ${fetching} with HTTP ${refusal}.`
-              : `No capture found at ${input.url} for timestamp ${fetching}.`,
+              ? `The Wayback Machine refused the replay request for ${url} at ${fetching} with HTTP ${refusal}.`
+              : `No capture found at ${url} for timestamp ${fetching}.`,
           ctx.recoveryFor('no_snapshot_available'),
           { cause: err },
         );
@@ -252,7 +271,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         throw ctx.fail(
           'content_fetch_failed',
           fetching !== undefined
-            ? `Could not fetch the archived page for ${input.url} near ${fetching}: ${err.message}`
+            ? `Could not fetch the archived page for ${url} near ${fetching}: ${err.message}`
             : err.message,
           {
             ...ctx.recoveryFor('content_fetch_failed'),

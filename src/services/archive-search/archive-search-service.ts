@@ -13,7 +13,8 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig, getUserAgent } from '@/config/server-config.js';
+import { getUserAgent } from '@/config/server-config.js';
+import type { CallDeadline } from '../call-deadline.js';
 import {
   bodyReadError,
   isHtmlPage,
@@ -63,7 +64,7 @@ const CREATOR_LIMIT = 10;
 const UPSTREAM_ERROR_CHARS = 500;
 
 /**
- * The hint an outage carries — a timeout, a network error, a 5xx, or an unreadable body —
+ * The hint an outage carries — a timeout, a network error, a 5xx, an unreadable body, or the call deadline —
  * in place of the declared recovery, whose query-text advice fits only an `error` body.
  */
 const OUTAGE_HINT = `${UPSTREAM} is down or unreachable; call again in a few minutes.`;
@@ -218,11 +219,9 @@ export interface SearchParams {
 
 export class ArchiveSearchService {
   private readonly headers: Record<string, string>;
-  private readonly timeoutMs: number;
 
   constructor(config: AppConfig, _storage: StorageService) {
     this.headers = { 'User-Agent': getUserAgent(config.mcpServerVersion) };
-    this.timeoutMs = getServerConfig().requestTimeoutMs;
   }
 
   /**
@@ -236,14 +235,18 @@ export class ArchiveSearchService {
    * mid-body included), an HTML page, an unparseable body, or a body with neither key is
    * `search_unavailable` after the retry loop; a 429, another 4xx, or a request timeout
    * (headers or body) is `search_unavailable` after one request, a 429 with a hint to wait.
-   * Every outage — a timeout, a network error, a 5xx, or an unreadable body — carries the
-   * outage hint in place of the declared query-text recovery.
+   * The retry loop runs under what remains of the call's `deadline`, and every request gets the
+   * request timeout or what remains, whichever is less; the deadline running out — mid-request,
+   * mid-backoff, or before a request — is `search_unavailable` naming it (`transportError`).
+   * Every outage — a timeout, a network error, a 5xx, an unreadable body, or the deadline —
+   * carries the outage hint in place of the declared query-text recovery.
    * A caller cancellation or caller-side deadline propagates as the fetch threw it.
    */
-  search(params: SearchParams, ctx: Context): Promise<SearchResult> {
+  search(params: SearchParams, ctx: Context, deadline: CallDeadline): Promise<SearchResult> {
     const q = searchQuery(params, ctx);
     return withRetry(
-      async () => {
+      async ({ signal }) => {
+        deadline.assertTimeLeft();
         const page = params.page ?? 1;
         const rows = params.rows ?? 50;
         const qp = new URLSearchParams({
@@ -260,7 +263,12 @@ export class ArchiveSearchService {
         qp.append('sort[]', sort);
         if (!RANDOM_SORT.test(sort)) qp.append('sort[]', TIE_BREAK_SORT);
 
-        const response = await this.fetchUpstream(`${SEARCH_BASE}?${qp}`, ctx);
+        const response = await this.fetchUpstream(
+          `${SEARCH_BASE}?${qp}`,
+          deadline.nextTimeoutMs(),
+          signal,
+          ctx,
+        );
         const text = await response.text().catch((err: unknown) => {
           throw bodyReadError(err, UPSTREAM);
         });
@@ -289,14 +297,15 @@ export class ArchiveSearchService {
         return { items, totalFound, page, rows };
       },
       {
-        operation: 'ArchiveSearchService.search',
+        // No `operation` label: withRetry copies it into an exhausted error's data, which reaches the caller.
         context: ctx,
         baseDelayMs: 1_000,
         signal: ctx.signal,
+        deadlineMs: deadline.remainingMs(),
         isTransient: isRetriedFailure,
       },
     ).catch((err: unknown) => {
-      throw transportError(err, UPSTREAM, this.timeoutMs, outage());
+      throw transportError(err, UPSTREAM, deadline, outage());
     });
   }
 
@@ -307,14 +316,17 @@ export class ArchiveSearchService {
    * wait and is answered after one request by the retry predicate; any other 4xx is marked
    * `retryable: false`, with a hint that repeating it will not help (Advanced Search answers
    * a control character in the query with a 400). Every other failure, timeouts and caller
-   * cancellation included, propagates untouched.
+   * cancellation included, propagates untouched. `signal` is the retry attempt's, which the
+   * call deadline and the caller's cancellation abort.
    */
-  private async fetchUpstream(url: string, ctx: Context): Promise<Response> {
+  private async fetchUpstream(
+    url: string,
+    timeoutMs: number,
+    signal: AbortSignal,
+    ctx: Context,
+  ): Promise<Response> {
     try {
-      return await fetchWithTimeout(url, this.timeoutMs, ctx, {
-        headers: this.headers,
-        signal: ctx.signal,
-      });
+      return await fetchWithTimeout(url, timeoutMs, ctx, { headers: this.headers, signal });
     } catch (err) {
       const status = statusOf(err);
       if (status === undefined) throw err;

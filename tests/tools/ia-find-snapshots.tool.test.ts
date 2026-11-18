@@ -3,10 +3,11 @@
  * @module tests/tools/ia-find-snapshots.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
 
 type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
@@ -28,6 +29,9 @@ const mockService = {
   findClosest: vi.fn(),
   fetchHistory: vi.fn(),
 };
+
+/** The call deadline the handler starts and passes on: 55 s at the default 30 s request timeout. */
+const CALL_DEADLINE = expect.objectContaining({ budgetSeconds: 55, requestTimeoutMs: 30_000 });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -65,46 +69,40 @@ describe('iaFindSnapshots', () => {
       ['empty', ''],
       ['whitespace-only', '   '],
     ])(
-      'throws missing_timestamp when the timestamp is %s, without a lookup',
+      'returns the latest capture on both surfaces when the timestamp is %s, looking it up with none',
       async (_label, timestamp) => {
-        const ctx = createMockContext({ errors: iaFindSnapshots.errors });
-        const input = iaFindSnapshots.input.parse({
-          url: 'https://example.com',
+        const replayUrl =
+          'https://web.archive.org/web/20260515165835/https://www.parliament.uk/robots.txt';
+        mockService.findClosest.mockResolvedValue({
+          snapshotUrl: replayUrl,
+          timestamp: '20260515165835',
+          status: '200',
+        });
+
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'https://www.parliament.uk/robots.txt',
           mode: 'closest',
           ...(timestamp !== undefined && { timestamp }),
         });
 
-        const err = await iaFindSnapshots.handler(input, ctx).catch((e: unknown) => e);
-
-        expect(err).toMatchObject({
-          code: JsonRpcErrorCode.InvalidParams,
-          data: { reason: 'missing_timestamp' },
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toEqual({
+          snapshots: [{ timestamp: '20260515165835', replay_url: replayUrl, statuscode: '200' }],
         });
-        const hint = (err as { data: { recovery?: { hint?: string } } }).data.recovery?.hint ?? '';
-        expect(hint).toContain('timestamp');
-        expect(hint).toContain('YYYYMMDDHHMMSS');
-        expect(hint).toContain('history');
-        expect(mockService.findClosest).not.toHaveBeenCalled();
+        const text = contentText(result);
+        expect(text).toContain('## 20260515165835');
+        expect(text).toContain(`**Replay URL:** [${replayUrl}](<${replayUrl}>)`);
+        expect(mockService.findClosest).toHaveBeenCalledWith(
+          'https://www.parliament.uk/robots.txt',
+          undefined,
+          expect.anything(),
+          CALL_DEADLINE,
+        );
       },
     );
 
-    it('renders missing_timestamp with its Recovery line in content[]', async () => {
-      const result = await runToolContract(iaFindSnapshots, {
-        url: 'https://example.com',
-        mode: 'closest',
-        timestamp: '  ',
-      });
-
-      expect(result.isError).toBe(true);
-      expect((result.structuredContent as { error: unknown }).error).toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: { reason: 'missing_timestamp' },
-      });
-      const text = contentText(result);
-      expect(text).toMatch(/^Recovery: .*timestamp.*YYYYMMDDHHMMSS/m);
-      expect(text).toContain('(reason missing_timestamp');
-      expect(text).not.toContain('no_snapshot_available');
-      expect(mockService.findClosest).not.toHaveBeenCalled();
+    it('declares no missing_timestamp, which a blank timestamp no longer raises', () => {
+      expect(iaFindSnapshots.errors?.map((e) => e.reason)).not.toContain('missing_timestamp');
     });
 
     it('propagates no_snapshot_available from the service (empty archived_snapshots)', async () => {
@@ -130,6 +128,7 @@ describe('iaFindSnapshots', () => {
         'https://example.com',
         '20200101',
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
 
@@ -155,6 +154,7 @@ describe('iaFindSnapshots', () => {
         'https://www.nasa.gov/',
         digits,
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
 
@@ -222,6 +222,35 @@ describe('iaFindSnapshots', () => {
       });
 
       await expect(iaFindSnapshots.handler(input, ctx)).rejects.toBe(unavailable);
+    });
+
+    it('binds the deadline to the caller’s signal, so once the caller cancels it neither refuses a request nor claims a failure', async () => {
+      vi.useFakeTimers();
+      try {
+        mockService.findClosest.mockResolvedValue({
+          snapshotUrl: 'https://web.archive.org/web/20200101120000/https://example.com',
+          timestamp: '20200101120000',
+          status: '200',
+        });
+        const caller = new AbortController();
+
+        await runToolContract(
+          iaFindSnapshots,
+          { url: 'https://example.com', mode: 'closest', timestamp: '20200101' },
+          { context: { signal: caller.signal } },
+        );
+        const deadline = mockService.findClosest.mock.calls[0]?.[3] as CallDeadline;
+        const expiry = timeout('Deadline exceeded.', { reason: 'retry_deadline_exceeded' });
+        vi.advanceTimersByTime(55_000);
+
+        expect(() => deadline.assertTimeLeft()).toThrow(/call deadline ran out/);
+        expect(deadline.isExpiry(expiry)).toBe(true);
+        caller.abort();
+        expect(() => deadline.assertTimeLeft()).not.toThrow();
+        expect(deadline.isExpiry(expiry)).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -330,6 +359,7 @@ describe('iaFindSnapshots', () => {
       expect(mockService.fetchHistory).toHaveBeenCalledWith(
         expect.objectContaining({ from: cdxFrom, to: cdxTo }),
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
 
@@ -369,6 +399,25 @@ describe('iaFindSnapshots', () => {
       expect(result.isError).toBeFalsy();
     });
 
+    it.each([
+      [
+        'a calendar URL',
+        'https://web.archive.org/web/2*/http://abcnews.go.com/Technology/wireStory/plastic-surgery-clinics-hacked-25000-photos-data-online-47728631',
+      ],
+      ['an archive.org/web URL', 'https://archive.org/web/20241231012939/https://digital.ucd.ie/'],
+    ])('lists the captures of %s itself, unchanged', async (_label, url) => {
+      mockService.fetchHistory.mockResolvedValue(oneRecord);
+
+      const result = await runToolContract(iaFindSnapshots, { url, mode: 'history' });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.fetchHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ url }),
+        expect.anything(),
+        CALL_DEADLINE,
+      );
+    });
+
     it('passes collapse="" as undefined to service, which applies its timestamp:8 default', async () => {
       mockService.fetchHistory.mockResolvedValue({
         records: [
@@ -393,8 +442,122 @@ describe('iaFindSnapshots', () => {
       expect(mockService.fetchHistory).toHaveBeenCalledWith(
         expect.objectContaining({ collapse: undefined }),
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
+  });
+
+  describe('a Wayback capture URL as url (#59)', () => {
+    const ORIGINAL = 'https://digital.ucd.ie/';
+    const CAPTURE = `https://web.archive.org/web/20241231012939/${ORIGINAL}`;
+    const errorOf = (result: ToolResult) => (result.structuredContent as { error: unknown }).error;
+
+    it.each([
+      ['omitted', {}],
+      ['blank', { timestamp: ' ' }],
+      ['its own digits as an ISO date-time', { timestamp: '2024-12-31T01:29:39Z' }],
+    ])(
+      'closest mode looks up the original URL at the URL’s timestamp when timestamp is %s',
+      async (_label, rest) => {
+        mockService.findClosest.mockResolvedValue({
+          snapshotUrl: CAPTURE,
+          timestamp: '20241231012939',
+          status: '200',
+        });
+
+        const result = await runToolContract(iaFindSnapshots, {
+          url: CAPTURE,
+          mode: 'closest',
+          ...rest,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(mockService.findClosest).toHaveBeenCalledWith(
+          ORIGINAL,
+          '20241231012939',
+          expect.anything(),
+          CALL_DEADLINE,
+        );
+      },
+    );
+
+    it('closest mode fails a timestamp naming a different capture as ambiguous_timestamp on both surfaces, without a lookup', async () => {
+      const result = await runToolContract(iaFindSnapshots, {
+        url: CAPTURE,
+        mode: 'closest',
+        timestamp: '2024',
+      });
+
+      const recovery = iaFindSnapshots.errors?.find(
+        (e) => e.reason === 'ambiguous_timestamp',
+      )?.recovery;
+      expect(recovery).toBeDefined();
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(ORIGINAL),
+        data: { reason: 'ambiguous_timestamp', recovery: { hint: recovery } },
+      });
+      const text = contentText(result);
+      expect(text).toContain(`Recovery: ${recovery}`);
+      expect(text).toContain('(reason ambiguous_timestamp');
+      expect(mockService.findClosest).not.toHaveBeenCalled();
+    });
+
+    it('history mode lists the original URL’s captures, reading neither the URL’s timestamp nor timestamp', async () => {
+      mockService.fetchHistory.mockResolvedValue({
+        records: [{ timestamp: '20200601120000', statuscode: '200', original: '', digest: 'X' }],
+      });
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: CAPTURE,
+        mode: 'history',
+        timestamp: '2015',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockService.fetchHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ url: ORIGINAL, from: undefined, to: undefined }),
+        expect.anything(),
+        CALL_DEADLINE,
+      );
+      expect(result.structuredContent).toMatchObject({
+        snapshots: [{ replay_url: `https://web.archive.org/web/20200601120000/${ORIGINAL}` }],
+      });
+    });
+
+    it('history mode names the original URL when it finds no captures', async () => {
+      mockService.fetchHistory.mockResolvedValue({ records: [] });
+
+      const result = await runToolContract(iaFindSnapshots, { url: CAPTURE, mode: 'history' });
+
+      expect(errorOf(result)).toMatchObject({
+        message: `No snapshots found for "${ORIGINAL}" with the specified filters.`,
+        data: { reason: 'no_snapshots' },
+      });
+    });
+
+    it.each(['closest', 'history'] as const)(
+      '%s mode fails a capture URL’s impossible timestamp as invalid_timestamp naming url, without a request',
+      async (mode) => {
+        const result = await runToolContract(iaFindSnapshots, {
+          url: `https://web.archive.org/web/20241399/${ORIGINAL}`,
+          mode,
+        });
+
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining('20241399'),
+          data: {
+            reason: 'invalid_timestamp',
+            field: 'url',
+            recovery: { hint: expect.stringContaining('/web/') },
+          },
+        });
+        expect(contentText(result)).toMatch(/^Recovery: .*\/web\//m);
+        expect(mockService.findClosest).not.toHaveBeenCalled();
+        expect(mockService.fetchHistory).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('blank url', () => {
@@ -440,6 +603,7 @@ describe('iaFindSnapshots', () => {
         'https://example.com',
         '20200101',
         expect.anything(),
+        CALL_DEADLINE,
       );
     });
   });

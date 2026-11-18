@@ -26,14 +26,11 @@ import { initArchiveMetadataService } from '@/services/archive-metadata/archive-
 
 type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
-/** IA_REQUEST_TIMEOUT_MS at its default. */
-const REQUEST_TIMEOUT_MS = 30_000;
+/** The call deadline at the default IA_REQUEST_TIMEOUT_MS (30 s). */
+const CALL_DEADLINE_MS = 55_000;
 
-/** The longest wait between a first and second attempt: the 1 s base backoff plus its 25% jitter. */
-const FIRST_BACKOFF_MAX_MS = 1_250;
-
-/** Two timed-out attempts and the backoff between them. */
-const TWO_TIMEOUTS_MS = 2 * REQUEST_TIMEOUT_MS + FIRST_BACKOFF_MAX_MS;
+/** 100 ms inside the default 30 s request timeout. */
+const JUST_INSIDE_MS = 29_900;
 
 const ID = 'a-volume';
 const FILE = 'a-volume_djvu.txt';
@@ -70,6 +67,24 @@ const hang: FetchMockResponder = (request) =>
   new Promise((_, reject) => {
     request.signal.addEventListener('abort', () => reject(request.signal.reason));
   });
+
+/** Answers as `respond` would after `ms`, unless the request's signal aborts first. */
+const answerAfter =
+  (ms: number, respond: FetchMockResponder): FetchMockResponder =>
+  (request, ...rest) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(respond(request, ...rest)), ms);
+      request.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(request.signal.reason);
+      });
+    });
+
+/** The message of a call that ran out of its 55 s deadline waiting on `upstream`. */
+const deadlineMessage = (upstream: string) =>
+  `${upstream} did not finish within the 55 s call deadline.`;
+const METADATA_API = 'The Internet Archive Metadata API';
+const DOWNLOAD = `The download of "${FILE}"`;
 
 /** Headers arrive with `head` as the first body bytes; the rest never comes until the request's signal aborts. */
 const stall =
@@ -161,7 +176,10 @@ const expectNoBody = (result: ToolResult) => {
   expect(contentText(result)).not.toContain('upstream-error-page-marker');
 };
 
-/** `archive_unavailable` with `recovery` on both surfaces, no upstream body, not marked unretryable. */
+/**
+ * `archive_unavailable` with `recovery` on both surfaces, no upstream body, not marked
+ * unretryable, and no internal operation label.
+ */
 const expectUnavailable = (result: ToolResult, recovery: string) => {
   expect(result.structuredContent).toMatchObject({
     error: {
@@ -171,6 +189,7 @@ const expectUnavailable = (result: ToolResult, recovery: string) => {
   });
   expect(contentText(result)).toContain(`Recovery: ${recovery}`);
   expect(errorOf(result).data).not.toHaveProperty('retryable');
+  expect(errorOf(result).data).not.toHaveProperty('operation');
   expect(contentText(result)).not.toContain('not retryable');
   expectNoBody(result);
 };
@@ -526,17 +545,16 @@ describe('Metadata API failures surface as archive_unavailable', () => {
       ['headers never arrive', hang],
       ['the body stalls', stall('{"metadata":')],
     ])(
-      'answers a second timeout (%s) after two requests, within two request timeouts',
+      'retries a first timeout (%s) once, and the call deadline cuts the second request',
       async (_label, respond) => {
         routeMetadata(respond);
 
         const { result, elapsedMs } = await runTimed(run);
 
         expect(calls(isMetadata)).toHaveLength(2);
-        expect(elapsedMs).toBeGreaterThanOrEqual(2 * REQUEST_TIMEOUT_MS);
-        expect(elapsedMs).toBeLessThanOrEqual(TWO_TIMEOUTS_MS);
+        expect(elapsedMs).toBe(CALL_DEADLINE_MS);
         expectUnavailable(result, declared());
-        expect(errorOf(result).message).toMatch(/Metadata API timed out after 30 s/);
+        expect(errorOf(result).message).toBe(deadlineMessage(METADATA_API));
         expect(calls(isDownload)).toHaveLength(0);
       },
     );
@@ -573,14 +591,15 @@ describe('Metadata API failures surface as archive_unavailable', () => {
       expect(errorOf(result).message).toContain('HTTP 503');
     });
 
-    it('stops at the second timeout even with a 5xx between the two', async () => {
+    it('sends no fourth request after a timeout, a 5xx, and a second stall the deadline cuts', async () => {
       routeMetadata(inSequence(hang, status(503), hang));
 
-      const { result } = await runTimed(run);
+      const { result, elapsedMs } = await runTimed(run);
 
       expect(calls(isMetadata)).toHaveLength(3);
+      expect(elapsedMs).toBe(CALL_DEADLINE_MS);
       expectUnavailable(result, declared());
-      expect(errorOf(result).message).toMatch(/Metadata API timed out after 30 s/);
+      expect(errorOf(result).message).toBe(deadlineMessage(METADATA_API));
     });
 
     it.each([
@@ -726,29 +745,30 @@ describe('ia_get_text download failures surface as archive_unavailable', () => {
     routeMetadata(MANIFEST);
   });
 
-  it('answers a second header timeout after two download requests, within two request timeouts', async () => {
+  it('retries a first download header timeout once, and the call deadline cuts the second', async () => {
     routeDownload(hang);
 
     const { result, elapsedMs } = await runTimed(() => getText());
 
     expect(calls(isDownload)).toHaveLength(2);
     expect(calls(isMetadata)).toHaveLength(1);
-    expect(elapsedMs).toBeGreaterThanOrEqual(2 * REQUEST_TIMEOUT_MS);
-    expect(elapsedMs).toBeLessThanOrEqual(TWO_TIMEOUTS_MS);
+    expect(elapsedMs).toBe(CALL_DEADLINE_MS);
     expectUnavailable(result, declared());
-    expect(errorOf(result).message).toContain(`download of "${FILE}" timed out after 30 s`);
+    expect(errorOf(result).message).toBe(deadlineMessage(DOWNLOAD));
   });
 
-  it('answers a deep page whose read stalls mid-file twice after two download requests', async () => {
+  it('answers a deep page whose read stalls mid-file at the call deadline, with no partial text', async () => {
     /** The file streams 1 MiB of text, then stops before the page at char_offset 5,000,000. */
     routeDownload(stall('x'.repeat(1024 * 1024)));
 
     const { result, elapsedMs } = await runTimed(() => getText(5_000_000));
 
     expect(calls(isDownload)).toHaveLength(2);
-    expect(elapsedMs).toBeLessThanOrEqual(TWO_TIMEOUTS_MS);
+    expect(elapsedMs).toBe(CALL_DEADLINE_MS);
     expectUnavailable(result, declared());
-    expect(declared()).toMatch(/can time out the same way; the download_url/);
+    expect(errorOf(result).message).toBe(deadlineMessage(DOWNLOAD));
+    expect(result.structuredContent).not.toHaveProperty('text');
+    expect(declared()).toMatch(/cut off by the call deadline, a retry can stall the same way/);
   });
 
   it.each([
@@ -770,17 +790,18 @@ describe('ia_get_text download failures surface as archive_unavailable', () => {
     expect(calls(isMetadata)).toHaveLength(1);
   });
 
-  it('gives the metadata request and the download one timeout retry each', async () => {
+  it('gives the metadata request its timeout retry, then cuts the stalled download at the call deadline', async () => {
     http.reset();
     routeMetadata(inSequence(hang, MANIFEST));
     routeDownload(inSequence(hang, () => new Response('Chapter one.')));
 
-    const { result } = await runTimed(() => getText());
+    const { result, elapsedMs } = await runTimed(() => getText());
 
-    expect(result.isError).toBeFalsy();
-    expect(result.structuredContent).toMatchObject({ text: 'Chapter one.' });
     expect(calls(isMetadata)).toHaveLength(2);
-    expect(calls(isDownload)).toHaveLength(2);
+    expect(calls(isDownload)).toHaveLength(1);
+    expect(elapsedMs).toBe(CALL_DEADLINE_MS);
+    expectUnavailable(result, declared());
+    expect(errorOf(result).message).toBe(deadlineMessage(DOWNLOAD));
   });
 
   it.each([
@@ -861,6 +882,151 @@ describe('ia_get_text download failures surface as archive_unavailable', () => {
     });
     expect(errorOf(result).data?.reason).toBeUndefined();
     expect(calls(isDownload)).toHaveLength(1);
+  });
+});
+
+describe('one call deadline spans every Metadata API and download request', () => {
+  let random: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // Backoff without jitter: exactly 1 s, then 2 s, then 4 s.
+    random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+
+  afterEach(() => {
+    random.mockRestore();
+  });
+
+  it.each([
+    ['ia_get_item', getItem, iaGetItem],
+    ['ia_get_text', () => getText(), iaGetText],
+  ] as const)(
+    '%s settles at 55 s when every Metadata API answer is a 503 just inside the request timeout',
+    async (_name, run, def) => {
+      routeMetadata(answerAfter(JUST_INSIDE_MS, status(503)));
+
+      const { result, elapsedMs } = await runTimed(run);
+
+      expect(elapsedMs).toBe(CALL_DEADLINE_MS);
+      expect(calls(isMetadata)).toHaveLength(2);
+      expect(calls(isDownload)).toHaveLength(0);
+      expectUnavailable(result, hint(def.errors, 'archive_unavailable'));
+      expect(errorOf(result).message).toBe(deadlineMessage(METADATA_API));
+      expect(contentText(result)).toContain(deadlineMessage(METADATA_API));
+    },
+  );
+
+  it.each([
+    ['ia_get_item', getItem, iaGetItem],
+    ['ia_get_text', () => getText(), iaGetText],
+  ] as const)(
+    '%s ends at the 503 whose 2 s backoff would outlast the deadline, never sleeping past 55 s',
+    async (_name, run, def) => {
+      // A 503 at 29.9 s, then its retry, sent at 30.9 s, answering a 503 at 54.5 s.
+      routeMetadata(
+        inSequence(answerAfter(JUST_INSIDE_MS, status(503)), answerAfter(23_600, status(503))),
+      );
+
+      const { result, elapsedMs } = await runTimed(run);
+
+      expect(elapsedMs).toBe(54_500);
+      expect(calls(isMetadata)).toHaveLength(2);
+      expect(calls(isDownload)).toHaveLength(0);
+      expectUnavailable(result, hint(def.errors, 'archive_unavailable'));
+      expect(errorOf(result).message).toBe(deadlineMessage(METADATA_API));
+      expect(contentText(result)).toContain(deadlineMessage(METADATA_API));
+    },
+  );
+
+  it('ia://item settles at 55 s under the same 503s, naming the deadline', async () => {
+    routeMetadata(answerAfter(JUST_INSIDE_MS, status(503)));
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+
+    vi.useFakeTimers();
+    const start = Date.now();
+    const pending = iaItemResource
+      .handler(iaItemResource.params.parse({ identifier: ID }), ctx)
+      .catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+    const err = await pending;
+
+    expect(Date.now() - start).toBe(CALL_DEADLINE_MS);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: deadlineMessage(METADATA_API),
+      data: {
+        reason: 'archive_unavailable',
+        recovery: { hint: hint(iaItemResource.errors, 'archive_unavailable') },
+      },
+    });
+    expect(err).not.toHaveProperty('data.retryable');
+    expect(calls(isMetadata)).toHaveLength(2);
+  });
+
+  it('ia_get_text gives the download only what the slow metadata request left', async () => {
+    routeMetadata(answerAfter(JUST_INSIDE_MS, MANIFEST));
+    routeDownload(answerAfter(JUST_INSIDE_MS, status(503)));
+
+    const { result, elapsedMs } = await runTimed(() => getText());
+
+    expect(elapsedMs).toBe(CALL_DEADLINE_MS);
+    expect(calls(isMetadata)).toHaveLength(1);
+    expect(calls(isDownload)).toHaveLength(1);
+    expectUnavailable(result, hint(iaGetText.errors, 'archive_unavailable'));
+    expect(errorOf(result).message).toBe(deadlineMessage(DOWNLOAD));
+  });
+
+  it('ia_get_text sends no download once 1 ms or less of the deadline remains', async () => {
+    // A first timeout at 30 s, its retry from 31 s answering at 54.999 s.
+    routeMetadata(inSequence(hang, answerAfter(23_999, MANIFEST)));
+    routeDownload(() => new Response('Chapter one.'));
+
+    const { result, elapsedMs } = await runTimed(() => getText());
+
+    expect(elapsedMs).toBe(CALL_DEADLINE_MS - 1);
+    expect(calls(isMetadata)).toHaveLength(2);
+    expect(calls(isDownload)).toHaveLength(0);
+    expectUnavailable(result, hint(iaGetText.errors, 'archive_unavailable'));
+    expect(errorOf(result).message).toBe(deadlineMessage(DOWNLOAD));
+  });
+
+  it('ia_get_text still serves a chained answer that lands inside the deadline', async () => {
+    routeMetadata(answerAfter(JUST_INSIDE_MS, MANIFEST));
+    routeDownload(answerAfter(20_000, () => new Response('Chapter one.')));
+
+    const { result, elapsedMs } = await runTimed(() => getText());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ text: 'Chapter one.' });
+    expect(contentText(result)).toContain('Chapter one.');
+    expect(elapsedMs).toBe(JUST_INSIDE_MS + 20_000);
+  });
+
+  it.each([
+    ['ia_get_item', iaGetItem],
+    ['ia_get_text', iaGetText],
+  ] as const)('%s keeps a cancellation during a backoff a cancellation', async (_name, def) => {
+    routeMetadata(status(503));
+    const controller = new AbortController();
+    vi.useFakeTimers();
+
+    const pending = runToolContract(
+      def,
+      { identifier: ID },
+      { context: { signal: controller.signal } },
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    expect(calls(isMetadata)).toHaveLength(1);
+    controller.abort();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.RequestCancelled },
+    });
+    expect(errorOf(result).data?.reason).toBeUndefined();
+    expect(errorOf(result).message).not.toMatch(/deadline|timed out/);
+    expect(calls(isMetadata)).toHaveLength(1);
   });
 });
 

@@ -17,15 +17,25 @@ const fetchWithTimeout = vi.fn();
 
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>();
+  type Attempt = Parameters<Parameters<typeof actual.withRetry>[0]>[0];
   return {
     ...actual,
     fetchWithTimeout: (...args: Parameters<typeof fetchWithTimeout>) => fetchWithTimeout(...args),
-    withRetry: <T>(fn: () => Promise<T>) => fn(),
+    // One attempt, on the caller's signal; async like the real loop, so a throw inside the attempt arrives as a rejection.
+    withRetry: async <T>(
+      fn: (attempt: Attempt) => Promise<T>,
+      options?: Parameters<typeof actual.withRetry>[1],
+    ): Promise<T> =>
+      await fn({
+        signal: options?.signal ?? new AbortController().signal,
+        remainingMs: Number.POSITIVE_INFINITY,
+      }),
   };
 });
 
 import { getServerConfig } from '@/config/server-config.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
+import { startCallDeadline } from '@/services/call-deadline.js';
 import { WaybackService } from '@/services/wayback/wayback-service.js';
 import {
   CPU_TIMED_TEST_TIMEOUT_MS,
@@ -63,7 +73,8 @@ const served = (
 
 const fetchContent = (response: Response) => {
   fetchWithTimeout.mockResolvedValueOnce(response);
-  return buildService().fetchContent(SNAPSHOT, createMockContext({ errors: iaGetSnapshot.errors }));
+  const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+  return buildService().fetchContent(SNAPSHOT, ctx, startCallDeadline(ctx.signal));
 };
 
 /** The text extracted from an HTML string served as UTF-8. */
@@ -273,7 +284,7 @@ describe('fetchContent scan time (#8)', () => {
     const ctx = createMockContext({ errors: iaGetSnapshot.errors });
     return () => {
       fetchWithTimeout.mockResolvedValueOnce(served(html));
-      return svc.fetchContent(SNAPSHOT, ctx);
+      return svc.fetchContent(SNAPSHOT, ctx, startCallDeadline(ctx.signal));
     };
   };
 
@@ -676,10 +687,8 @@ describe('fetchContent media-type routing (#49)', () => {
   /** fetchContent of `snapshotUrl`, the upstream answering each request in turn with `responses`. */
   const fetchServed = (snapshotUrl: string, ...responses: Response[]) => {
     for (const response of responses) fetchWithTimeout.mockResolvedValueOnce(response);
-    return buildService().fetchContent(
-      snapshotUrl,
-      createMockContext({ errors: iaGetSnapshot.errors }),
-    );
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    return buildService().fetchContent(snapshotUrl, ctx, startCallDeadline(ctx.signal));
   };
   const requestedUrls = () => fetchWithTimeout.mock.calls.map((call) => String(call[0]));
 

@@ -3,10 +3,11 @@
  * @module tests/tools/ia-get-item.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
+import type { CallDeadline } from '@/services/call-deadline.js';
 
 type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
@@ -196,6 +197,43 @@ describe('iaGetItem', () => {
     expect(result.subject).toEqual(['subject1', 'subject2']);
   });
 
+  describe('the call deadline (#55)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("binds the deadline to the caller's signal, so a caller who left past 55 s gets the cancellation", async () => {
+      const caller = new AbortController();
+      const cancelled = requestCancelled(
+        'fetch GET https://archive.org/metadata/pg1342 was aborted.',
+      );
+      /**
+       * The call outlives its deadline and the caller leaves; the service checks the deadline
+       * before its next request, which then fails as the cancellation it is.
+       */
+      mockService.getItem.mockImplementation(
+        (_identifier: string, _ctx: unknown, deadline: CallDeadline) => {
+          vi.advanceTimersByTime(56_000);
+          caller.abort();
+          deadline.assertTimeLeft();
+          return Promise.reject(cancelled);
+        },
+      );
+      const ctx = createMockContext({ errors: iaGetItem.errors, signal: caller.signal });
+
+      await expect(
+        iaGetItem.handler(iaGetItem.input.parse({ identifier: 'pg1342' }), ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: cancelled.message,
+      });
+    });
+  });
+
   describe('format', () => {
     it('renders identifier, title, creator, and file listing', () => {
       const output = {
@@ -236,7 +274,7 @@ describe('iaGetItem', () => {
       expect(text).toContain('no-title-id');
     });
 
-    it('renders array subject and collection with comma join', () => {
+    it('renders each list of two or more values as one item per value between blank lines', () => {
       const output = {
         identifier: 'test',
         subject: ['s1', 's2'],
@@ -244,22 +282,29 @@ describe('iaGetItem', () => {
         file_count: 0,
         files: [],
       };
-      const blocks = iaGetItem.format!(output);
-      const text = blocks.map((b) => (b as { type: string; text: string }).text).join('');
-      expect(text).toContain('s1, s2');
-      expect(text).toContain('c1, c2');
+      const [block] = iaGetItem.format!(output) as [{ text: string }];
+      expect(block.text).toBe(
+        '# test\n**Identifier:** test\n**Subjects:**\n\n- s1\n- s2\n\n**Collection:**\n\n- c1\n- c2\n\n**Files (0):**',
+      );
     });
 
-    it('puts each value of a list description on its own line, keeping its line breaks', () => {
-      const text = (
-        iaGetItem.format!({
-          identifier: 'x',
-          description: ['First line\nsecond line', 'Third'],
-          file_count: 0,
-          files: [],
-        })[0] as { text: string }
-      ).text;
-      expect(text).toContain('**Description:** First line\\\nsecond line\\\nThird\n');
+    it('renders each value of a list description as its own item, keeping its line breaks', () => {
+      const render = (description: string[]) =>
+        (
+          iaGetItem.format!({ identifier: 'x', description, file_count: 0, files: [] })[0] as {
+            text: string;
+          }
+        ).text;
+      expect(render(['First line\nsecond line', 'Third'])).toBe(
+        '# x\n**Identifier:** x\n\n**Description:**\n\n- First line\\\nsecond line\n- Third\n\n**Files (0):**',
+      );
+      // Three values, and two whose second holds the line break: no longer the same text.
+      expect(render(['Digitized.', 'Photocopy', 'Mode of access: Internet'])).toBe(
+        '# x\n**Identifier:** x\n\n**Description:**\n\n- Digitized.\n- Photocopy\n- Mode of access: Internet\n\n**Files (0):**',
+      );
+      expect(render(['Digitized.', 'Photocopy\nMode of access: Internet'])).toBe(
+        '# x\n**Identifier:** x\n\n**Description:**\n\n- Digitized.\n- Photocopy\\\nMode of access: Internet\n\n**Files (0):**',
+      );
     });
 
     it('renders a converted description as literal text', () => {
@@ -284,6 +329,24 @@ describe('iaGetItem', () => {
         }
       ).text;
       expect(text).toContain('**Page Images:** 0');
+    });
+
+    it('renders a string or one-value list inline after its label, and a one-value title as the heading', () => {
+      const text = (
+        iaGetItem.format!({
+          identifier: 'prideprejudice00aust',
+          title: ['Pride and prejudice'],
+          creator: 'Austen, Jane, 1775-1817',
+          date: '1894',
+          collection: ['americana'],
+          description: ['A novel.'],
+          file_count: 0,
+          files: [],
+        })[0] as { text: string }
+      ).text;
+      expect(text).toBe(
+        '# Pride and prejudice\n**Identifier:** prideprejudice00aust\n**Creator:** Austen, Jane, 1775-1817\n**Date:** 1894\n**Collection:** americana\n\n**Description:** A novel.\n\n**Files (0):**',
+      );
     });
   });
 
@@ -330,7 +393,11 @@ describe('iaGetItem', () => {
       const result = await runToolContract(iaGetItem, { identifier: ' pg1342  ' });
 
       expect(result.isError).toBeFalsy();
-      expect(mockService.getItem).toHaveBeenCalledWith('pg1342', expect.anything());
+      expect(mockService.getItem).toHaveBeenCalledWith(
+        'pg1342',
+        expect.anything(),
+        expect.objectContaining({ budgetSeconds: 55 }),
+      );
     });
   });
 
@@ -350,7 +417,11 @@ describe('iaGetItem', () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expect(mockService.getItem).toHaveBeenCalledWith('prideprejudice00aust', expect.anything());
+      expect(mockService.getItem).toHaveBeenCalledWith(
+        'prideprejudice00aust',
+        expect.anything(),
+        expect.objectContaining({ budgetSeconds: 55 }),
+      );
       expect((result.structuredContent as { identifier: string }).identifier).toBe(
         'prideprejudice00aust',
       );
@@ -388,7 +459,7 @@ describe('iaGetItem', () => {
   });
 
   describe('language (repeatable upstream field)', () => {
-    it('returns an array language through output validation and renders it joined', async () => {
+    it('returns an array language through output validation and renders one item per language', async () => {
       mockService.getItem.mockResolvedValue({
         metadata: {
           identifier: 'protestant-review_1938-01_15_1',
@@ -407,7 +478,9 @@ describe('iaGetItem', () => {
         'English',
         'French',
       ]);
-      expect(contentText(result)).toContain('**Language:** German, English, French');
+      expect(contentText(result)).toContain(
+        '**Language:**\n\n- German\n- English\n- French\n\n**Files (0):**',
+      );
     });
 
     it('keeps a single language a plain string, not a one-element array', async () => {
@@ -434,7 +507,7 @@ describe('iaGetItem', () => {
   });
 
   describe('title and date (documented single-valued, sometimes lists upstream)', () => {
-    it('returns a list-valued title and date through output validation and renders every value', async () => {
+    it('returns a list-valued title and date through output validation and lists every value, the identifier as the heading', async () => {
       mockService.getItem.mockResolvedValue({
         metadata: {
           identifier: '00hamigoog',
@@ -450,9 +523,9 @@ describe('iaGetItem', () => {
       const sc = result.structuredContent as { title: unknown; date: unknown };
       expect(sc.title).toEqual(['Afganistan ', 'Афганистанъ ']);
       expect(sc.date).toEqual(['1908', '1909']);
-      const text = contentText(result);
-      expect(text).toMatch(/^# Afganistan , Афганистанъ/);
-      expect(text).toContain('**Date:** 1908, 1909');
+      expect(contentText(result)).toBe(
+        '# 00hamigoog\n**Title:**\n\n- Afganistan&#32;\n- Афганистанъ&#32;\n\n**Identifier:** 00hamigoog\n**Date:**\n\n- 1908\n- 1909\n\n**Files (0):**',
+      );
     });
 
     it('keeps a string title and date unchanged', async () => {
@@ -475,16 +548,17 @@ describe('iaGetItem', () => {
       expect(contentText(result)).toContain('**Date:** 1894');
     });
 
-    it('keeps a list title holding a line break out of the heading', () => {
-      const text = (
-        iaGetItem.format!({
-          identifier: 'x',
-          title: ['First', 'Second\nline'],
-          file_count: 0,
-          files: [],
-        })[0] as { text: string }
-      ).text;
-      expect(text).toMatch(/^First, Second\\\nline\n/);
+    it('keeps a title holding a line break out of the heading', () => {
+      const render = (title: string[]) =>
+        (
+          iaGetItem.format!({ identifier: 'x', title, file_count: 0, files: [] })[0] as {
+            text: string;
+          }
+        ).text;
+      expect(render(['First', 'Second\nline'])).toBe(
+        '# x\n**Title:**\n\n- First\n- Second\\\nline\n\n**Identifier:** x\n\n**Files (0):**',
+      );
+      expect(render(['Second\nline'])).toBe('Second\\\nline\n**Identifier:** x\n\n**Files (0):**');
     });
 
     it('accepts both shapes in the declared output schema', () => {
@@ -550,20 +624,9 @@ describe('iaGetItem', () => {
         access_restricted: true,
         image_count: 354,
       });
-      const text = contentText(result);
-      for (const line of [
-        '**Publisher:** Westport, Conn. : Greenwood Press, Greenwood',
-        '**Volume:** 2',
-        '**ISBN:** 9780313328770, 0313328773',
-        '**OCLC ID:** 85792390',
-        '**LCCN:** 2006022953, cn 87032552',
-        '**Open Library Edition:** OL10420367M',
-        '**Open Library Work:** OL3939167W',
-        '**Page Images:** 354',
-        '**Access Restricted:** true',
-      ]) {
-        expect(text).toContain(line);
-      }
+      expect(contentText(result)).toContain(
+        '\n**Media Type:** texts\n**Publisher:**\n\n- Westport, Conn. : Greenwood Press\n- Greenwood\n\n**Volume:** 2\n**ISBN:**\n\n- 9780313328770\n- 0313328773\n\n**OCLC ID:** 85792390\n**LCCN:**\n\n- 2006022953\n- cn 87032552\n\n**Open Library Edition:** OL10420367M\n**Open Library Work:** OL3939167W\n**Page Images:** 354\n**Access Restricted:** true\n\n**Files (2):**',
+      );
     });
 
     it('marks a private file on both surfaces and leaves a public one unmarked', async () => {
@@ -816,7 +879,11 @@ describe('iaGetItem', () => {
       await run({ max_files: 5, file_offset: 10, format: 'JPEG Thumb' });
 
       expect(mockService.getItem).toHaveBeenCalledTimes(1);
-      expect(mockService.getItem).toHaveBeenCalledWith('big', expect.anything());
+      expect(mockService.getItem).toHaveBeenCalledWith(
+        'big',
+        expect.anything(),
+        expect.objectContaining({ budgetSeconds: 55 }),
+      );
     });
 
     it('serves max_files above the cap on an item with fewer files, with no truncation or notice', async () => {

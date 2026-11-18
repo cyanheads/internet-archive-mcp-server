@@ -19,7 +19,7 @@ export interface CdxRecord {
   timestamp: string;
 }
 
-/** The capture nearest a requested timestamp, from the Availability API or the CDX fallback. */
+/** The capture nearest a requested timestamp, or the latest one when none is given, from the Availability API or the CDX fallback. */
 export interface ClosestSnapshot {
   /** Replay URL of the capture on https://web.archive.org. */
   snapshotUrl: string;

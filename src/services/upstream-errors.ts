@@ -1,13 +1,14 @@
 /**
  * @fileoverview Upstream failure classification shared by the Advanced Search, Metadata, and
  * Wayback services: the HTTP status a fetch error carries, the wait a 429 names, transport failures
- * (a request timeout, a network error, a connection dropped mid-body), and the retry
- * predicate built on them.
+ * (a request timeout, a network error, a connection dropped mid-body), the retry predicate built
+ * on them, and how a request left without an answer — the call deadline included — fails.
  * @module services/upstream-errors
  */
 
 import { McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { defaultIsTransient } from '@cyanheads/mcp-ts-core/utils';
+import type { CallDeadline } from './call-deadline.js';
 
 /** `errorSource` of a body read the connection dropped under, tagged so `transportFailure` sees a network error. */
 const BODY_READ_NETWORK_ERROR = 'BodyReadNetworkError';
@@ -106,22 +107,35 @@ export function isRetriedFailure(err: unknown): boolean {
 }
 
 /**
- * A transport failure from `upstream` rethrown as `ServiceUnavailable` carrying `data` (the
- * calling tool's declared reason and hint) and, after a network error, the attempts made.
- * Any other error is returned as it is.
+ * A request to `upstream` that got no usable answer, rethrown as `ServiceUnavailable` carrying
+ * `data` (the calling tool's declared reason and hint). The call deadline running out —
+ * mid-request, mid-backoff, or before a request (`CallDeadline.isExpiry`) — names the deadline,
+ * except that an answer which completed as it ran out and would have ended the ladder anyway (a
+ * 429 or a refusal) is returned as it was. A request's own timeout names the request timeout; a
+ * network error names the attempts made. Any other error is returned as it is.
  */
 export function transportError(
   err: unknown,
   upstream: string,
-  timeoutMs: number,
+  deadline: CallDeadline,
   data: Record<string, unknown>,
 ): unknown {
+  if (deadline.isExpiry(err)) {
+    const { cause } = err as McpError;
+    const answered = cause instanceof McpError && typeof cause.data?.status === 'number';
+    if (answered && !isRetriedFailure(cause)) return cause;
+    return serviceUnavailable(
+      `${upstream} did not finish within the ${deadline.budgetSeconds} s call deadline.`,
+      data,
+      { cause: err },
+    );
+  }
   const failure = transportFailure(err);
   if (!failure) return err;
   const { retryAttempts } = (err as McpError).data ?? {};
   return serviceUnavailable(
     failure === 'timeout'
-      ? `${upstream} timed out after ${timeoutMs / 1000} s.`
+      ? `${upstream} timed out after ${deadline.requestTimeoutMs / 1000} s.`
       : `${upstream} could not be reached (network error${retryAttempts ? `, ${retryAttempts} attempts` : ''}).`,
     { ...data, ...(retryAttempts !== undefined && { retryAttempts }) },
     { cause: err },
