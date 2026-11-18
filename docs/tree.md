@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-11-12 12:25:33
+Generated on: 2026-11-18 06:54:14
 
 ```text
 internet-archive-mcp-server/
@@ -29,6 +29,7 @@ internet-archive-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -155,13 +156,14 @@ internet-archive-mcp-server/
 │   │   │       ├── ia-item.resource.ts
 │   │   │       └── index.ts
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── ia-find-snapshots.tool.ts
-│   │           ├── ia-get-item.tool.ts
-│   │           ├── ia-get-snapshot.tool.ts
-│   │           ├── ia-get-text.tool.ts
-│   │           ├── ia-search-items.tool.ts
-│   │           └── index.ts
+│   │       ├── definitions/
+│   │       │   ├── ia-find-snapshots.tool.ts
+│   │       │   ├── ia-get-item.tool.ts
+│   │       │   ├── ia-get-snapshot.tool.ts
+│   │       │   ├── ia-get-text.tool.ts
+│   │       │   ├── ia-search-items.tool.ts
+│   │       │   └── index.ts
+│   │       └── labelled-field.ts
 │   ├── services/
 │   │   ├── archive-metadata/
 │   │   │   ├── archive-metadata-service.ts
@@ -175,8 +177,10 @@ internet-archive-mcp-server/
 │   │   ├── wayback/
 │   │   │   ├── html-charset.ts
 │   │   │   ├── types.ts
+│   │   │   ├── wayback-capture-url.ts
 │   │   │   ├── wayback-service.ts
 │   │   │   └── wayback-timestamp.ts
+│   │   ├── call-deadline.ts
 │   │   ├── html-entities.ts
 │   │   ├── html-text.ts
 │   │   └── upstream-errors.ts
@@ -190,6 +194,7 @@ internet-archive-mcp-server/
 │   │   └── cpu-time.ts
 │   ├── integration/
 │   │   ├── archive-metadata-failures.int.test.ts
+│   │   ├── call-deadline-config.int.test.ts
 │   │   ├── ia-get-item-contract.int.test.ts
 │   │   ├── ia-search-items-contract.int.test.ts
 │   │   └── wayback-contract.int.test.ts
@@ -200,9 +205,12 @@ internet-archive-mcp-server/
 │   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── archive-metadata-service.test.ts
+│   │   ├── call-deadline.test.ts
 │   │   ├── html-text.test.ts
 │   │   ├── item-reference.test.ts
 │   │   ├── language-spellings.test.ts
+│   │   ├── upstream-errors.test.ts
+│   │   ├── wayback-capture-url.test.ts
 │   │   ├── wayback-content.test.ts
 │   │   ├── wayback-service.test.ts
 │   │   └── wayback-timestamp.test.ts
@@ -214,6 +222,7 @@ internet-archive-mcp-server/
 │       ├── ia-get-snapshot.tool.test.ts
 │       ├── ia-get-text.tool.test.ts
 │       ├── ia-search-items.tool.test.ts
+│       ├── labelled-field.test.ts
 │       └── markdown-format.test.ts
 ├── .dockerignore
 ├── .env.example

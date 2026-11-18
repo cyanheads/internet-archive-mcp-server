@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-17 · ⚠️ Breaking
+
+A Wayback capture URL passed as url is read as the page it archives; one deadline bounds each tool call; ia_find_snapshots closest mode reads an omitted timestamp as the latest capture; list-valued fields keep their value boundaries in content[].
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-11-12
 
 ia_get_snapshot pages long captures and reads non-HTML text as stored; Wayback timestamps accept ISO 8601; archive.org item URLs work as identifiers; ia_get_item returns catalog fields; ia_get_text reads any text file of a multi-file item.
