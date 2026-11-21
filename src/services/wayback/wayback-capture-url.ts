@@ -1,7 +1,8 @@
 /**
  * @fileoverview A Wayback Machine capture URL in `url` — `web.archive.org/web/<timestamp>/<original>`,
  * the form of the `replay_url` both Wayback tools return — read as the URL it archives and its
- * timestamp, together with the tool's own `timestamp`, before any request is sent.
+ * timestamp, together with the tool's own `timestamp`, before any request is sent; and the
+ * original URL a capture URL names, for a replay redirect's target or the capture served.
  * @module services/wayback/wayback-capture-url
  */
 
@@ -53,7 +54,7 @@ const URL_TIMESTAMP_HINT =
  * `original` is everything after the capture path, decoded once when its scheme is
  * percent-encoded. Undefined for anything that is not a capture URL on a `WAYBACK_HOSTS` host.
  */
-function captureOf(value: string): { digits: string; original: string } | undefined {
+export function captureOf(value: string): { digits: string; original: string } | undefined {
   const rest = value.replace(SCHEME, '');
   const slash = rest.indexOf('/');
   if (slash < 0 || !WAYBACK_HOSTS.has(rest.slice(0, slash).toLowerCase())) return;

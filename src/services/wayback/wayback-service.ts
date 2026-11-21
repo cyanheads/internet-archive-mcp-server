@@ -27,7 +27,15 @@ import {
   waitPhrase,
 } from '../upstream-errors.js';
 import { decodeHtml, decodeText } from './html-charset.js';
-import type { CdxHistoryResult, CdxRecord, ClosestSnapshot, SnapshotContent } from './types.js';
+import type {
+  ArchivedRedirect,
+  CdxHistoryResult,
+  CdxRecord,
+  ClosestSnapshot,
+  RedirectDeadEnd,
+  SnapshotContent,
+} from './types.js';
+import { captureOf, WAYBACK_HOSTS } from './wayback-capture-url.js';
 
 /** Parameters for fetching CDX capture history. */
 export interface FetchHistoryParams {
@@ -85,6 +93,22 @@ export function notServedMessage(url: string, status: number): string {
  */
 const MEMENTO_DATETIME = 'memento-datetime';
 
+/**
+ * The statuses a replay redirects with: Wayback's own redirect to the nearest capture, or the
+ * replay of a capture that is itself an archived redirect, carrying the status the site sent.
+ */
+const REDIRECT_STATUSES = new Set([300, 301, 302, 303, 307, 308]);
+
+/**
+ * The most redirects one replay request follows; the next ends it without a capture. Observed
+ * archived-redirect chains run to 3, and an archived redirect usually costs two (its own, then
+ * Wayback's to the target's nearest capture), so 10 admits five stacked archived redirects.
+ */
+export const MAX_REPLAY_REDIRECTS = 10;
+
+/** The URL schemes a replay redirect is followed to. */
+const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
+
 const AVAILABILITY_BASE = 'https://archive.org/wayback/available';
 const CDX_BASE = 'https://web.archive.org/cdx/search/cdx';
 const WAYBACK_ORIGIN = 'https://web.archive.org';
@@ -128,6 +152,20 @@ interface ClosestLookup {
 interface RequestLimits {
   signal: AbortSignal;
   timeoutMs: number;
+}
+
+/** A replay whose redirects ended on a 2xx: the response, the URL that served it, and the archived redirects passed. */
+interface ServedReplay {
+  redirects: ArchivedRedirect[];
+  replayUrl: string;
+  response: Response;
+}
+
+/** A replay 3xx: its status, its `Location`, and its capture timestamp when it is an archived redirect. */
+interface ReplayRedirect {
+  captureTimestamp: string | undefined;
+  location: string | undefined;
+  status: number;
 }
 
 /**
@@ -379,9 +417,10 @@ export class WaybackService {
 
   /**
    * Fetch archived content for a snapshot URL and extract readable text. Reports the
-   * capture Wayback served, which differs from the requested one when Wayback redirects
-   * a timestamp that is not itself a capture, and the HTTP status it replayed that capture
-   * with.
+   * capture Wayback served and the HTTP status it replayed that capture with. The replay's
+   * redirects are followed by `followReplay`: the served capture differs from the requested
+   * one when Wayback redirects a timestamp that is not itself a capture to the nearest one,
+   * and when the capture requested is an archived redirect, which `redirects` then lists.
    *
    * The replay's `Content-Type` decides the read before any body byte is taken. An HTML
    * page, or a capture with no media type, is read from the replay itself and stripped to
@@ -389,22 +428,24 @@ export class WaybackService {
    * type — has its replay body cancelled unread, because that form rewrites the URLs inside
    * it, and is read as stored from the capture's `id_` form in a second request with the
    * same retries, within what remains of the call's `deadline`. A body of any other type is
-   * cancelled unread and throws `NotFound` with `mediaType` and `replayUrl`. The body read is
-   * streamed up to `REPLAY_BYTE_CEILING` bytes — a longer body is cut there, the upstream
-   * read cancelled, and `truncatedAtBytes` set — then decoded with the charset the response
-   * declares, or the one Wayback guessed for the capture.
+   * cancelled unread and throws `NotFound` with `mediaType`, `replayUrl`, and the archived
+   * `redirects` passed, when there were any. The body read is streamed up to
+   * `REPLAY_BYTE_CEILING` bytes — a longer body is cut there, the upstream read cancelled, and
+   * `truncatedAtBytes` set — then decoded with the charset the response declares, or the one
+   * Wayback guessed for the capture.
    *
    * A non-2xx carrying `Memento-Datetime` is an archived error page, not a Wayback failure:
    * it is not retried and throws `NotFound` with `status` and `captureTimestamp`. Any other
    * 4xx but a 404, 408, 425, or 429 is Wayback refusing the request — a 403 is its answer
    * for a site excluded from the archive — and throws `NotFound` with `status` alone,
-   * after one request. Otherwise a 5xx, 408, 425, or network error is retried, and a 429
-   * or a timeout answered after one request, each as `ServiceUnavailable` (a 429 with a
-   * hint to wait), which `ia_get_snapshot` remaps onto its declared `content_fetch_failed`;
-   * so is the call's `deadline` running out, mid-request, mid-backoff, or before a request,
-   * its message naming the deadline. A 404 and a caller cancellation propagate as the fetch
-   * threw them. No error carries the replay's body. The text is returned whole;
-   * `ia_get_snapshot` pages it.
+   * after one request. Redirects that reach no readable capture throw `NotFound` with
+   * `deadEnd` (see `followReplay`), after one attempt. Otherwise a 5xx, 408, 425, or network
+   * error on any request of the chain is retried, the chain starting again, and a 429 or a
+   * timeout answered after one attempt, each as `ServiceUnavailable` (a 429 with a hint to
+   * wait), which `ia_get_snapshot` remaps onto its declared `content_fetch_failed`; so is the
+   * call's `deadline` running out, mid-request, mid-backoff, or before a request, its message
+   * naming the deadline. A 404 and a caller cancellation propagate as the fetch threw them.
+   * No error carries the replay's body. The text is returned whole; `ia_get_snapshot` pages it.
    */
   async fetchContent(
     snapshotUrl: string,
@@ -412,13 +453,14 @@ export class WaybackService {
     deadline: CallDeadline,
   ): Promise<SnapshotContent> {
     const served = await this.retry(REPLAY, ctx, deadline, async (limits) => {
-      const response = await this.fetchUpstream(snapshotUrl, REPLAY, ctx, {
-        ...limits,
-        errorHeaders: [MEMENTO_DATETIME],
-      });
-      const replayUrl = waybackUrl(response.url) ?? snapshotUrl;
+      const { response, replayUrl, redirects } = await this.followReplay(
+        snapshotUrl,
+        ctx,
+        deadline,
+        limits,
+      );
       const guessedCharset = response.headers.get('x-archive-guessed-charset');
-      const capture = { replayUrl, status: String(response.status), guessedCharset };
+      const capture = { replayUrl, status: String(response.status), guessedCharset, redirects };
       const mediaType = mediaTypeOf(response.headers.get('content-type'));
       const kind = bodyKind(mediaType);
       if (kind === 'html') {
@@ -429,6 +471,7 @@ export class WaybackService {
         throw notFound(`The capture at ${replayUrl} is ${mediaType}, not text.`, {
           mediaType,
           replayUrl,
+          ...(redirects.length > 0 && { redirects }),
         });
       }
       return capture;
@@ -443,6 +486,7 @@ export class WaybackService {
       replayUrl: served.replayUrl,
       timestamp: captureTimestamp(served.replayUrl),
       status: served.status,
+      ...(served.redirects.length > 0 && { redirects: served.redirects }),
       ...(body.truncated && { truncatedAtBytes: REPLAY_BYTE_CEILING }),
     };
   }
@@ -456,9 +500,10 @@ export class WaybackService {
    * A text capture's body as stored, from the `id_` form of `replayUrl`, under the same
    * retries as the replay request and within what remains of the call's `deadline`. The
    * `id_` response carries no guessed charset, so the one Wayback sent with the replay stands
-   * in for it. The replay already served this capture, so an `id_` 4xx — a refusal, a 404, or
-   * an archived error page — says nothing about the capture: it is `ServiceUnavailable` marked
-   * `retryable: false`, with a hint naming the replay URL, never the `NotFound`
+   * in for it. Its redirects are followed as the replay's are. The replay already served this
+   * capture, so an `id_` 4xx — a refusal, a 404, or an archived error page — or redirects that
+   * reach no readable capture say nothing about the capture: each is `ServiceUnavailable`
+   * marked `retryable: false`, with a hint naming the replay URL, never the `NotFound`
    * `ia_get_snapshot` reads as no capture.
    */
   private readRawText(
@@ -469,24 +514,102 @@ export class WaybackService {
   ): Promise<ReplayBody> {
     const rawUrl = rawReplayUrl(replayUrl);
     return this.retry(REPLAY, ctx, deadline, async (limits) => {
-      const response = await this.fetchUpstream(rawUrl, REPLAY, ctx, {
-        ...limits,
-        errorHeaders: [MEMENTO_DATETIME],
-      }).catch((err: unknown) => {
-        if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.NotFound) throw err;
-        throw serviceUnavailable(
-          `The Wayback Machine replayed this capture but answered its unmodified form, ${rawUrl}, with HTTP ${err.data?.status ?? statusOf(err)}.`,
-          {
-            retryable: false,
-            recovery: {
-              hint: `Wayback replayed this capture but refused its unmodified form, so a retry is unlikely to help; open ${replayUrl} to read the capture, or pick another one with ia_find_snapshots in history mode.`,
+      const { response } = await this.followReplay(rawUrl, ctx, deadline, limits).catch(
+        (err: unknown) => {
+          if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.NotFound) throw err;
+          // A dead end's status is its chain's last answer, which a later hop may have given.
+          throw serviceUnavailable(
+            err.data?.deadEnd === undefined
+              ? `The Wayback Machine replayed this capture but answered its unmodified form, ${rawUrl}, with HTTP ${err.data?.status ?? statusOf(err)}.`
+              : `The Wayback Machine replayed this capture but the redirects of its unmodified form, ${rawUrl}, reached no readable capture.`,
+            {
+              retryable: false,
+              recovery: {
+                hint: `Wayback replayed this capture but refused its unmodified form, so a retry is unlikely to help; open ${replayUrl} to read the capture, or pick another one with ia_find_snapshots in history mode.`,
+              },
             },
-          },
-          { cause: err },
-        );
-      });
+            { cause: err },
+          );
+        },
+      );
       return readBody(response, 'text', guessedCharset);
     });
+  }
+
+  /**
+   * The replay of `url` with its redirects followed here, not by the runtime's `fetch`, which
+   * under Bun refuses a relative `Location` that embeds a scheme — the root-relative
+   * `/web/<timestamp>/http://…` form Wayback writes for many archived redirects. Runs within
+   * one retry attempt, so a retried attempt starts the chain again from `url`.
+   *
+   * Each 3xx's `Location` is resolved against the URL that answered it, and the next request
+   * goes only to an http(s) URL on a `WAYBACK_HOSTS` host the chain has not requested, for at
+   * most `MAX_REPLAY_REDIRECTS` redirects. Every URL the chain requests, compares, records, and
+   * reports — `url` included — is the parsed form without its fragment, which is what a request
+   * sends on either runtime. `first` limits the first request; each later one is sent only
+   * while the call `deadline` has time left, with the request timeout or what remains,
+   * whichever is less. A 3xx carrying `Memento-Datetime` replays a capture that is itself an
+   * archived redirect, and is recorded in `redirects`; one without it is Wayback's own
+   * redirect to the nearest capture.
+   *
+   * A chain that cannot reach a readable capture throws `NotFound`, which the retry loop does
+   * not retry, carrying `deadEnd`, the archived `redirects` passed, and the last answer's
+   * `status` — so does a 404, a refusal, or an archived error page after an archived
+   * redirect, which concerns its target rather than the URL requested. Every other failure
+   * propagates as `fetchUpstream` threw it.
+   */
+  private async followReplay(
+    url: string,
+    ctx: Context,
+    deadline: CallDeadline,
+    first: RequestLimits,
+  ): Promise<ServedReplay> {
+    const requested = new Set<string>();
+    const redirects: ArchivedRedirect[] = [];
+    let current = withoutFragment(new URL(url));
+    let limits = first;
+    for (let followed = 0; ; followed++) {
+      requested.add(current);
+      let redirect: ReplayRedirect;
+      try {
+        const response = await this.fetchUpstream(current, REPLAY, ctx, limits);
+        return { response, replayUrl: waybackUrl(current) ?? current, redirects };
+      } catch (err) {
+        const answer = redirectOf(err);
+        if (!answer) throw redirects.length > 0 ? targetFailure(err, redirects) : err;
+        redirect = answer;
+      }
+
+      const { status, location, captureTimestamp } = redirect;
+      const archived = captureTimestamp === undefined ? {} : { captureTimestamp };
+      if (location === undefined) {
+        throw deadEnd(status, redirects, { kind: 'no_location', status, ...archived });
+      }
+      const next = URL.parse(location, current);
+      if (!next || !HTTP_PROTOCOLS.has(next.protocol) || !WAYBACK_HOSTS.has(next.hostname)) {
+        const href = next?.href ?? location;
+        throw deadEnd(status, redirects, {
+          kind: 'bad_location',
+          status,
+          location: href,
+          ...archived,
+        });
+      }
+      const nextUrl = withoutFragment(next);
+      if (captureTimestamp !== undefined) {
+        const target = captureOf(nextUrl)?.original ?? nextUrl;
+        redirects.push({ status, captureTimestamp, target });
+      }
+      if (requested.has(nextUrl)) {
+        throw deadEnd(status, redirects, { kind: 'loop', url: nextUrl });
+      }
+      if (followed === MAX_REPLAY_REDIRECTS) {
+        throw deadEnd(status, redirects, { kind: 'too_many_redirects' });
+      }
+      deadline.assertTimeLeft();
+      limits = { signal: first.signal, timeoutMs: deadline.nextTimeoutMs() };
+      current = nextUrl;
+    }
   }
 
   /**
@@ -716,34 +839,36 @@ export class WaybackService {
    * the retry loop reads (`retryAfter`, `retryable`) and is retried like a 5xx, so the error
    * surfacing after the last attempt carries the reason and its recovery hint.
    * A 429 carries a hint to wait and is answered after one request by the retry predicate —
-   * the upstream asked the client to slow down. A non-2xx whose `errorHeaders`
-   * capture includes `Memento-Datetime` is an archived error page, thrown as `NotFound`.
-   * Any other replay 4xx except a 404 is `replayRefusal`; any other lookup 4xx is
-   * `lookupRefusal`, about the looked-up `target` URL. Every other failure, timeouts and
-   * caller cancellation included, propagates untouched. A `NOT_SERVED` status, and a replay
-   * 404, is an expected answer, so the fetch logs it at debug rather than error.
+   * the upstream asked the client to slow down. A replay request is sent with
+   * `redirect: 'manual'`, capturing `Memento-Datetime` and `Location` on a non-2xx: its 3xx
+   * propagates untouched, for `followReplay` to follow, and a replay non-2xx carrying
+   * `Memento-Datetime` is an archived error page, thrown as `NotFound`. Any other replay 4xx
+   * except a 404 is `replayRefusal`; any other lookup 4xx is `lookupRefusal`, about the
+   * looked-up `target` URL. Every other failure, timeouts and caller cancellation included,
+   * propagates untouched. A `NOT_SERVED` status, a replay 404, and a replay redirect are
+   * expected answers, so the fetch logs them at debug rather than error.
    */
   private async fetchUpstream(
     url: string,
     api: UpstreamApi,
     ctx: Context,
-    {
-      timeoutMs,
-      signal,
-      errorHeaders,
-      target = url,
-    }: RequestLimits & { errorHeaders?: string[]; target?: string },
+    { timeoutMs, signal, target = url }: RequestLimits & { target?: string },
   ): Promise<Response> {
     try {
       return await fetchWithTimeout(url, timeoutMs, ctx, {
         headers: this.headers,
         signal,
-        expectedStatuses: api === REPLAY ? [...NOT_SERVED, 404] : [...NOT_SERVED],
-        ...(errorHeaders && { errorHeaders }),
+        ...(api === REPLAY
+          ? {
+              redirect: 'manual' as const,
+              expectedStatuses: [...NOT_SERVED, 404, ...REDIRECT_STATUSES],
+              errorHeaders: [MEMENTO_DATETIME, 'location'],
+            }
+          : { expectedStatuses: [...NOT_SERVED] }),
       });
     } catch (err) {
       const status = statusOf(err);
-      if (status === undefined) throw err;
+      if (status === undefined || (api === REPLAY && REDIRECT_STATUSES.has(status))) throw err;
       const archived = archivedCaptureError(err as McpError, status);
       if (archived) throw archived;
       if (status === 429) throw rateLimitError(err, api.name, `The ${api.name}`, api.reason);
@@ -905,15 +1030,69 @@ function archivedCaptureError(err: McpError, status: number): McpError | undefin
   const headers = err.data?.headers as Record<string, string> | undefined;
   const datetime = headers?.[MEMENTO_DATETIME];
   if (typeof datetime !== 'string') return;
-  const captured = Date.parse(datetime);
-  const timestamp = Number.isNaN(captured)
-    ? datetime
-    : new Date(captured).toISOString().replace(/\D/g, '').slice(0, 14);
+  const timestamp = mementoTimestamp(datetime);
   return notFound(
     `The capture at ${timestamp} is an archived HTTP ${status} page.`,
     { status, captureTimestamp: timestamp },
     { cause: err },
   );
+}
+
+/** The 14-digit timestamp a `Memento-Datetime` names, or the header as sent when it is not an HTTP date. */
+function mementoTimestamp(datetime: string): string {
+  const captured = Date.parse(datetime);
+  return Number.isNaN(captured)
+    ? datetime
+    : new Date(captured).toISOString().replace(/\D/g, '').slice(0, 14);
+}
+
+/** The redirect a replay failure is, when `fetchUpstream` passed on a 3xx; undefined for any other failure. */
+function redirectOf(err: unknown): ReplayRedirect | undefined {
+  const status = statusOf(err);
+  if (status === undefined || !REDIRECT_STATUSES.has(status)) return;
+  const headers = (err as McpError).data?.headers as Record<string, string> | undefined;
+  const datetime = headers?.[MEMENTO_DATETIME];
+  return {
+    status,
+    location: headers?.location,
+    captureTimestamp: datetime === undefined ? undefined : mementoTimestamp(datetime),
+  };
+}
+
+/**
+ * A replay chain that reached no readable capture, as a `NotFound` the retry loop does not
+ * retry: the last answer's `status`, the archived `redirects` passed, and how it ended.
+ */
+function deadEnd(
+  status: number,
+  redirects: ArchivedRedirect[],
+  end: RedirectDeadEnd,
+  cause?: unknown,
+): McpError {
+  return notFound(
+    `The replay's redirects reached no readable capture (${end.kind}).`,
+    { status, redirects, deadEnd: end },
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * A request for an archived redirect's target that failed as `NotFound` — Wayback has not
+ * archived the target (a 404 with no `Memento-Datetime`), its capture is an archived error
+ * page, or Wayback refused the replay — as the dead end it is. Any other failure is returned
+ * as it is.
+ */
+function targetFailure(err: unknown, redirects: ArchivedRedirect[]): unknown {
+  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.NotFound) return err;
+  const { status, captureTimestamp } = err.data ?? {};
+  if (typeof status !== 'number') return err;
+  const end: RedirectDeadEnd =
+    typeof captureTimestamp === 'string'
+      ? { kind: 'archived_error', status, captureTimestamp }
+      : status === 404
+        ? { kind: 'not_archived' }
+        : { kind: 'refused', status };
+  return deadEnd(status, redirects, end, err);
 }
 
 /**
@@ -959,10 +1138,24 @@ function lookupRefusal(err: McpError, status: number, api: UpstreamApi, target: 
   );
 }
 
-/** The https form of a web.archive.org URL; undefined for any other URL. */
+/** `url` as a request sends it: serialized without its fragment, `#` included. */
+function withoutFragment(url: URL): string {
+  const sent = new URL(url);
+  sent.hash = '';
+  return sent.href;
+}
+
+/**
+ * An http(s) URL on a `WAYBACK_HOSTS` host in its `https://web.archive.org` form, the rest of
+ * it kept as written; undefined for any other URL. Every replay URL the service reports or
+ * builds on takes this form, so `captureTimestamp` and `rawReplayUrl` read it.
+ */
 function waybackUrl(url: string): string | undefined {
-  const prefix = /^https?:\/\/web\.archive\.org\//i.exec(url)?.[0];
-  return prefix ? `${WAYBACK_ORIGIN}/${url.slice(prefix.length)}` : undefined;
+  const scheme = /^https?:\/\//i.exec(url)?.[0];
+  if (!scheme) return;
+  const slash = url.indexOf('/', scheme.length);
+  if (slash < 0 || !WAYBACK_HOSTS.has(url.slice(scheme.length, slash).toLowerCase())) return;
+  return `${WAYBACK_ORIGIN}${url.slice(slash)}`;
 }
 
 /** A replay URL's `web/<timestamp><modifier>/` prefix, capturing the 14-digit timestamp. */

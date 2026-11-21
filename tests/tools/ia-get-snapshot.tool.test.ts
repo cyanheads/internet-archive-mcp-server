@@ -3,7 +3,7 @@
  * @module tests/tools/ia-get-snapshot.tool.test
  */
 
-import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, notFound, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -363,6 +363,7 @@ describe('iaGetSnapshot', () => {
     const text = (iaGetSnapshot.format!(result)[0] as { text: string }).text;
     expect(text).toContain(`**Replay URL:** [${served}](<${served}>)`);
     expect(text).toContain('**Resolved Timestamp:** 20200104000551');
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('reports the served capture, status included, on the resolution path too', async () => {
@@ -912,6 +913,50 @@ describe('iaGetSnapshot', () => {
       expect(next.isError).toBeFalsy();
       expect(next.structuredContent).toMatchObject({ char_offset: 50_000, has_more: false });
     });
+
+    // A capture of a Wayback capture URL: its original is itself a capture URL, which would read
+    // back at its own timestamp, so the notice names the capture served instead.
+    const INNER = 'https://web.archive.org/web/20191124173151/https://news.example.com/story';
+    const NESTED = `https://web.archive.org/web/20201112015604/${INNER}`;
+    it.each<[label: string, url: string, redirects: unknown[] | undefined]>([
+      ['served as asked', NESTED, undefined],
+      [
+        'reached through an archived redirect',
+        'https://web.archive.org/web/20201112015603/https://web.archive.org/web/2019/https://news.example.com/story',
+        [{ status: 302, captureTimestamp: '20201112015603', target: INNER }],
+      ],
+    ])(
+      'names a next page that reads back when the original of the capture %s is a capture URL',
+      async (_label, url, redirects) => {
+        mockService.buildReplayUrl.mockReturnValue(NESTED);
+        mockService.fetchContent.mockResolvedValue({
+          text: 'x'.repeat(60_000),
+          replayUrl: NESTED,
+          timestamp: '20201112015604',
+          status: '200',
+          ...(redirects && { redirects }),
+        });
+
+        const first = await runToolContract(iaGetSnapshot, { url, timestamp: '' });
+        const notice = (first.structuredContent as { notice?: string }).notice ?? '';
+        const printed =
+          /More text follows: call ia_get_snapshot again with url `([^`]+)`, timestamp (\d{14}) \(resolved_timestamp\), and char_offset (\d+)/.exec(
+            notice,
+          );
+        expect(printed).not.toBeNull();
+        const [, nextUrl, nextTimestamp, nextOffset] = printed as RegExpExecArray;
+
+        mockService.buildReplayUrl.mockClear();
+        const next = await runToolContract(iaGetSnapshot, {
+          url: nextUrl,
+          timestamp: nextTimestamp,
+          char_offset: Number(nextOffset),
+        });
+        expect(next.isError).toBeFalsy();
+        expect(next.structuredContent).toMatchObject({ char_offset: 50_000, has_more: false });
+        expect(mockService.buildReplayUrl).toHaveBeenCalledWith('20201112015604', INNER);
+      },
+    );
   });
 
   describe('Wayback URLs that name no single capture', () => {
@@ -1253,6 +1298,252 @@ describe('iaGetSnapshot', () => {
       expect(text).not.toContain('Unrecognized key');
       expect(mockService.fetchContent).not.toHaveBeenCalled();
     });
+  });
+
+  describe('archived redirects (#63)', () => {
+    const URL_ASKED = 'http://example.com/docs/report.pdf';
+    const ASKED_AT = '20250805171636';
+    const SERVED = 'https://web.archive.org/web/20250828072413/http://redirected.example.org/';
+    const TO_TARGET = {
+      status: 301,
+      captureTimestamp: ASKED_AT,
+      target: 'http://redirected.example.org/',
+    };
+    const NOTICE =
+      'The capture at 20250805171636 is an archived HTTP 301 redirect to `http://redirected.example.org/`, and the text comes from the capture Wayback served for that URL (replay_url).';
+
+    type Result = Awaited<ReturnType<typeof runToolContract>>;
+    const textOf = (result: Result) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+    const serveRedirected = (
+      text: string,
+      redirects: unknown[],
+      extra: Record<string, unknown> = {},
+    ) => {
+      mockService.buildReplayUrl.mockReturnValue(
+        `https://web.archive.org/web/${ASKED_AT}/${URL_ASKED}`,
+      );
+      mockService.fetchContent.mockResolvedValue({
+        text,
+        replayUrl: SERVED,
+        timestamp: '20250828072413',
+        status: '200',
+        redirects,
+        ...extra,
+      });
+    };
+    const read = (input: Record<string, unknown> = {}) =>
+      runToolContract(iaGetSnapshot, { url: URL_ASKED, timestamp: ASKED_AT, ...input });
+
+    it('names the archived redirect and its target in a notice, on both surfaces', async () => {
+      serveRedirected('home page', [TO_TARGET]);
+
+      const result = await read();
+
+      expect(result.structuredContent).toMatchObject({
+        text: 'home page',
+        replay_url: SERVED,
+        resolved_timestamp: '20250828072413',
+        resolved_status: '200',
+        notice: NOTICE,
+      });
+      expect(textOf(result)).toContain(`> ${NOTICE}`);
+    });
+
+    it('names each archived redirect a chain passed, in order', async () => {
+      serveRedirected('final', [
+        TO_TARGET,
+        {
+          status: 302,
+          captureTimestamp: '20250805171640',
+          target: 'https://final.example.net/a`b',
+        },
+      ]);
+
+      const result = await read();
+
+      const notice =
+        'The capture at 20250805171636 is an archived HTTP 301 redirect to `http://redirected.example.org/`, whose capture at 20250805171640 is an archived HTTP 302 redirect to ``https://final.example.net/a`b``, and the text comes from the capture Wayback served for that URL (replay_url).';
+      expect((result.structuredContent as { notice?: string }).notice).toBe(notice);
+      expect(textOf(result)).toContain(`> ${notice}`);
+    });
+
+    it('opens the notice with the archived redirect when the read-limit and max_chars notices fire too, on both surfaces', async () => {
+      serveRedirected('home page', [TO_TARGET], { truncatedAtBytes: 4_194_304 });
+
+      const result = await read({ max_chars: 60_000 });
+
+      const notice = `${NOTICE} The archived page is longer than 4,194,304 bytes; the text comes from its first 4,194,304 bytes. Open replay_url for the full page. max_chars 60,000 is above this server's maximum of 50,000 characters per call, so this page holds up to 50,000.`;
+      expect((result.structuredContent as { notice?: string }).notice).toBe(notice);
+      expect(textOf(result)).toContain(`> ${notice}`);
+    });
+
+    it('names the served capture’s original URL in the next-page notice after an archived redirect', async () => {
+      serveRedirected('a'.repeat(60_000), [TO_TARGET]);
+
+      const result = await read();
+
+      const next =
+        'More text follows: call ia_get_snapshot again with url `http://redirected.example.org/`, timestamp 20250828072413 (resolved_timestamp), and char_offset 50000 for the next page.';
+      expect((result.structuredContent as { notice?: string }).notice).toBe(`${NOTICE} ${next}`);
+      expect(textOf(result)).toContain(next);
+    });
+
+    it.each<[label: string, redirects: unknown[] | undefined, message: string]>([
+      [
+        'served without a redirect, in the message it has always had',
+        undefined,
+        `The capture of ${URL_ASKED} that Wayback served is application/pdf, not text, so it has no text to return; the original file is at ${SERVED}.`,
+      ],
+      [
+        'reached through an archived redirect, opening with the redirect',
+        [TO_TARGET],
+        `The capture of ${URL_ASKED} at ${ASKED_AT} is an archived HTTP 301 redirect to http://redirected.example.org/; the capture Wayback served for that URL is application/pdf, not text, so it has no text to return; the original file is at ${SERVED}.`,
+      ],
+    ])('fails a non-text capture %s, on both surfaces', async (_label, redirects, message) => {
+      mockService.buildReplayUrl.mockReturnValue(
+        `https://web.archive.org/web/${ASKED_AT}/${URL_ASKED}`,
+      );
+      mockService.fetchContent.mockRejectedValue(
+        notFound(`The capture at ${SERVED} is application/pdf, not text.`, {
+          mediaType: 'application/pdf',
+          replayUrl: SERVED,
+          ...(redirects && { redirects }),
+        }),
+      );
+
+      const result = await read();
+
+      const hint = iaGetSnapshot.errors?.find((e) => e.reason === 'non_text_capture')?.recovery;
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message,
+          data: {
+            reason: 'non_text_capture',
+            mediaType: 'application/pdf',
+            replayUrl: SERVED,
+            recovery: { hint },
+          },
+        },
+      });
+      const text = textOf(result);
+      expect(text).toContain(`Error: ${message}`);
+      expect(text).toContain(`Recovery: ${hint}`);
+    });
+
+    const recovery = () =>
+      iaGetSnapshot.errors?.find((e) => e.reason === 'no_snapshot_available')?.recovery as string;
+    const LOOP_A = `https://web.archive.org/web/${ASKED_AT}/http://loop-a.example.com/`;
+
+    it.each<[ending: string, data: Record<string, unknown>, message: string]>([
+      [
+        'a target Wayback never archived',
+        {
+          status: 404,
+          redirects: [
+            { status: 302, captureTimestamp: ASKED_AT, target: 'http://parked.example.org/?s=1' },
+          ],
+          deadEnd: { kind: 'not_archived' },
+        },
+        'The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 302 redirect to http://parked.example.org/?s=1; the Wayback Machine has not archived that URL.',
+      ],
+      [
+        'an archived error page of the target',
+        {
+          status: 404,
+          redirects: [TO_TARGET],
+          deadEnd: { kind: 'archived_error', status: 404, captureTimestamp: '20250805171640' },
+        },
+        'The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 301 redirect to http://redirected.example.org/; its capture at 20250805171640 is an archived HTTP 404 error page.',
+      ],
+      [
+        'a refused replay of the target',
+        { status: 403, redirects: [TO_TARGET], deadEnd: { kind: 'refused', status: 403 } },
+        'The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 301 redirect to http://redirected.example.org/; the Wayback Machine refused to replay it with HTTP 403.',
+      ],
+      [
+        'a loop',
+        {
+          status: 301,
+          redirects: [
+            { status: 301, captureTimestamp: ASKED_AT, target: 'http://loop-b.example.com/' },
+            { status: 301, captureTimestamp: ASKED_AT, target: 'http://loop-a.example.com/' },
+          ],
+          deadEnd: { kind: 'loop', url: LOOP_A },
+        },
+        `The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 301 redirect to http://loop-b.example.com/, whose capture at 20250805171636 is an archived HTTP 301 redirect to http://loop-a.example.com/; the next redirect returns to ${LOOP_A}, which was already requested.`,
+      ],
+      [
+        'an eleventh redirect',
+        { status: 302, redirects: [], deadEnd: { kind: 'too_many_redirects' } },
+        'No readable capture of http://example.com/docs/report.pdf at 20250805171636: the redirects continue past 10, the most this server follows.',
+      ],
+      [
+        'an archived redirect with no Location',
+        {
+          status: 301,
+          redirects: [],
+          deadEnd: { kind: 'no_location', status: 301, captureTimestamp: ASKED_AT },
+        },
+        'No readable capture of http://example.com/docs/report.pdf at 20250805171636: the capture at 20250805171636 is an archived HTTP 301 redirect with no Location header.',
+      ],
+      [
+        'a Wayback redirect with no Location, after an archived one',
+        { status: 302, redirects: [TO_TARGET], deadEnd: { kind: 'no_location', status: 302 } },
+        'The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 301 redirect to http://redirected.example.org/; the Wayback Machine answered HTTP 302 with no Location header.',
+      ],
+      [
+        'an archived redirect to a Location that is not followed',
+        {
+          status: 302,
+          redirects: [],
+          deadEnd: {
+            kind: 'bad_location',
+            status: 302,
+            location: 'ftp://files.example.com/report.pdf',
+            captureTimestamp: ASKED_AT,
+          },
+        },
+        'No readable capture of http://example.com/docs/report.pdf at 20250805171636: the capture at 20250805171636 is an archived HTTP 302 redirect to ftp://files.example.com/report.pdf, which is not an http(s) Wayback Machine URL, so it is not followed.',
+      ],
+      [
+        'a Wayback redirect off the Wayback hosts, after an archived one',
+        {
+          status: 302,
+          redirects: [TO_TARGET],
+          deadEnd: {
+            kind: 'bad_location',
+            status: 302,
+            location: 'https://redirected.example.org/elsewhere',
+          },
+        },
+        'The capture of http://example.com/docs/report.pdf at 20250805171636 is an archived HTTP 301 redirect to http://redirected.example.org/; the Wayback Machine redirected to https://redirected.example.org/elsewhere, which is not an http(s) Wayback Machine URL, so it is not followed.',
+      ],
+    ])(
+      'fails redirects ending on %s as no_snapshot_available naming the chain, on both surfaces',
+      async (_ending, data, message) => {
+        mockService.buildReplayUrl.mockReturnValue(
+          `https://web.archive.org/web/${ASKED_AT}/${URL_ASKED}`,
+        );
+        const deadEnd = notFound("The replay's redirects reached no readable capture.", data);
+        mockService.fetchContent.mockRejectedValue(deadEnd);
+
+        const result = await read();
+
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.NotFound,
+            message,
+            data: { reason: 'no_snapshot_available', recovery: { hint: recovery() } },
+          },
+        });
+        const text = textOf(result);
+        expect(text).toContain(message);
+        expect(text).toContain(`Recovery: ${recovery()}`);
+      },
+    );
   });
 
   describe('format', () => {

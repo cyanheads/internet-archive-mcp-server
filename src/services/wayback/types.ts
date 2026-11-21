@@ -41,9 +41,48 @@ export interface CdxHistoryResult {
   resumeKey?: string;
 }
 
+/**
+ * An archived redirect a replay passed through: a capture of the 3xx the site itself sent,
+ * which Wayback replays with that status and the capture's `Memento-Datetime`.
+ */
+export interface ArchivedRedirect {
+  /**
+   * Timestamp (YYYYMMDDHHMMSS) of the redirect capture, from its `Memento-Datetime`; the header
+   * as sent when it is not an HTTP date.
+   */
+  captureTimestamp: string;
+  /** The HTTP status the site redirected with when it was captured. */
+  status: number;
+  /** Where it points: the original URL of the Wayback capture URL in its `Location`. */
+  target: string;
+}
+
+/**
+ * How a replay's redirects ended without a readable capture. The first three follow an
+ * archived redirect and concern its target: Wayback has not archived it (a 404 with no
+ * `Memento-Datetime`), its capture is an archived error page, or Wayback refused to replay
+ * it. The rest can end any chain: a `Location` already requested, a redirect past
+ * `MAX_REPLAY_REDIRECTS`, a 3xx with no `Location`, or one that is unparseable, not http(s),
+ * or off the Wayback hosts.
+ * `captureTimestamp` is set when the 3xx that ended the chain is itself an archived redirect.
+ */
+export type RedirectDeadEnd =
+  | { kind: 'not_archived' }
+  | { kind: 'archived_error'; status: number; captureTimestamp: string }
+  | { kind: 'refused'; status: number }
+  | { kind: 'loop'; url: string }
+  | { kind: 'too_many_redirects' }
+  | { kind: 'no_location'; status: number; captureTimestamp?: string }
+  | { kind: 'bad_location'; status: number; location: string; captureTimestamp?: string };
+
 /** Fetched snapshot content. */
 export interface SnapshotContent {
-  /** Replay URL of the capture Wayback served — where the fetch ended after any redirect. */
+  /**
+   * The archived redirects the replay followed to the served capture, in order; absent when
+   * it passed through none. Wayback's own redirects to a nearest capture are not listed.
+   */
+  redirects?: ArchivedRedirect[] | undefined;
+  /** Replay URL of the capture Wayback served — where the replay's redirects ended. */
   replayUrl: string;
   /** HTTP status Wayback replayed the served capture with. */
   status: string;

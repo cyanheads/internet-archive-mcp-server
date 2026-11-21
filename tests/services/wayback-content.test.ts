@@ -2,8 +2,9 @@
  * @fileoverview Tests for WaybackService.fetchContent — the text it extracts from an
  * archived page (markup removal, one-pass character-reference decoding, linear-time
  * scanning), the charset it decodes the body with, how the replay's media type routes
- * the read (HTML, text from the `id_` form, or no text), and the replay URL and timestamp
- * it reports for the capture Wayback actually served.
+ * the read (HTML, text from the `id_` form, or no text), and the status it reports for the
+ * capture served. Redirects, and the capture they lead to, are covered by
+ * wayback-redirects.test.ts, which routes each 3xx as Wayback sends it.
  * @module tests/services/wayback-content.test
  */
 
@@ -53,23 +54,18 @@ const served = (
   body: BodyInit,
   {
     contentType = 'text/html',
-    url,
     headers = {},
     status = 200,
   }: {
     contentType?: string | null;
-    url?: string;
     headers?: Record<string, string>;
     status?: number;
   } = {},
-): Response => {
-  const response = new Response(body, {
+): Response =>
+  new Response(body, {
     status,
     headers: { ...(contentType ? { 'content-type': contentType } : {}), ...headers },
   });
-  if (url !== undefined) Object.defineProperty(response, 'url', { value: url });
-  return response;
-};
 
 const fetchContent = (response: Response) => {
   fetchWithTimeout.mockResolvedValueOnce(response);
@@ -403,37 +399,6 @@ describe('fetchContent charset (#25)', () => {
   });
 });
 
-describe('fetchContent replay URL (#19)', () => {
-  const FINAL = 'https://web.archive.org/web/20200104000551/https://example.com/';
-
-  it('reports the URL the fetch ended on and its capture timestamp', async () => {
-    const result = await fetchContent(served('<p>x</p>', { url: FINAL }));
-    expect(result).toMatchObject({ replayUrl: FINAL, timestamp: '20200104000551' });
-  });
-
-  it('reports the https form of a final web.archive.org URL', async () => {
-    const result = await fetchContent(
-      served('<p>x</p>', { url: 'http://web.archive.org/web/20200104000551/https://example.com/' }),
-    );
-    expect(result.replayUrl).toBe(FINAL);
-  });
-
-  it('reports the requested replay URL when the response carries no final URL', async () => {
-    const result = await fetchContent(served('<p>x</p>', { url: '' }));
-    expect(result).toMatchObject({ replayUrl: SNAPSHOT, timestamp: '20120601000000' });
-  });
-
-  it('reports the requested replay URL when the fetch ended off web.archive.org', async () => {
-    const result = await fetchContent(served('<p>x</p>', { url: 'https://example.com/' }));
-    expect(result).toMatchObject({ replayUrl: SNAPSHOT, timestamp: '20120601000000' });
-  });
-
-  it('keeps the requested URL when Wayback served it without a redirect', async () => {
-    const result = await fetchContent(served('<p>x</p>', { url: SNAPSHOT }));
-    expect(result).toMatchObject({ replayUrl: SNAPSHOT, timestamp: '20120601000000' });
-  });
-});
-
 describe('fetchContent guessed charset (#25)', () => {
   const PAGE = '<p>The Rest \xa9 1997-99 Rob Malda, Actualit\xe9s</p>';
   const WANT = 'The Rest © 1997-99 Rob Malda, Actualités';
@@ -660,9 +625,6 @@ describe('fetchContent media-type routing (#49)', () => {
     '{"current_user_url":"https://api.github.com/user","current_user_authorizations_html_url":"https://github.com/settings/connections/applications{/client_id}"}';
   const GITHUB_JSON_REWRITTEN =
     '{"current_user_url":"https://web.archive.org/web/20200116122222/https://api.github.com/user","current_user_authorizations_html_url":"https://web.archive.org/web/20200116122222/https://github.com/settings/connections/applications{/client_id}"}';
-  /** RFC 2616 §2.1, as its text/plain capture holds it: line breaks and ABNF angle brackets. */
-  const RFC_2616_RULE =
-    '   *rule\n      The character "*" preceding an element indicates repetition. The\n      full form is "<n>*<m>element" indicating at least <n> and at most\n      <m> occurrences of element.\n';
   const utf8 = (text: string) => new TextEncoder().encode(text);
 
   /** A body that counts reads and records a cancel; nothing is pulled until a read asks for it. */
@@ -715,34 +677,15 @@ describe('fetchContent media-type routing (#49)', () => {
       GITHUB,
       served(plain.stream, {
         contentType: json,
-        url: GITHUB,
         headers: { 'x-archive-guessed-charset': 'utf-8' },
       }),
-      served(utf8(GITHUB_JSON), { contentType: json, url: GITHUB_RAW }),
+      served(utf8(GITHUB_JSON), { contentType: json }),
     );
 
     expect(result.text).toBe(GITHUB_JSON);
     expect(result).toMatchObject({ replayUrl: GITHUB, timestamp: '20200116122222', status: '200' });
     expect(requestedUrls()).toEqual([GITHUB, GITHUB_RAW]);
     expect(plain.stats).toEqual({ pulled: 0, cancelled: true });
-  });
-
-  it('builds the id_ URL from the capture Wayback redirected to, and keeps a text body as stored', async () => {
-    const requested = 'https://web.archive.org/web/2020/https://www.rfc-editor.org/rfc/rfc2616.txt';
-    const servedUrl =
-      'https://web.archive.org/web/20201230144805/https://www.rfc-editor.org/rfc/rfc2616.txt';
-    const raw =
-      'https://web.archive.org/web/20201230144805id_/https://www.rfc-editor.org/rfc/rfc2616.txt';
-
-    const result = await fetchServed(
-      requested,
-      served(utf8('rewritten'), { contentType: 'text/plain', url: servedUrl }),
-      served(utf8(RFC_2616_RULE), { contentType: 'text/plain', url: raw }),
-    );
-
-    expect(result.text).toBe(RFC_2616_RULE);
-    expect(result).toMatchObject({ replayUrl: servedUrl, timestamp: '20201230144805' });
-    expect(requestedUrls()).toEqual([requested, raw]);
   });
 
   it.each([
@@ -845,16 +788,16 @@ describe('fetchContent media-type routing (#49)', () => {
   ])('fails a %s capture as non-text without reading its body', async (contentType, mediaType) => {
     const pdf = tracked(latin1('%PDF-1.7\r%\xe2\xe3\xcf\xd3\r\n922 0 obj\r<</Linearized'));
 
-    const err = await fetchServed(
-      SNAPSHOT,
-      served(pdf.stream, { contentType, url: SNAPSHOT }),
-    ).catch((e: unknown) => e);
+    const err = await fetchServed(SNAPSHOT, served(pdf.stream, { contentType })).catch(
+      (e: unknown) => e,
+    );
 
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       message: expect.stringContaining(mediaType),
       data: { mediaType, replayUrl: SNAPSHOT },
     });
+    expect(err).not.toHaveProperty('data.redirects');
     expect(requestedUrls()).toEqual([SNAPSHOT]);
     expect(pdf.stats).toEqual({ pulled: 0, cancelled: true });
   });

@@ -245,7 +245,7 @@ src/
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
       wayback-timestamp.ts              # Timestamp forms (1–14 digits, ISO 8601) → Wayback digits
-      wayback-capture-url.ts            # Wayback capture URL in url → original URL + timestamp (both Wayback tools); WAYBACK_HOSTS
+      wayback-capture-url.ts            # Wayback capture URL → original URL + timestamp (url in both Wayback tools, the service's redirect walk); WAYBACK_HOSTS
       html-charset.ts                   # Archived-page charset detection + decoding
       types.ts                          # Wayback domain types
     archive-search/

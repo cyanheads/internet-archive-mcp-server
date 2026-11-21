@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-11-18 06:54:14
+Generated on: 2026-11-21 19:25:20
 
 ```text
 internet-archive-mcp-server/
@@ -212,6 +212,7 @@ internet-archive-mcp-server/
 │   │   ├── upstream-errors.test.ts
 │   │   ├── wayback-capture-url.test.ts
 │   │   ├── wayback-content.test.ts
+│   │   ├── wayback-redirects.test.ts
 │   │   ├── wayback-service.test.ts
 │   │   └── wayback-timestamp.test.ts
 │   ├── smoke/

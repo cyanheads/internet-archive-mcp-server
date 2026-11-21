@@ -46,14 +46,22 @@ const cdxRows =
   () =>
     Response.json([['timestamp', 'original', 'statuscode'], ...rows]);
 
-/** A replay response that reports `url` as the URL the fetch ended on. */
+/** A capture replayed as a page: `body`, served as HTML unless `headers` say otherwise. */
 const replay =
-  (body: BodyInit, url?: string, headers: Record<string, string> = {}) =>
-  () => {
-    const response = new Response(body, { headers: { 'content-type': 'text/html', ...headers } });
-    if (url) Object.defineProperty(response, 'url', { value: url });
-    return response;
-  };
+  (body: BodyInit, headers: Record<string, string> = {}) =>
+  () =>
+    new Response(body, { headers: { 'content-type': 'text/html', ...headers } });
+
+/** Wayback's own redirect to the nearest capture: a 302 with `x-archive-redirect-reason` and no Memento-Datetime. */
+const nearestCapture = (location: string) => () =>
+  new Response(null, {
+    status: 302,
+    headers: { location, 'x-archive-redirect-reason': 'found capture at 20200101000000' },
+  });
+
+/** The replay of a capture that is itself an archived redirect: the site's status, its Memento-Datetime, and its Location. */
+const archivedRedirect = (status: number, mementoDatetime: string, location: string) => () =>
+  new Response(null, { status, headers: { location, 'memento-datetime': mementoDatetime } });
 
 /** What a failed or timed-out CDX fallback says on both surfaces, whichever tool asked. */
 const FALLBACK_MESSAGE = /Availability API found no capture.*CDX .*did not complete/;
@@ -142,6 +150,12 @@ const archivedError = (status: number, mementoDatetime: string) => () =>
   });
 
 const calls = (match: (r: Request) => boolean) => http.calls.filter((c) => match(c.request));
+
+/** The replay URLs requested, in order. */
+const replayUrls = () => calls(isReplay).map((c) => c.request.url);
+
+/** Answers any replay URL no exact route names, so an extra hop shows in the request count. */
+const routeUnrouted = () => routeReplay(() => new Response('unrouted', { status: 400 }));
 
 const contentText = (result: ToolResult): string =>
   result.content
@@ -1214,17 +1228,30 @@ describe('ia_get_snapshot', () => {
         },
       }),
     );
-    routeReplay(replay(PAGE, 'https://web.archive.org/web/20200101230626/https://www.nasa.gov/'));
+    const asked = 'https://web.archive.org/web/20200101230622/http://nasa.gov/';
+    const target = 'https://web.archive.org/web/20200101230622/https://www.nasa.gov/';
+    const served = 'https://web.archive.org/web/20200101230626/https://www.nasa.gov/';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(301, 'Wed, 01 Jan 2020 23:06:22 GMT', target),
+    });
+    http.route({ match: target, respond: nearestCapture(served) });
+    http.route({ match: served, respond: replay(PAGE) });
 
     const result = await runToolContract(iaGetSnapshot, { url: 'nasa.gov', timestamp: '20200101' });
 
+    const notice =
+      'The capture at 20200101230622 is an archived HTTP 301 redirect to `https://www.nasa.gov/`, and the text comes from the capture Wayback served for that URL (replay_url).';
     expect(result.structuredContent).toMatchObject({
+      replay_url: served,
       resolved_timestamp: '20200101230626',
       resolved_status: '200',
+      notice,
     });
-    expect(contentText(result)).toContain(
-      '**Resolved Timestamp:** 20200101230626 | **Status:** 200',
-    );
+    const text = contentText(result);
+    expect(text).toContain('**Resolved Timestamp:** 20200101230626 | **Status:** 200');
+    expect(text).toContain(`> ${notice}`);
+    expect(replayUrls()).toEqual([asked, target, served]);
   });
 
   it('discloses a body cut at the byte ceiling on both surfaces', async () => {
@@ -1266,7 +1293,6 @@ describe('ia_get_snapshot', () => {
     routeReplay(
       replay(
         Uint8Array.from(html, (c) => c.charCodeAt(0)),
-        undefined,
         {
           'x-archive-guessed-charset': 'iso-8859-1',
         },
@@ -1323,29 +1349,31 @@ describe('ia_get_snapshot', () => {
   });
 
   it('reports the capture Wayback redirected an exact timestamp to', async () => {
+    const asked = 'https://web.archive.org/web/20200104000000/example.com';
     const served = 'https://web.archive.org/web/20200104000551/https://example.com/';
-    routeReplay(replay(PAGE, served));
+    http.route({ match: asked, respond: nearestCapture(served) });
+    http.route({ match: served, respond: replay(PAGE) });
 
     const result = await runToolContract(iaGetSnapshot, {
       url: 'example.com',
       timestamp: '20200104000000',
     });
 
-    expect(calls(isReplay)[0]?.request.url).toBe(
-      'https://web.archive.org/web/20200104000000/example.com',
-    );
+    expect(replayUrls()).toEqual([asked, served]);
     expect(result.structuredContent).toMatchObject({
       replay_url: served,
       resolved_timestamp: '20200104000551',
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
     const text = contentText(result);
     expect(text).toContain(`**Replay URL:** [${served}](<${served}>)`);
     expect(text).toContain('**Resolved Timestamp:** 20200104000551');
+    expect(text).not.toContain('archived HTTP');
   });
 
   it('keeps the requested URL and timestamp for a capture served without a redirect', async () => {
     const requested = 'https://web.archive.org/web/20200104000551/https://example.com/';
-    routeReplay(replay(PAGE, requested));
+    routeReplay(replay(PAGE));
 
     const result = await runToolContract(iaGetSnapshot, {
       url: 'https://example.com/',
@@ -1373,6 +1401,303 @@ describe('ia_get_snapshot', () => {
     expect(sc.text).toBe('Actualités · Multimédia');
     expect(contentText(result)).toContain('Actualités · Multimédia');
     expect(contentText(result)).not.toContain('�');
+  });
+});
+
+describe('ia_get_snapshot following a replay’s redirects (#63)', () => {
+  const recovery = () => hint(iaGetSnapshot.errors, 'no_snapshot_available');
+
+  const errorOf = (result: ToolResult) =>
+    (result.structuredContent as { error: { code: number; message: string } }).error;
+
+  /** `no_snapshot_available` with `message` and the declared hint, on both surfaces. */
+  const expectDeadEnd = (result: ToolResult, message: string) => {
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        message,
+        data: { reason: 'no_snapshot_available', recovery: { hint: recovery() } },
+      },
+    });
+    const text = contentText(result);
+    expect(text).toContain(`Error: ${message}`);
+    expect(text).toContain(`Recovery: ${recovery()}`);
+  };
+
+  it('follows an archived redirect with a root-relative Location to the served capture, and its next page is one request to that capture', async () => {
+    const asked =
+      'https://web.archive.org/web/20250805171636/http://www.example.org/documents/report.pdf';
+    const target = 'https://web.archive.org/web/20250805171636/http://redirected.example.org/';
+    const served = 'https://web.archive.org/web/20250828072413/http://redirected.example.org/';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(
+        301,
+        'Tue, 05 Aug 2025 17:16:36 GMT',
+        '/web/20250805171636/http://redirected.example.org/',
+      ),
+    });
+    http.route({ match: target, respond: nearestCapture(served) });
+    http.route({
+      match: served,
+      respond: replay(
+        `<html><body><p>${'a'.repeat(50_000)}${'b'.repeat(10_000)}</p></body></html>`,
+      ),
+    });
+    routeUnrouted();
+
+    const first = await runToolContract(iaGetSnapshot, {
+      url: 'http://www.example.org/documents/report.pdf',
+      timestamp: '20250805171636',
+    });
+
+    const notice =
+      'The capture at 20250805171636 is an archived HTTP 301 redirect to `http://redirected.example.org/`, and the text comes from the capture Wayback served for that URL (replay_url). More text follows: call ia_get_snapshot again with url `http://redirected.example.org/`, timestamp 20250828072413 (resolved_timestamp), and char_offset 50000 for the next page.';
+    expect(first.structuredContent).toMatchObject({
+      text: 'a'.repeat(50_000),
+      replay_url: served,
+      resolved_timestamp: '20250828072413',
+      resolved_status: '200',
+      has_more: true,
+      notice,
+    });
+    const text = contentText(first);
+    expect(text).toContain(`**Replay URL:** [${served}](<${served}>)`);
+    expect(text).toContain('**Resolved Timestamp:** 20250828072413 | **Status:** 200');
+    expect(text).toContain(`> ${notice}`);
+    expect(replayUrls()).toEqual([asked, target, served]);
+
+    const next = await runToolContract(iaGetSnapshot, {
+      url: 'http://redirected.example.org/',
+      timestamp: '20250828072413',
+      char_offset: 50_000,
+    });
+
+    expect(next.structuredContent).toMatchObject({
+      text: 'b'.repeat(10_000),
+      replay_url: served,
+      char_offset: 50_000,
+      has_more: false,
+      total_chars: 60_000,
+    });
+    expect(next.structuredContent).not.toHaveProperty('notice');
+    expect(contentText(next)).toContain('b'.repeat(10_000));
+    expect(replayUrls()).toEqual([asked, target, served, served]);
+  });
+
+  it('names the served capture without the fragment an archived redirect’s Location carried, in replay_url and both notices', async () => {
+    const asked = 'https://web.archive.org/web/20250805171636/http://www.example.org/';
+    const served = 'https://web.archive.org/web/20250805171636/http://redirected.example.org/';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(301, 'Tue, 05 Aug 2025 17:16:36 GMT', `${served}#main`),
+    });
+    // Matched without its fragment, so a request that carries one still reaches the capture.
+    http.route({
+      match: (request) => request.url.replace(/#.*$/s, '') === served,
+      respond: replay(`<html><body><p>${'a'.repeat(60_000)}</p></body></html>`),
+    });
+    routeUnrouted();
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'http://www.example.org/',
+      timestamp: '20250805171636',
+    });
+
+    const notice =
+      'The capture at 20250805171636 is an archived HTTP 301 redirect to `http://redirected.example.org/`, and the text comes from the capture Wayback served for that URL (replay_url). More text follows: call ia_get_snapshot again with url `http://redirected.example.org/`, timestamp 20250805171636 (resolved_timestamp), and char_offset 50000 for the next page.';
+    expect(result.structuredContent).toMatchObject({ replay_url: served, notice });
+    expect(contentText(result)).toContain(`> ${notice}`);
+    expect(replayUrls()).toEqual([asked, served]);
+  });
+
+  it('fails an archived redirect whose target Wayback never archived as no_snapshot_available, after one attempt', async () => {
+    const asked = 'https://web.archive.org/web/20240515003448/https://example.com/';
+    const target =
+      'https://web.archive.org/web/20240515003448/http://parked.example.org/?subid1=abc';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(302, 'Wed, 15 May 2024 00:34:48 GMT', target),
+    });
+    http.route({
+      match: target,
+      respond: () =>
+        new Response('Wayback Machine has not archived that URL.', {
+          status: 404,
+          headers: { 'content-type': 'text/html' },
+        }),
+    });
+    routeUnrouted();
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'https://example.com/', timestamp: '20240515003448' }),
+    );
+
+    expectDeadEnd(
+      result,
+      'The capture of https://example.com/ at 20240515003448 is an archived HTTP 302 redirect to http://parked.example.org/?subid1=abc; the Wayback Machine has not archived that URL.',
+    );
+    expect(replayUrls()).toEqual([asked, target]);
+  });
+
+  it('names the target’s capture and status when an archived redirect ends on an archived error page, after one attempt', async () => {
+    const asked = 'https://web.archive.org/web/20190419141850/http://www.example.org/';
+    const target =
+      'https://web.archive.org/web/20190419141850/https://redirected.example.org/status';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(
+        301,
+        'Fri, 19 Apr 2019 14:18:50 GMT',
+        '/web/20190419141850/https://redirected.example.org/status',
+      ),
+    });
+    http.route({ match: target, respond: archivedError(503, 'Fri, 19 Apr 2019 14:18:56 GMT') });
+    routeUnrouted();
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, {
+        url: 'http://www.example.org/',
+        timestamp: '20190419141850',
+      }),
+    );
+
+    expectDeadEnd(
+      result,
+      'The capture of http://www.example.org/ at 20190419141850 is an archived HTTP 301 redirect to https://redirected.example.org/status; its capture at 20190419141856 is an archived HTTP 503 error page.',
+    );
+    expect(errorOf(result).message).not.toContain(
+      'capture at 20190419141850 is an archived HTTP 503',
+    );
+    expect(replayUrls()).toEqual([asked, target]);
+  });
+
+  it('fails redirects that loop as no_snapshot_available without a retry', async () => {
+    const asked = 'https://web.archive.org/web/20200104000000/example.com';
+    const nearest = 'https://web.archive.org/web/20200104000551/https://example.com/';
+    http.route({ match: asked, respond: nearestCapture(nearest) });
+    http.route({ match: nearest, respond: nearestCapture(asked) });
+    routeUnrouted();
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000000' }),
+    );
+
+    expectDeadEnd(
+      result,
+      `No readable capture of example.com at 20200104000000: the next redirect returns to ${asked}, which was already requested.`,
+    );
+    expect(replayUrls()).toEqual([asked, nearest]);
+  });
+
+  it('names an eleventh redirect that is itself an archived redirect, after one attempt', async () => {
+    const hop = (i: number) =>
+      `https://web.archive.org/web/202001010000${String(i).padStart(2, '0')}/https://example.com/`;
+    for (let i = 0; i < 10; i++) http.route({ match: hop(i), respond: nearestCapture(hop(i + 1)) });
+    http.route({
+      match: hop(10),
+      respond: archivedRedirect(
+        301,
+        'Wed, 01 Jan 2020 00:00:10 GMT',
+        'https://web.archive.org/web/20200101000010/http://redirected.example.org/',
+      ),
+    });
+    routeUnrouted();
+
+    const result = await runWithRetries(() =>
+      runToolContract(iaGetSnapshot, { url: 'https://example.com/', timestamp: '20200101000000' }),
+    );
+
+    expectDeadEnd(
+      result,
+      'The capture of https://example.com/ at 20200101000010 is an archived HTTP 301 redirect to http://redirected.example.org/; the redirects continue past 10, the most this server follows.',
+    );
+    expect(replayUrls()).toHaveLength(11);
+  });
+
+  it.each([403, 410, 451])(
+    'fails a %i for an archived redirect’s target as a refusal with the declared hint, never as a URL not served',
+    async (status) => {
+      const asked = 'https://web.archive.org/web/20250805171636/http://www.example.org/';
+      const target = 'https://web.archive.org/web/20250805171636/http://redirected.example.org/';
+      http.route({
+        match: asked,
+        respond: archivedRedirect(301, 'Tue, 05 Aug 2025 17:16:36 GMT', target),
+      });
+      http.route({
+        match: target,
+        respond: () =>
+          new Response('<p>playback</p>', { status, headers: { 'content-type': 'text/html' } }),
+      });
+      routeUnrouted();
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaGetSnapshot, {
+          url: 'http://www.example.org/',
+          timestamp: '20250805171636',
+        }),
+      );
+
+      expectDeadEnd(
+        result,
+        `The capture of http://www.example.org/ at 20250805171636 is an archived HTTP 301 redirect to http://redirected.example.org/; the Wayback Machine refused to replay it with HTTP ${status}.`,
+      );
+      expect(contentText(result)).not.toMatch(/does not serve captures|at any timestamp/);
+      expect(replayUrls()).toEqual([asked, target]);
+    },
+  );
+
+  describe('after only a nearest-capture redirect, the answer keeps its own message', () => {
+    const asked = 'https://web.archive.org/web/20200104000000/example.com';
+    const nearest = 'https://web.archive.org/web/20200104000551/https://example.com/';
+    const read = () =>
+      runWithRetries(() =>
+        runToolContract(iaGetSnapshot, { url: 'example.com', timestamp: '20200104000000' }),
+      );
+
+    it('a not-served status: a URL the Wayback Machine does not serve, with its own hint', async () => {
+      http.route({ match: asked, respond: nearestCapture(nearest) });
+      http.route({
+        match: nearest,
+        respond: () =>
+          new Response('<p>playback</p>', {
+            status: 410,
+            headers: { 'content-type': 'text/html' },
+          }),
+      });
+      routeUnrouted();
+
+      const result = await read();
+
+      const message = 'The Wayback Machine does not serve captures of example.com (HTTP 410).';
+      const notServed =
+        'No capture of this URL can be read from the Wayback Machine at any timestamp, so another timestamp or a retry will not help; look for the content under a different URL.';
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message,
+          data: { reason: 'no_snapshot_available', recovery: { hint: notServed } },
+        },
+      });
+      const text = contentText(result);
+      expect(text).toContain(`Error: ${message}`);
+      expect(text).toContain(`Recovery: ${notServed}`);
+      expect(replayUrls()).toEqual([asked, nearest]);
+    });
+
+    it('an archived error page: the capture and its archived status', async () => {
+      http.route({ match: asked, respond: nearestCapture(nearest) });
+      http.route({ match: nearest, respond: archivedError(503, 'Sat, 04 Jan 2020 00:05:51 GMT') });
+      routeUnrouted();
+
+      const result = await read();
+
+      expectDeadEnd(
+        result,
+        'The capture of example.com at 20200104000551 is an archived HTTP 503 error page — the site returned that error when it was captured, so the capture holds no copy of the page itself.',
+      );
+      expect(replayUrls()).toEqual([asked, nearest]);
+    });
   });
 });
 
@@ -1499,8 +1824,9 @@ describe('ia_get_snapshot by the replay’s media type (#49)', () => {
     routeReplay(
       replay(
         Uint8Array.from(html, (c) => c.charCodeAt(0)),
-        undefined,
-        { 'x-archive-guessed-charset': 'latin1' },
+        {
+          'x-archive-guessed-charset': 'latin1',
+        },
       ),
     );
 
@@ -2235,6 +2561,34 @@ describe('one call deadline spans every request a Wayback call chains (#55)', ()
     }
   });
 
+  /** `getExact`'s replay, which Wayback redirects to the nearest capture, and that capture's replay URL. */
+  const EXACT_CHAIN = [
+    'https://web.archive.org/web/20200101000000/example.com',
+    'https://web.archive.org/web/20200101000551/https://example.com/',
+  ] as const;
+
+  /** Routes `getExact`'s redirect, answered by `first`, then its target, answered by `second`; any other replay URL draws a 400. */
+  const routeRedirectedExact = (first: FetchMockResponder, second: FetchMockResponder) => {
+    http.route({ match: EXACT_CHAIN[0], respond: first });
+    http.route({ match: EXACT_CHAIN[1], respond: second });
+    routeUnrouted();
+  };
+
+  it('ends a replay whose redirect target stalls on the call deadline, sending no further hop', async () => {
+    routeRedirectedExact(answerAfter(JUST_INSIDE, nearestCapture(EXACT_CHAIN[1])), hang);
+
+    const { result, elapsedMs } = await runTimed(() => getExact());
+
+    expect(elapsedMs).toBe(55_000);
+    expectDeadline(
+      result,
+      iaGetSnapshot.errors,
+      'content_fetch_failed',
+      REPLAY_EXPIRED('20200101000000'),
+    );
+    expect(replayUrls()).toEqual(EXACT_CHAIN);
+  });
+
   describe('a caller cancellation stays RequestCancelled, never the deadline', () => {
     /** Aborts the caller's signal at `atMs` of fake time, reporting when the call settled. */
     const cancelAt = async (atMs: number, run: (signal: AbortSignal) => Promise<ToolResult>) => {
@@ -2287,6 +2641,16 @@ describe('one call deadline spans every request a Wayback call chains (#55)', ()
       expect(elapsedMs).toBe(40_000);
       expect(calls(isCdx)).toHaveLength(1);
       expect(calls(isReplay)).toHaveLength(0);
+    });
+
+    it('mid-chain, on the request a followed redirect sent, sending no further hop', async () => {
+      routeRedirectedExact(nearestCapture(EXACT_CHAIN[1]), hang);
+
+      const { result, elapsedMs } = await cancelAt(10_000, getExact);
+
+      expectCancelled(result);
+      expect(elapsedMs).toBe(10_000);
+      expect(replayUrls()).toEqual(EXACT_CHAIN);
     });
   });
 });
@@ -2896,6 +3260,38 @@ describe('Wayback log level for an upstream non-2xx', () => {
     expect(statusRecords(404)).toEqual({ error: 1, debug: 0 });
   });
 
+  it.each([
+    [
+      'an archived redirect',
+      301,
+      archivedRedirect(
+        301,
+        'Sat, 04 Jan 2020 00:05:51 GMT',
+        'https://web.archive.org/web/20200104000551/https://example.com/',
+      ),
+    ],
+    [
+      'a redirect to the nearest capture',
+      302,
+      nearestCapture('https://web.archive.org/web/20200104000551/https://example.com/'),
+    ],
+  ])(
+    'logs a followed replay redirect, %s, at debug and never at error',
+    async (_kind, status, respond) => {
+      http.route({ match: 'https://web.archive.org/web/20200104000551/example.com', respond });
+      http.route({
+        match: 'https://web.archive.org/web/20200104000551/https://example.com/',
+        respond: replay('<html><body>page</body></html>'),
+      });
+
+      const result = await getExact();
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ text: 'page', resolved_status: '200' });
+      expect(statusRecords(status)).toEqual({ error: 0, debug: 1 });
+    },
+  );
+
   it.each([400, 503])('keeps a replay %i at error', async (status) => {
     routeReplay(page(status));
 
@@ -3235,7 +3631,7 @@ describe('ia_find_snapshots closest mode with no timestamp reads the latest capt
 
   it('sends the same lookup ia_get_snapshot sends for a blank timestamp, and finds the capture it reads', async () => {
     routeAvailability(latestOnly);
-    routeReplay(replay('User-agent: *', LATEST));
+    routeReplay(replay('User-agent: *'));
 
     const found = await runToolContract(iaFindSnapshots, { url: ROBOTS, mode: 'closest' });
     const read = await runToolContract(iaGetSnapshot, { url: ROBOTS, timestamp: '' });
@@ -3281,7 +3677,7 @@ describe('a Wayback capture URL as url (#59)', () => {
   ])(
     'ia_get_snapshot reads the capture a capture URL names for a timestamp %s, keyed on its original',
     async (_label, timestamp) => {
-      routeReplay(replay('<html><body>UCD Digital Library</body></html>', CAPTURE));
+      routeReplay(replay('<html><body>UCD Digital Library</body></html>'));
 
       const result = await runToolContract(iaGetSnapshot, { url: CAPTURE, timestamp });
 
@@ -3391,7 +3787,11 @@ describe('a Wayback capture URL as url (#59)', () => {
     const PAGE_URL = 'https://en.wikipedia.org/wiki/World_War_II';
     const asked = `https://web.archive.org/web/20200101030000/${PAGE_URL}`;
     const served = `https://web.archive.org/web/20200101030925/${PAGE_URL}`;
-    routeReplay(replay(`<html><body><p>${'a'.repeat(60_000)}</p></body></html>`, served));
+    http.route({ match: asked, respond: nearestCapture(served) });
+    http.route({
+      match: served,
+      respond: replay(`<html><body><p>${'a'.repeat(60_000)}</p></body></html>`),
+    });
 
     const first = await runToolContract(iaGetSnapshot, { url: asked, timestamp: '' });
     const notice = `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp 20200101030925 (resolved_timestamp), and char_offset 50000 for the next page.`;
@@ -3412,6 +3812,6 @@ describe('a Wayback capture URL as url (#59)', () => {
       has_more: false,
       total_chars: 60_000,
     });
-    expect(calls(isReplay).map((c) => c.request.url)).toEqual([asked, served]);
+    expect(replayUrls()).toEqual([asked, served, served]);
   });
 });

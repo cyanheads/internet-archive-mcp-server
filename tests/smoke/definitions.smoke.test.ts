@@ -10,7 +10,8 @@ import { getArchiveMetadataService } from '@/services/archive-metadata/archive-m
 import { getArchiveSearchService } from '@/services/archive-search/archive-search-service.js';
 import { getWaybackService } from '@/services/wayback/wayback-service.js';
 
-vi.mock('@/services/wayback/wayback-service.js', () => ({
+vi.mock('@/services/wayback/wayback-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/wayback/wayback-service.js')>()),
   getWaybackService: vi.fn(),
 }));
 vi.mock('@/services/archive-search/archive-search-service.js', () => ({

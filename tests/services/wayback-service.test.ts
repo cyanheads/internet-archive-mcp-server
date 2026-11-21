@@ -710,6 +710,29 @@ describe('WaybackService.findClosest resolution', () => {
     });
   });
 
+  it.each([
+    'https://wayback.archive.org/web/20200101231047/https://example.com/',
+    'http://wayback.archive.org/web/20200101231047/https://example.com/',
+  ])(
+    'uses an Availability capture on the alias host, %s, in its web.archive.org form, in one request',
+    async (url) => {
+      fetchWithTimeout.mockResolvedValueOnce(
+        availability({
+          archived_snapshots: {
+            closest: { url, timestamp: '20200101231047', status: '200', available: true },
+          },
+        }),
+      );
+
+      await expect(findClosest('example.com', '20200101')).resolves.toEqual({
+        snapshotUrl: 'https://web.archive.org/web/20200101231047/https://example.com/',
+        timestamp: '20200101231047',
+        status: '200',
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('falls back to CDX when the Availability URL is not a Wayback replay URL', async () => {
     fetchWithTimeout
       .mockResolvedValueOnce(
@@ -1194,7 +1217,7 @@ describe('WaybackService timeouts and network errors (#31)', () => {
     expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
   });
 
-  it('asks the replay fetch, and only it, to capture Memento-Datetime on an error', async () => {
+  it('asks the replay fetch, and only it, to leave redirects to it and capture Memento-Datetime and Location on an error', async () => {
     // Declared, so both runtimes read it as HTML: Node's Response gives a bare string body
     // text/plain, which routes the capture to its id_ form, while Bun gives it no type.
     fetchWithTimeout.mockResolvedValueOnce(
@@ -1205,12 +1228,14 @@ describe('WaybackService timeouts and network errors (#31)', () => {
       createMockContext({ errors: iaGetSnapshot.errors }),
     );
     expect(fetchWithTimeout.mock.calls[0]?.[3]).toMatchObject({
-      errorHeaders: ['memento-datetime'],
+      redirect: 'manual',
+      errorHeaders: ['memento-datetime', 'location'],
     });
 
     fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, capture('20200101000000')]));
     await fetchHistory(1);
     expect(fetchWithTimeout.mock.calls[1]?.[3]).not.toHaveProperty('errorHeaders');
+    expect(fetchWithTimeout.mock.calls[1]?.[3]).not.toHaveProperty('redirect');
 
     fetchWithTimeout.mockResolvedValueOnce(availability({ archived_snapshots: {} }));
     fetchWithTimeout.mockResolvedValueOnce(
@@ -1221,8 +1246,11 @@ describe('WaybackService timeouts and network errors (#31)', () => {
       '20200101',
       createMockContext({ errors: iaFindSnapshots.errors }),
     );
-    expect(fetchWithTimeout.mock.calls[2]?.[3]).not.toHaveProperty('errorHeaders');
-    expect(fetchWithTimeout.mock.calls[3]?.[3]).not.toHaveProperty('errorHeaders');
+    for (const call of fetchWithTimeout.mock.calls.slice(2)) {
+      expect(call[3]).not.toHaveProperty('errorHeaders');
+      expect(call[3]).not.toHaveProperty('redirect');
+    }
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(4);
   });
 
   it('leaves a caller-side deadline as the fetch threw it, after one request', async () => {

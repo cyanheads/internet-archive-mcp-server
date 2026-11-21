@@ -8,18 +8,92 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { startCallDeadline } from '@/services/call-deadline.js';
-import { readCaptureTarget } from '@/services/wayback/wayback-capture-url.js';
+import type { ArchivedRedirect, RedirectDeadEnd } from '@/services/wayback/types.js';
+import { captureOf, readCaptureTarget } from '@/services/wayback/wayback-capture-url.js';
 import {
   getWaybackService,
+  MAX_REPLAY_REDIRECTS,
   NOT_SERVED,
   NOT_SERVED_HINT,
   notServedMessage,
 } from '@/services/wayback/wayback-service.js';
 
+/**
+ * `text` as a Markdown code span, so text from a `Location` header reads back exactly from
+ * either surface of a notice. Error messages name it plainly: the framework escapes a message
+ * for `content[]`.
+ */
+const code = (text: string): string => markdown().inlineCode(text).build();
+
+/**
+ * The archived redirects a replay followed, as the rest of a sentence about the first one's
+ * capture: " at <timestamp> is an archived HTTP <status> redirect to <target>", each later one
+ * joined as ", whose capture at …", with each target rendered by `name`.
+ */
+function redirectChain(
+  redirects: readonly ArchivedRedirect[],
+  name: (target: string) => string,
+): string {
+  return redirects
+    .map(
+      (r, i) =>
+        `${i === 0 ? '' : ', whose capture'} at ${r.captureTimestamp} is an archived HTTP ${r.status} redirect to ${name(r.target)}`,
+    )
+    .join('');
+}
+
+/** How a replay's redirects ended, as a clause; `chained` when archived redirects were named before it. */
+function deadEndClause(end: RedirectDeadEnd, chained: boolean): string {
+  const capture = (timestamp: string) => `${chained ? 'its' : 'the'} capture at ${timestamp}`;
+  switch (end.kind) {
+    case 'not_archived':
+      return 'the Wayback Machine has not archived that URL';
+    case 'archived_error':
+      return `${capture(end.captureTimestamp)} is an archived HTTP ${end.status} error page`;
+    case 'refused':
+      return `the Wayback Machine refused to replay it with HTTP ${end.status}`;
+    case 'loop':
+      return `the next redirect returns to ${end.url}, which was already requested`;
+    case 'too_many_redirects':
+      return `the redirects continue past ${MAX_REPLAY_REDIRECTS}, the most this server follows`;
+    case 'no_location':
+      return end.captureTimestamp === undefined
+        ? `the Wayback Machine answered HTTP ${end.status} with no Location header`
+        : `${capture(end.captureTimestamp)} is an archived HTTP ${end.status} redirect with no Location header`;
+    case 'bad_location': {
+      const to = `${end.location}, which is not an http(s) Wayback Machine URL, so it is not followed`;
+      return end.captureTimestamp === undefined
+        ? `the Wayback Machine redirected to ${to}`
+        : `${capture(end.captureTimestamp)} is an archived HTTP ${end.status} redirect to ${to}`;
+    }
+    default: {
+      const unreachable: never = end;
+      return unreachable;
+    }
+  }
+}
+
+/** An error message's opening clause for the archived redirects a replay of `url` followed, each target named plainly. */
+function redirectedFrom(url: string, redirects: readonly ArchivedRedirect[]): string {
+  return `The capture of ${url}${redirectChain(redirects, (target) => target)}`;
+}
+
+/** The message for redirects from `url` at `timestamp` that reached no readable capture. */
+function deadEndMessage(
+  url: string,
+  timestamp: string,
+  redirects: readonly ArchivedRedirect[],
+  end: RedirectDeadEnd,
+): string {
+  return redirects.length > 0
+    ? `${redirectedFrom(url, redirects)}; ${deadEndClause(end, true)}.`
+    : `No readable capture of ${url} at ${timestamp}: ${deadEndClause(end, false)}.`;
+}
+
 export const iaGetSnapshot = tool('ia_get_snapshot', {
   title: 'Get Wayback Machine Snapshot Content',
   description:
-    'Fetch the archived content of a URL at a specific Wayback Machine timestamp, or of the capture a Wayback capture URL such as a replay_url names. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text with its markup stripped, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass resolved_timestamp as timestamp so every page comes from the same capture. Use ia_find_snapshots first to discover valid timestamps for a URL.',
+    'Fetch the archived content of a URL at a specific Wayback Machine timestamp, or of the capture a Wayback capture URL such as a replay_url names. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text with its markup stripped, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass it with the url and timestamp the notice names, so every page comes from the same capture; after an archived redirect that url differs from the one sent. Use ia_find_snapshots first to discover valid timestamps for a URL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -41,7 +115,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .min(0)
       .default(0)
       .describe(
-        "Character offset (UTF-16 code units) into the capture's text where this page starts. For the next page, pass the previous char_offset plus max_chars, with the previous resolved_timestamp as timestamp so the page comes from the same capture. An offset at or past total_chars returns empty text.",
+        "Character offset (UTF-16 code units) into the capture's text where this page starts. For the next page, pass the previous char_offset plus max_chars with the url and timestamp the previous page's notice names, so the page comes from the same capture; after an archived redirect that url differs from the one sent. An offset at or past total_chars returns empty text.",
       ),
     max_chars: z
       .number()
@@ -68,7 +142,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     has_more: z
       .boolean()
       .describe(
-        "True when the capture's text continues past this page; the notice names the char_offset and timestamp that read the next one.",
+        "True when the capture's text continues past this page; the notice names the url, char_offset, and timestamp that read the next one.",
       ),
     total_chars: z
       .number()
@@ -78,7 +152,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     replay_url: z
       .string()
       .describe(
-        'Wayback Machine replay URL (https://web.archive.org) of the capture the text came from — where the fetch ended after any redirect Wayback issued to the capture it served.',
+        `Wayback Machine replay URL (https://web.archive.org) of the capture the text came from — where the replay's redirects ended: Wayback's own to the nearest capture, and archived redirects (a capture of the site's own 3xx, which the notice names), followed for up to ${MAX_REPLAY_REDIRECTS} redirects on the Wayback Machine.`,
       ),
     resolved_timestamp: z
       .string()
@@ -97,7 +171,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .string()
       .optional()
       .describe(
-        'Set when the capture is longer than the 4 MiB read limit (the text comes from its first bytes only), when max_chars is above the server maximum, or when more text follows this page — naming the char_offset and timestamp that read the next one.',
+        "Set when the replay passed through an archived redirect (a capture of the site's own 3xx) — the capture requested is one, or Wayback first redirected the requested timestamp to a nearest capture that is one — naming each archived redirect's capture timestamp, HTTP status, and target, the text then coming from the capture Wayback served for the last target; when the capture is longer than the 4 MiB read limit (the text comes from its first bytes only); when max_chars is above the server maximum; or when more text follows this page — naming the url, char_offset, and timestamp that read the next one.",
       ),
   },
 
@@ -121,7 +195,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     {
       reason: 'no_snapshot_available',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No capture exists near the requested timestamp for this URL, the capture there is an archived error page — the HTTP 4xx or 5xx the site itself returned when it was captured — or the Wayback Machine refused the replay request with an HTTP 4xx, as it does for a site excluded from the archive; or the closest-capture lookup answered HTTP 403, 410, or 451, the Wayback Machine declining to serve the URL at all.',
+      when: `No capture exists near the requested timestamp for this URL, the capture there is an archived error page — the HTTP 4xx or 5xx the site itself returned when it was captured — or the Wayback Machine refused the replay request with an HTTP 4xx, as it does for a site excluded from the archive; or the replay's redirects reach no readable capture — the target of an archived redirect (a capture of the site's own 3xx) was never archived, is an archived error page, or was refused, or the redirects loop, run past ${MAX_REPLAY_REDIRECTS}, or reach a 3xx with no Location or a Location that is not an http(s) Wayback Machine URL — answered after one attempt; or the closest-capture lookup answered HTTP 403, 410, or 451, the Wayback Machine declining to serve the URL at all.`,
       recovery:
         'Use ia_find_snapshots in history mode to discover what snapshots actually exist for this URL; status_filter "200" lists only captures with readable content.',
       severity: 'warning',
@@ -137,7 +211,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     {
       reason: 'content_fetch_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The archived page could not be fetched — the Wayback Machine answered HTTP 429, or 408, 425, or 5xx after retries, did not answer within the request timeout, or could not be reached, or refused the unmodified (id_) form of a text capture it had replayed — or its nearest capture could not be looked up: the closest-capture lookup found no capture or answered HTTP 429, or 408, 425, or 5xx after retries, an unreadable response, or an error in place of a capture, and its CDX fallback failed or had no time left; or the lookup refused the request with another 4xx, did not answer within the request timeout, or could not be reached; or the lookup and the fetch together did not finish within the call's 55 s deadline (the request timeout when that is longer).",
+      when: "The archived page could not be fetched — the Wayback Machine answered HTTP 429, or 408, 425, or 5xx after retries, did not answer within the request timeout, or could not be reached, or refused the unmodified (id_) form of a text capture it had replayed, or that form's redirects reached no readable capture — or its nearest capture could not be looked up: the closest-capture lookup found no capture or answered HTTP 429, or 408, 425, or 5xx after retries, an unreadable response, or an error in place of a capture, and its CDX fallback failed or had no time left; or the lookup refused the request with another 4xx, did not answer within the request timeout, or could not be reached; or the lookup and the fetch together did not finish within the call's 55 s deadline (the request timeout when that is longer).",
       recovery: 'The Wayback Machine is temporarily unavailable; retry in a few seconds.',
     },
   ],
@@ -191,6 +265,11 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       const hasMore = nextOffset < totalChars;
 
       const notices: string[] = [];
+      if (content.redirects) {
+        notices.push(
+          `The capture${redirectChain(content.redirects, code)}, and the text comes from the capture Wayback served for that URL (replay_url).`,
+        );
+      }
       if (content.truncatedAtBytes !== undefined) {
         const bytes = content.truncatedAtBytes.toLocaleString('en-US');
         notices.push(
@@ -204,10 +283,16 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         );
       }
       if (hasMore) {
-        // Names the URL looked up, never a capture URL, whose own timestamp could differ from
-        // the one served; as a code span, so it reads back exactly from either surface.
+        // Names the URL looked up — after an archived redirect, the original URL of the capture
+        // served, so the next page is one request to that capture — never the caller's capture
+        // URL, whose own timestamp could differ from the one served. When that URL is itself a
+        // Wayback capture URL (a capture of one), it would read at its own timestamp, so the
+        // capture served is named instead. As a code span, so it reads back exactly from either
+        // surface.
+        const lookedUp = (content.redirects && captureOf(content.replayUrl)?.original) ?? url;
+        const nextUrl = captureOf(lookedUp) ? content.replayUrl : lookedUp;
         notices.push(
-          `More text follows: call ia_get_snapshot again with url ${markdown().inlineCode(url).build()}, timestamp ${resolvedTimestamp} (resolved_timestamp), and char_offset ${nextOffset} for the next page.`,
+          `More text follows: call ia_get_snapshot again with url ${code(nextUrl)}, timestamp ${resolvedTimestamp} (resolved_timestamp), and char_offset ${nextOffset} for the next page.`,
         );
       }
       if (notices.length) ctx.enrich.notice(notices.join(' '));
@@ -234,11 +319,28 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         err instanceof McpError &&
         err.code === JsonRpcErrorCode.NotFound
       ) {
-        const { captureTimestamp, mediaType, replayUrl, status } = err.data ?? {};
+        const { captureTimestamp, deadEnd, mediaType, redirects, replayUrl, status } =
+          err.data ?? {};
+        if (deadEnd !== undefined) {
+          throw ctx.fail(
+            'no_snapshot_available',
+            deadEndMessage(
+              url,
+              fetching,
+              redirects as ArchivedRedirect[],
+              deadEnd as RedirectDeadEnd,
+            ),
+            ctx.recoveryFor('no_snapshot_available'),
+            { cause: err },
+          );
+        }
         if (mediaType !== undefined) {
+          const served = `is ${mediaType}, not text, so it has no text to return; the original file is at ${replayUrl}.`;
           throw ctx.fail(
             'non_text_capture',
-            `The capture of ${url} that Wayback served is ${mediaType}, not text, so it has no text to return; the original file is at ${replayUrl}.`,
+            redirects
+              ? `${redirectedFrom(url, redirects as ArchivedRedirect[])}; the capture Wayback served for that URL ${served}`
+              : `The capture of ${url} that Wayback served ${served}`,
             { mediaType, replayUrl, ...ctx.recoveryFor('non_text_capture') },
             { cause: err },
           );
