@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-21
+
+ia_get_snapshot follows a replay's redirects itself, up to 10 and on Wayback Machine hosts only, naming each archived redirect in a notice; redirects that reach no readable capture are no_snapshot_available with the redirect and its ending named.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-17 · ⚠️ Breaking
 
 A Wayback capture URL passed as url is read as the page it archives; one deadline bounds each tool call; ia_find_snapshots closest mode reads an omitted timestamp as the latest capture; list-valued fields keep their value boundaries in content[].
