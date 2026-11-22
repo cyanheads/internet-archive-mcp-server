@@ -240,12 +240,13 @@ src/
   services/
     upstream-errors.ts                  # Shared transport/429 classification + retry predicate
     call-deadline.ts                    # One deadline per tool/resource call: 55 s, or IA_REQUEST_TIMEOUT_MS when longer
-    html-text.ts                        # HTML → plain text (markup scan + reference decode); archived pages and item descriptions
+    html-text.ts                        # HTML → plain text (markup scan + line builder + reference decode) and a page's anchors with its first <base href>; archived pages and item descriptions
     html-entities.ts                    # Named character reference table
+    string-or-list.ts                   # The string-or-list rule for Archive record fields (item metadata, search rows)
     wayback/
       wayback-service.ts                # WaybackService — Availability API + CDX API
       wayback-timestamp.ts              # Timestamp forms (1–14 digits, ISO 8601) → Wayback digits
-      wayback-capture-url.ts            # Wayback capture URL → original URL + timestamp (url in both Wayback tools, the service's redirect walk); WAYBACK_HOSTS
+      wayback-capture-url.ts            # Wayback capture URL → original URL + timestamp (url in both Wayback tools, the service's redirect walk); an href on a replayed page → the URL it names (ia_get_snapshot links); WAYBACK_HOSTS
       html-charset.ts                   # Archived-page charset detection + decoding
       types.ts                          # Wayback domain types
     archive-search/
@@ -255,10 +256,11 @@ src/
     archive-metadata/
       archive-metadata-service.ts       # ArchiveMetadataService — Metadata API + downloads
       item-reference.ts                 # Identifier or archive.org item URL → item identifier + file
-      read-text-page.ts                 # UTF-16 pages with UTF-8 byte checkpoints
+      phrase-matcher.ts                 # ia_get_text find: streaming phrase matcher (simple case folding, White_Space runs)
+      read-text-page.ts                 # UTF-16 pages with UTF-8 byte checkpoints, at an offset or at a phrase's first match
       types.ts                          # Metadata domain types
   mcp-server/
-    tools/labelled-field.ts             # Labelled string-or-list fields and the item heading, shared by ia_get_item and ia_search_items
+    tools/labelled-field.ts             # Labelled string-or-list fields (optional per-value renderer) and the item heading, shared by ia_get_item and ia_search_items
     tools/definitions/
       ia-find-snapshots.tool.ts         # ia_find_snapshots
       ia-get-snapshot.tool.ts           # ia_get_snapshot

@@ -1,6 +1,6 @@
 # internet-archive-mcp-server - Directory Structure
 
-Generated on: 2026-11-21 19:25:20
+Generated on: 2026-11-22 12:16:27
 
 ```text
 internet-archive-mcp-server/
@@ -168,6 +168,7 @@ internet-archive-mcp-server/
 │   │   ├── archive-metadata/
 │   │   │   ├── archive-metadata-service.ts
 │   │   │   ├── item-reference.ts
+│   │   │   ├── phrase-matcher.ts
 │   │   │   ├── read-text-page.ts
 │   │   │   └── types.ts
 │   │   ├── archive-search/
@@ -183,6 +184,7 @@ internet-archive-mcp-server/
 │   │   ├── call-deadline.ts
 │   │   ├── html-entities.ts
 │   │   ├── html-text.ts
+│   │   ├── string-or-list.ts
 │   │   └── upstream-errors.ts
 │   └── index.ts
 ├── tests/
@@ -209,6 +211,7 @@ internet-archive-mcp-server/
 │   │   ├── html-text.test.ts
 │   │   ├── item-reference.test.ts
 │   │   ├── language-spellings.test.ts
+│   │   ├── phrase-matcher.test.ts
 │   │   ├── upstream-errors.test.ts
 │   │   ├── wayback-capture-url.test.ts
 │   │   ├── wayback-content.test.ts
