@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-11-22
+
+ia_get_snapshot returns an archived page's text in lines and, with include_links, its links; ia_get_text finds a phrase; ia_find_snapshots collapses by digest or URL; items return upload dates, runtime, and track details; list-valued item fields no longer fail ia_get_item.
+
 ## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-21
 
 ia_get_snapshot follows a replay's redirects itself, up to 10 and on Wayback Machine hosts only, naming each archived redirect in a notice; redirects that reach no readable capture are no_snapshot_available with the redirect and its ending named.
