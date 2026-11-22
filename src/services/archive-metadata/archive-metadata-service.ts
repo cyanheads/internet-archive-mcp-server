@@ -12,12 +12,14 @@ import {
   McpError,
   notFound,
   serviceUnavailable,
+  timeout,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getUserAgent } from '@/config/server-config.js';
 import type { CallDeadline } from '../call-deadline.js';
 import { descriptionToText } from '../html-text.js';
+import { stringOrList } from '../string-or-list.js';
 import {
   bodyReadError,
   isHtmlPage,
@@ -27,7 +29,8 @@ import {
   transportError,
   transportFailure,
 } from '../upstream-errors.js';
-import { readTextPage } from './read-text-page.js';
+import { compilePhrase } from './phrase-matcher.js';
+import { findTextPage, readTextPage, type TextCheckpoint } from './read-text-page.js';
 import type { ArchiveFile, ArchiveItem, ArchiveItemMetadata, TextContent } from './types.js';
 
 /** Cursor lifetime in seconds; records contain identity and decoder positions, never text. */
@@ -54,7 +57,6 @@ const storageUnavailable = (err: unknown): boolean =>
   (err.code === JsonRpcErrorCode.ServiceUnavailable || err.code === JsonRpcErrorCode.Timeout);
 
 const continuationError = (
-  ctx: Context,
   reason: 'invalid_continuation' | 'range_unavailable',
   charOffset: number,
 ) =>
@@ -67,12 +69,108 @@ const continuationError = (
       reason,
       retryable: false,
       char_offset: charOffset,
-      ...ctx.recoveryFor(reason),
       recovery: {
         hint: `Omit continuation and retry with char_offset ${charOffset}; restart from char_offset 0 if the file changed.`,
       },
     },
   );
+
+/** A cursor's fields besides its version and expiry. */
+type CursorFields = Omit<TextCursor, 'version' | 'expiresAt'>;
+
+/** A download a cursor can resume: its strong validator and its length in bytes. */
+interface Identity {
+  etag: string;
+  totalBytes: number;
+}
+
+/**
+ * Store `fields` as a tenant-scoped cursor for an hour and return its token, or nothing when cursor
+ * storage is unreachable or full; any other failure, a cancellation included, propagates.
+ */
+async function saveCursor(ctx: Context, fields: CursorFields): Promise<string | undefined> {
+  const token = crypto.randomUUID();
+  const record: TextCursor = { version: 1, ...fields, expiresAt: Date.now() + CURSOR_TTL * 1_000 };
+  try {
+    await ctx.state.set(`ia-text/${token}`, record, { ttl: CURSOR_TTL });
+    return token;
+  } catch (err) {
+    if (ctx.signal.aborted) throw ctx.signal.reason;
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    /**
+     * The in-memory provider reports quota exhaustion as InternalError. This seam writes
+     * only a generated JSON cursor; schema/programmer failures still propagate.
+     */
+    if (
+      !storageUnavailable(err) &&
+      !(err instanceof McpError && err.code === JsonRpcErrorCode.InternalError)
+    )
+      throw err;
+    return;
+  }
+}
+
+/**
+ * How long before the download's own timeout a `find` search stops: 1 s, or a tenth of a shorter
+ * timeout, so the search ends with its resume offset rather than as a timeout the retry ladder
+ * answers by reading the file again from its first byte.
+ */
+const FIND_STOP_MARGIN_MS = 1_000;
+
+/** Why a read stores no cursor where one would resume it: the download's identity, or the store. */
+const NO_CURSOR_BECAUSE = {
+  identity: 'the download lacks a stable identity validator or byte length',
+  storage: 'cursor storage could not be reached',
+} as const;
+type NoCursor = keyof typeof NO_CURSOR_BECAUSE;
+
+/**
+ * `find_incomplete`: the search from `searchStart` stopped with no match before `resumeOffset`,
+ * the earliest offset where one can still begin — on `unheld`, where the first match does begin,
+ * its text let go to keep the call's held text bounded. The hint names the one call that resumes
+ * there: the stored cursor's continuation, else `char_offset`, which reads the file from its first
+ * byte, so after a time stop it says so and why no cursor was stored.
+ */
+function findIncomplete(
+  file: string,
+  searchStart: number,
+  { cause, resumeOffset }: { cause: 'time' | 'unheld'; resumeOffset: number },
+  resume: { token: string } | { noCursor: NoCursor },
+): McpError {
+  const cutOff = `The search of "${file}" stopped before the download's request timeout or the call deadline could cut it off`;
+  const message =
+    cause === 'unheld'
+      ? `The first match of find in "${file}" begins at char_offset ${resumeOffset}, but this call could not return the page there: a whitespace run longer than the text one call holds came before the match.`
+      : resumeOffset > searchStart
+        ? `${cutOff}. No match begins from char_offset ${searchStart} up to char_offset ${resumeOffset}, where the search resumes.`
+        : `${cutOff}, before ruling out a match at char_offset ${searchStart}.`;
+  const byOffset = `Call again with the same find and char_offset ${resumeOffset}.`;
+  return timeout(message, {
+    reason: 'find_incomplete',
+    char_offset: resumeOffset,
+    ...('token' in resume && { next_continuation: resume.token }),
+    recovery: {
+      hint:
+        'token' in resume
+          ? `Call again with the same find and continuation ${resume.token}.`
+          : cause === 'unheld'
+            ? byOffset
+            : `${byOffset} That call reads the file from its first byte, so it searches past char_offset ${resumeOffset} only if the download runs faster than this one did; no continuation is available because ${NO_CURSOR_BECAUSE[resume.noCursor]}.`,
+    },
+  });
+}
+
+/**
+ * A `find` search that stopped without getting past `searchStart`, where any call it named would
+ * repeat this read: `archive_unavailable`, as a read without `find` fails when its download
+ * cannot reach `char_offset` in time, with no offset or continuation to resume from.
+ */
+function searchStalled(file: string, searchStart: number, ctx: Context): McpError {
+  return serviceUnavailable(
+    `The download of "${file}" was too slow to search past char_offset ${searchStart} before its request timeout or the call deadline would have cut it off.`,
+    unavailable(ctx),
+  );
+}
 
 const METADATA_BASE = 'https://archive.org/metadata';
 const DOWNLOAD_BASE = 'https://archive.org/download';
@@ -86,6 +184,11 @@ export interface TextSelection {
   continuation?: string | undefined;
   /** A file name exactly as the manifest lists it; omitted, the default pick. */
   file?: string | undefined;
+  /**
+   * A phrase to start the page at: its first match at or after the read's start (`charOffset`,
+   * or the continuation's position). Holding only White_Space, it reads as omitted.
+   */
+  find?: string | undefined;
 }
 
 /** An item's readable text files, when the default pick chose among more than one. */
@@ -131,9 +234,13 @@ export class ArchiveMetadataService {
   /**
    * Retrieve full metadata and the complete file manifest for an Archive item —
    * `ia_get_text` scans every file, so paging stays in the `ia_get_item` handler.
-   * Each description value is converted from the HTML the Archive stores to plain-text
-   * lines (`descriptionToText`); a value left with no text is dropped, and a description
-   * left with none is omitted. Every other value is relayed as received. Throws `item_not_found` (with the caller's recovery hint)
+   * Each metadata field is read through `stringOrList`: a string or a list of strings is kept,
+   * any other value is left out. Each description value is then converted from the HTML the
+   * Archive stores to plain-text lines (`descriptionToText`); a value left with no text is
+   * dropped, and a description left with none is omitted. Every other kept value is relayed as
+   * received. Each manifest entry is read through `manifestFile`: an entry with no file name is
+   * left out, and each other field is kept only as a non-empty string; a `files` value that is
+   * not a list reads as no files. Throws `item_not_found` (with the caller's recovery hint)
    * when the API returns `{}`, the item is dark, or the body holds neither metadata nor
    * a file list — the `error` or `result` the API answers for an identifier with a `/`
    * in it. Any other failure is `archive_unavailable` (see `retry` and `statusError`),
@@ -174,51 +281,45 @@ export class ArchiveMetadataService {
       }
 
       const meta = raw.metadata as Record<string, unknown> | undefined;
-      const rawFiles = (raw.files as unknown[] | undefined) ?? [];
-      const description = meta?.description
-        ? descriptionText(meta.description as string | string[])
+      const storedDescription = stringOrList(meta?.description);
+      const description =
+        storedDescription === undefined ? undefined : descriptionText(storedDescription);
+      const imageCount = isTexts(stringOrList(meta?.mediatype))
+        ? wholeNumber(meta?.imagecount)
         : undefined;
-      const imageCount = meta?.mediatype === 'texts' ? wholeNumber(meta.imagecount) : undefined;
 
+      // One line per relayed field, in output order; `relay` leaves out a value of any other shape.
       const metadata: ArchiveItemMetadata = {
         identifier,
-        ...(meta?.title ? { title: meta.title as string | string[] } : {}),
-        ...(meta?.creator ? { creator: meta.creator as string | string[] } : {}),
+        ...relay('title', meta?.title),
+        ...relay('creator', meta?.creator),
         ...(description ? { description } : {}),
-        ...(meta?.mediatype ? { mediatype: meta.mediatype as string } : {}),
-        ...(meta?.date ? { date: meta.date as string | string[] } : {}),
-        ...(meta?.subject ? { subject: meta.subject as string | string[] } : {}),
-        ...(meta?.collection ? { collection: meta.collection as string | string[] } : {}),
-        ...(meta?.licenseurl ? { licenseurl: meta.licenseurl as string } : {}),
-        ...(meta?.rights ? { rights: meta.rights as string } : {}),
-        ...(meta?.language ? { language: meta.language as string | string[] } : {}),
-        ...(meta?.publisher ? { publisher: meta.publisher as string | string[] } : {}),
-        ...(meta?.volume ? { volume: meta.volume as string } : {}),
-        ...(meta?.isbn ? { isbn: meta.isbn as string | string[] } : {}),
-        ...(meta?.['oclc-id'] ? { oclc_id: meta['oclc-id'] as string | string[] } : {}),
-        ...(meta?.lccn ? { lccn: meta.lccn as string | string[] } : {}),
-        ...(meta?.openlibrary_edition
-          ? { openlibrary_edition: meta.openlibrary_edition as string }
-          : {}),
-        ...(meta?.openlibrary_work ? { openlibrary_work: meta.openlibrary_work as string } : {}),
+        ...relay('mediatype', meta?.mediatype),
+        ...relay('date', meta?.date),
+        ...relay('publicdate', meta?.publicdate),
+        ...relay('addeddate', meta?.addeddate),
+        ...relay('subject', meta?.subject),
+        ...relay('collection', meta?.collection),
+        ...relay('licenseurl', meta?.licenseurl),
+        ...relay('rights', meta?.rights),
+        ...relay('language', meta?.language),
+        ...relay('publisher', meta?.publisher),
+        ...relay('volume', meta?.volume),
+        ...relay('isbn', meta?.isbn),
+        ...relay('oclc_id', meta?.['oclc-id']),
+        ...relay('lccn', meta?.lccn),
+        ...relay('openlibrary_edition', meta?.openlibrary_edition),
+        ...relay('openlibrary_work', meta?.openlibrary_work),
+        ...relay('runtime', meta?.runtime),
         ...(imageCount !== undefined ? { image_count: imageCount } : {}),
         ...(meta?.['access-restricted-item'] === 'true'
           ? { access_restricted: true as const }
           : {}),
       };
 
-      const files: ArchiveFile[] = rawFiles.map((f) => {
-        const file = f as Record<string, unknown>;
-        const name = (file.name as string) ?? '';
-        return {
-          name,
-          downloadUrl: `${DOWNLOAD_BASE}/${encodeURIComponent(identifier)}/${encodeURIComponent(name)}`,
-          ...(file.format ? { format: file.format as string } : {}),
-          ...(file.size ? { size: file.size as string } : {}),
-          ...(file.md5 ? { md5: file.md5 as string } : {}),
-          ...(file.private === 'true' ? { private: true as const } : {}),
-        };
-      });
+      const files = (Array.isArray(raw.files) ? raw.files : []).flatMap(
+        (entry: unknown) => manifestFile(identifier, entry) ?? [],
+      );
 
       ctx.log.debug('Item metadata fetched', { identifier, fileCount: files.length });
       return { metadata, files };
@@ -236,6 +337,16 @@ export class ArchiveMetadataService {
    * before any download; else the default pick (`defaultTextFile`), with `textFiles` set when
    * it chose among several. `continuation` resumes a validated representation using a
    * tenant-scoped, one-hour byte checkpoint.
+   * With `find`, the same read searches from `charOffset` or the continuation's position and the
+   * page starts at the phrase's first match (`matchOffset`, also `charOffset`); text is held from
+   * the earliest place a match can still begin, at most `maxChars` + 1 units plus twice the
+   * phrase. A miss is an empty page at the search start with `hasMore` false and no
+   * `matchOffset`. A search that would outrun the download's request timeout or the call deadline
+   * stops first and throws `find_incomplete` with the offset to resume from and, when a cursor
+   * could be stored, a continuation there — never retried, so no byte it scanned is read again
+   * in the call; so does a first match whose text the bound let go. A stopped search with no
+   * call to name that reads past where it began — no advance past its start, and no cursor that
+   * skips the bytes before it — throws `archive_unavailable` instead, also unretried.
    * Throws `invalid_continuation` (a `file` other than the continuation's included) or
    * `range_unavailable` for an unusable resume, plus `item_not_found`, `invalid_file`,
    * `no_text_file`, `download_forbidden`, or `archive_unavailable`; the metadata request and
@@ -248,19 +359,19 @@ export class ArchiveMetadataService {
     charOffset: number,
     ctx: Context,
     deadline: CallDeadline,
-    { continuation, file }: TextSelection = {},
+    { continuation, file, find }: TextSelection = {},
   ): Promise<TextPage> {
+    const phrase = find === undefined ? undefined : compilePhrase(find);
     let cursor: TextCursor | undefined;
     if (continuation) {
-      if (!/^[0-9a-f-]{36}$/.test(continuation))
-        throw continuationError(ctx, 'invalid_continuation', 0);
+      if (!/^[0-9a-f-]{36}$/.test(continuation)) throw continuationError('invalid_continuation', 0);
       try {
         cursor = (await ctx.state.get(`ia-text/${continuation}`, TextCursorSchema)) ?? undefined;
       } catch (err) {
         if (ctx.signal.aborted) throw ctx.signal.reason;
         if (err instanceof Error && err.name === 'AbortError') throw err;
         if (!storageUnavailable(err)) throw err;
-        throw continuationError(ctx, 'invalid_continuation', 0);
+        throw continuationError('invalid_continuation', 0);
       }
       if (
         cursor?.version !== 1 ||
@@ -268,7 +379,6 @@ export class ArchiveMetadataService {
         cursor.expiresAt <= Date.now()
       ) {
         throw continuationError(
-          ctx,
           'invalid_continuation',
           cursor?.identifier === identifier ? cursor.nextCharOffset : 0,
         );
@@ -298,7 +408,7 @@ export class ArchiveMetadataService {
     const readable = name === undefined ? item.files.filter(isReadableText) : undefined;
     const textFile = readable ? defaultTextFile(readable) : item.files.find((f) => f.name === name);
     if (!textFile) {
-      if (cursor) throw continuationError(ctx, 'invalid_continuation', charOffset);
+      if (cursor) throw continuationError('invalid_continuation', charOffset);
       if (name !== undefined) throw invalidFile(ctx, identifier, name);
       throw notFound(
         `Item "${identifier}" has no readable text file: its manifest lists no DjVuTXT, Text, or Plain Text file and no .txt file other than Metadata sidecars.`,
@@ -313,20 +423,37 @@ export class ArchiveMetadataService {
     const sourceFileBytes = Number.isSafeInteger(size) && size >= 0 ? size : undefined;
     // The continuation's file was found by name; a changed checksum or size means it changed.
     if (cursor && (cursor.md5 !== textFile.md5 || cursor.size !== textFile.size)) {
-      throw continuationError(ctx, 'invalid_continuation', charOffset);
+      throw continuationError('invalid_continuation', charOffset);
     }
+
+    /** A cursor resuming this file at `nextCharOffset` from `checkpoint`, in a representation it can resume. */
+    const cursorFields = (
+      identity: Identity,
+      nextCharOffset: number,
+      checkpoint: TextCheckpoint,
+    ): CursorFields => ({
+      identifier,
+      file: textFile.name,
+      ...(textFile.md5 !== undefined && { md5: textFile.md5 }),
+      ...(textFile.size !== undefined && { size: textFile.size }),
+      ...identity,
+      nextCharOffset,
+      checkpoint,
+    });
 
     // Step 2: stream the page out of the text file
     const download = textDownload(textFile.name);
-    return this.retry(download, ctx, deadline, async (signal) => {
+    const read = await this.retry(download, ctx, deadline, async (signal) => {
       // A 401/403 here is the expected outcome for a restricted item — IA answers
       // 401 for login-required downloads and 403 for limited collections — so both
       // remap to the declared download_forbidden contract and its recovery hint
       // reaches the wire. expectedStatuses drops the fetch's own error-level log
       // to debug; the status-mapped McpError is still thrown, unchanged.
       let response: Response;
+      const timeoutMs = deadline.nextTimeoutMs();
+      const stopAt = Date.now() + timeoutMs - Math.min(FIND_STOP_MARGIN_MS, timeoutMs / 10);
       try {
-        response = await fetchWithTimeout(textFile.downloadUrl, deadline.nextTimeoutMs(), ctx, {
+        response = await fetchWithTimeout(textFile.downloadUrl, timeoutMs, ctx, {
           headers: {
             ...this.headers,
             'Accept-Encoding': 'identity',
@@ -340,7 +467,7 @@ export class ArchiveMetadataService {
         });
       } catch (err) {
         if (cursor && statusOf(err) === 416)
-          throw continuationError(ctx, 'range_unavailable', charOffset);
+          throw continuationError('range_unavailable', charOffset);
         if (
           err instanceof McpError &&
           (err.code === JsonRpcErrorCode.Forbidden || err.code === JsonRpcErrorCode.Unauthorized)
@@ -376,75 +503,94 @@ export class ArchiveMetadataService {
             totalBytes === cursor.totalBytes - cursor.checkpoint.byteOffset);
         if (etag !== cursor.etag || (range && Number(range[3]) !== cursor.totalBytes)) {
           await response.body?.cancel();
-          throw continuationError(ctx, 'invalid_continuation', charOffset);
+          throw continuationError('invalid_continuation', charOffset);
         }
         if (!valid) {
           await response.body?.cancel();
-          throw continuationError(ctx, 'range_unavailable', charOffset);
+          throw continuationError('range_unavailable', charOffset);
         }
         totalBytes = cursor.totalBytes;
       }
-      const page = await readTextPage(
-        response,
-        cursor ? 0 : charOffset,
-        maxChars,
-        cursor?.checkpoint,
-      ).catch((err: unknown) => {
+      if (response.headers.get('content-length') === null && !cursor)
+        totalBytes = sourceFileBytes ?? NaN;
+      // The representation a cursor can resume: a strong validator over identity bytes of known length.
+      const identity: Identity | undefined =
+        etag &&
+        /^"[^"\r\n]*"$/.test(etag) &&
+        (!encoding || encoding === 'identity') &&
+        Number.isSafeInteger(totalBytes) &&
+        totalBytes >= 0 &&
+        (cursor !== undefined || response.status === 200)
+          ? { etag, totalBytes }
+          : undefined;
+      // Offsets the page and search report count from the read's start: the cursor's position, or 0.
+      const base = cursor ? charOffset : 0;
+
+      const bodyRead = (err: unknown): never => {
         throw bodyReadError(err, download.name);
-      });
+      };
+      let page: Awaited<ReturnType<typeof readTextPage>>;
+      let matchOffset: number | undefined;
+      if (!phrase) {
+        page = await readTextPage(
+          response,
+          cursor ? 0 : charOffset,
+          maxChars,
+          cursor?.checkpoint,
+        ).catch(bodyRead);
+      } else {
+        const found = await findTextPage(
+          response,
+          phrase,
+          cursor ? 0 : charOffset,
+          maxChars,
+          cursor?.checkpoint,
+          stopAt,
+        ).catch(bodyRead);
+        // A caller cancellation stays one, never a miss or an incomplete search.
+        if (ctx.signal.aborted) throw ctx.signal.reason;
+        if (found.kind === 'incomplete') {
+          ctx.log.debug('Text search stopped', {
+            identifier,
+            file: textFile.name,
+            bytesRead: found.bytesRead,
+            cause: found.cause,
+          });
+          // Returned, not thrown, so the retry ladder never reads the file again for it.
+          return { stopped: { ...found, resumeOffset: base + found.resumeOffset }, identity };
+        }
+        if (found.kind === 'hit') {
+          matchOffset = base + found.matchOffset;
+          page = found;
+        } else {
+          // A miss has no next page: its checkpoint goes unread, as readTextPage's does at the end.
+          page = {
+            bytesRead: found.bytesRead,
+            hasMore: false,
+            text: '',
+            checkpoint: { byteOffset: 0, skip: 0 },
+          };
+        }
+      }
+      const pageOffset = matchOffset ?? charOffset;
       if (
         cursor &&
         !page.hasMore &&
         cursor.checkpoint.byteOffset + page.bytesRead !== cursor.totalBytes
       ) {
-        throw continuationError(ctx, 'range_unavailable', charOffset);
+        throw continuationError('range_unavailable', charOffset);
       }
 
       let nextContinuation: string | undefined;
       let continuationNotice: string | undefined;
       if (page.hasMore) {
-        if (response.headers.get('content-length') === null && !cursor)
-          totalBytes = sourceFileBytes ?? NaN;
-        if (
-          !etag ||
-          !/^"[^"\r\n]*"$/.test(etag) ||
-          (encoding && encoding !== 'identity') ||
-          !Number.isSafeInteger(totalBytes) ||
-          totalBytes < 0 ||
-          (!cursor && response.status !== 200)
-        ) {
-          continuationNotice = `Efficient continuation is unavailable because the download lacks a stable identity validator or byte length. Continue with char_offset ${charOffset + maxChars}.`;
+        const next = pageOffset + maxChars;
+        if (!identity) {
+          continuationNotice = `Efficient continuation is unavailable because ${NO_CURSOR_BECAUSE.identity}. Continue with char_offset ${next}.`;
         } else {
-          const token = crypto.randomUUID();
-          const record: TextCursor = {
-            version: 1,
-            identifier,
-            file: textFile.name,
-            ...(textFile.md5 !== undefined && { md5: textFile.md5 }),
-            ...(textFile.size !== undefined && { size: textFile.size }),
-            etag,
-            totalBytes,
-            nextCharOffset: charOffset + maxChars,
-            checkpoint: page.checkpoint,
-            expiresAt: Date.now() + CURSOR_TTL * 1_000,
-          };
-          try {
-            await ctx.state.set(`ia-text/${token}`, record, { ttl: CURSOR_TTL });
-            nextContinuation = token;
-          } catch (err) {
-            if (ctx.signal.aborted) throw ctx.signal.reason;
-            if (err instanceof Error && err.name === 'AbortError') throw err;
-            /**
-             * The in-memory provider reports quota exhaustion as InternalError. This seam writes
-             * only a generated JSON cursor; schema/programmer failures still propagate.
-             */
-            if (
-              !storageUnavailable(err) &&
-              !(err instanceof McpError && err.code === JsonRpcErrorCode.InternalError)
-            )
-              throw err;
-            continuationNotice = `Efficient continuation is unavailable because cursor storage could not be reached. Continue with char_offset ${charOffset + maxChars}.`;
-          }
+          nextContinuation = await saveCursor(ctx, cursorFields(identity, next, page.checkpoint));
+          if (!nextContinuation)
+            continuationNotice = `Efficient continuation is unavailable because ${NO_CURSOR_BECAUSE.storage}. Continue with char_offset ${next}.`;
         }
       }
 
@@ -455,19 +601,43 @@ export class ArchiveMetadataService {
         sourceFileBytes,
         sliceChars: page.text.length,
         hasMore: page.hasMore,
+        ...(phrase && { matchOffset }),
       });
 
       return {
         text: page.text,
         hasMore: page.hasMore,
-        charOffset,
+        charOffset: pageOffset,
         maxChars,
         sourceFile: textFile.name,
+        ...(matchOffset !== undefined && { matchOffset }),
         ...(nextContinuation && { nextContinuation }),
         ...(continuationNotice && { continuationNotice }),
         ...(sourceFileBytes !== undefined && { sourceFileBytes }),
         ...(readable && readable.length > 1 && { textFiles: textFileSummary(readable) }),
       };
+    });
+    if (!('stopped' in read)) return read;
+
+    const { stopped, identity } = read;
+    const advanced = stopped.resumeOffset > charOffset;
+    /**
+     * The call the error names must read past where this one began, or it repeats this read. A
+     * cursor decodes from its byte checkpoint, which is past this read's first byte once the
+     * search advanced, or when this read decoded from byte 0 up to a later search start.
+     */
+    const token =
+      identity && stopped.resumeCheckpoint && (advanced || (!cursor && charOffset > 0))
+        ? await saveCursor(
+            ctx,
+            cursorFields(identity, stopped.resumeOffset, stopped.resumeCheckpoint),
+          )
+        : undefined;
+    if (token) throw findIncomplete(textFile.name, charOffset, stopped, { token });
+    // No cursor that skips ahead, and char_offset at the search start would read from byte 0 again.
+    if (!advanced) throw searchStalled(textFile.name, charOffset, ctx);
+    throw findIncomplete(textFile.name, charOffset, stopped, {
+      noCursor: identity ? 'storage' : 'identity',
     });
   }
 
@@ -577,6 +747,60 @@ function readItemBody(text: string, ctx: Context): Record<string, unknown> {
   }
   return parsed as Record<string, unknown>;
 }
+
+/** `{ [name]: value }` when `stringOrList` keeps the value, `{}` otherwise: one relayed field. */
+const relay = <K extends keyof ArchiveItemMetadata>(
+  name: K,
+  value: unknown,
+): Partial<Record<K, string | string[]>> => {
+  const kept = stringOrList(value);
+  // TypeScript types a generic computed key as a string index signature; the key is `name`.
+  return kept === undefined ? {} : ({ [name]: kept } as Record<K, string | string[]>);
+};
+
+/** A manifest file field as sent when it is a non-empty string; `undefined` for any other value. */
+const fileText = (value: unknown): string | undefined =>
+  typeof value === 'string' && value !== '' ? value : undefined;
+
+/** `{ [name]: value }` when `fileText` keeps the value, `{}` otherwise: one optional file field. */
+const fileField = <K extends 'format' | 'size' | 'md5' | 'title' | 'track' | 'length'>(
+  name: K,
+  value: unknown,
+): Partial<Record<K, string>> => {
+  const kept = fileText(value);
+  // As in `relay`: TypeScript types a generic computed key as a string index signature.
+  return kept === undefined ? {} : ({ [name]: kept } as Record<K, string>);
+};
+
+/**
+ * One manifest entry as an `ArchiveFile`, or `undefined` — the entry left out — when it is not an
+ * object or has no file name to build a download URL from. Every other field is read through
+ * `fileText`, so the `ia_get_item` format filter and the `ia_get_text` file pick, which read them
+ * as strings, never meet another shape.
+ */
+const manifestFile = (identifier: string, entry: unknown): ArchiveFile | undefined => {
+  if (typeof entry !== 'object' || entry === null) return undefined;
+  const file = entry as Record<string, unknown>;
+  const name = fileText(file.name);
+  if (name === undefined) return undefined;
+  return {
+    name,
+    downloadUrl: `${DOWNLOAD_BASE}/${encodeURIComponent(identifier)}/${encodeURIComponent(name)}`,
+    ...fileField('format', file.format),
+    ...fileField('size', file.size),
+    ...fileField('md5', file.md5),
+    ...fileField('title', file.title),
+    ...fileField('track', file.track),
+    ...fileField('length', file.length),
+    ...(file.private === 'true' ? { private: true as const } : {}),
+  };
+};
+
+/** True for a `texts` mediatype: the string, or a non-empty list whose every value is `texts`. */
+const isTexts = (mediatype: string | string[] | undefined): boolean => {
+  const values = [mediatype ?? []].flat();
+  return values.length > 0 && values.every((m) => m === 'texts');
+};
 
 /**
  * A count the Metadata API sends as a string of digits, as a number; `undefined` for

@@ -130,6 +130,78 @@ describe('iaItemResource', () => {
     expect(result).toEqual({ ...metadata, file_count: 1 });
   });
 
+  it('returns list-valued rights, licenseurl, volume, mediatype, and Open Library IDs unchanged', async () => {
+    const metadata = {
+      identifier: 'kinematographyea1931kine',
+      mediatype: ['texts', 'texts'],
+      licenseurl: [
+        'https://opensource.org/licenses/MIT',
+        'http://creativecommons.org/licenses/by-nc-sa/3.0',
+      ],
+      rights: ['Accessible without restriction.', 'Archived under fair use.'],
+      volume: ['1931', '18'],
+      openlibrary_edition: ['OL1M', 'OL2M'],
+      openlibrary_work: ['OL1W', 'OL2W'],
+    };
+    mockService.getItem.mockResolvedValue({ metadata, files: [] });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'kinematographyea1931kine' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({ ...metadata, file_count: 0 });
+  });
+
+  it('returns publicdate and addeddate as the service maps them, and lists them in its description', async () => {
+    const metadata = {
+      identifier: 'achristmascarol19505gut',
+      title: 'A Christmas Carol',
+      publicdate: '2014-10-24 16:15:43',
+      addeddate: '2006-12-06',
+    };
+    mockService.getItem.mockResolvedValue({ metadata, files: [] });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'achristmascarol19505gut' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({ ...metadata, file_count: 0 });
+    expect(iaItemResource.description).toContain(
+      ', date, publicdate and addeddate (when the item was made public and when it was added to the Archive), license,',
+    );
+  });
+
+  it('returns runtime as the service maps it, without the files’ track details, and lists it in its description', async () => {
+    const metadata = {
+      identifier: 'pride_and_prejudice_librivox',
+      title: 'Pride and Prejudice',
+      mediatype: 'audio',
+      runtime: '13:06:44',
+    };
+    mockService.getItem.mockResolvedValue({
+      metadata,
+      files: [
+        {
+          name: 'prideandprejudice_01-03_austen.mp3',
+          title: 'Chapters 1-3',
+          track: '1/37',
+          length: '1133.07',
+          downloadUrl:
+            'https://archive.org/download/pride_and_prejudice_librivox/prideandprejudice_01-03_austen.mp3',
+        },
+      ],
+    });
+
+    const ctx = createMockContext({ errors: iaItemResource.errors });
+    const params = iaItemResource.params.parse({ identifier: 'pride_and_prejudice_librivox' });
+    const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result).toEqual({ ...metadata, file_count: 1 });
+    expect(iaItemResource.description).toContain(
+      ', volume, the running time (runtime) of an audio or video item, the page-image count',
+    );
+  });
+
   it('returns only identifier and file_count=0 for sparse metadata ({})', async () => {
     mockService.getItem.mockResolvedValue({
       metadata: { identifier: 'sparse-item' },

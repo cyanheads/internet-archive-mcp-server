@@ -7,8 +7,13 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { startCallDeadline } from '@/services/call-deadline.js';
+import type { CdxHistoryResult } from '@/services/wayback/types.js';
 import { readCaptureTarget } from '@/services/wayback/wayback-capture-url.js';
-import { getWaybackService } from '@/services/wayback/wayback-service.js';
+import {
+  cdxMatchType,
+  type FetchHistoryParams,
+  getWaybackService,
+} from '@/services/wayback/wayback-service.js';
 import { TIMESTAMP_FORMS, waybackTimestamp } from '@/services/wayback/wayback-timestamp.js';
 
 const WAYBACK_WEB = 'https://web.archive.org/web';
@@ -19,10 +24,42 @@ const LIMIT_CAP = 10_000;
 /** The largest `limit` accepted: the CDX server's documented per-query maximum. */
 const LIMIT_CEILING = 150_000;
 
+/**
+ * The one notice for a history page CDX listed no rows for — why it holds no captures, then
+ * the continuation limitation the service reported, if any — since the framework keeps only
+ * the last notice set. It names fields and quotes only values as sent to CDX (digits and a
+ * status code), never the URL: a notice renders as live Markdown.
+ */
+function emptyPageNotice(query: FetchHistoryParams, page: CdxHistoryResult): string {
+  const matchType = cdxMatchType(query.url);
+  const under = matchType === 'exact' ? '' : matchType;
+  const bounds = Object.entries({ from: query.from, to: query.to }).filter(
+    (entry): entry is [string, string] => entry[1] !== undefined,
+  );
+  const sent = query.statusFilter ? [...bounds, ['status_filter', query.statusFilter]] : bounds;
+  let why: string;
+  if (page.resumeKey) {
+    why = `This page holds no captures; pass this response's resume_key as resume_key for the next page.`;
+  } else if (query.resumeKey) {
+    why = 'No captures remain past this resume_key.';
+  } else if (sent.length === 0) {
+    why = under
+      ? `No URL under this ${under} has captures.`
+      : 'The Wayback Machine lists no captures of this URL.';
+  } else {
+    const fixes = [
+      ...(bounds.length > 0 ? [`widen ${bounds.map(([field]) => field).join(' and ')}`] : []),
+      ...(query.statusFilter ? ['remove status_filter'] : []),
+    ];
+    why = `No captures ${under ? `under this ${under}` : 'of this URL'} match ${sent.map(([field, value]) => `${field} "${value}"`).join(', ')}; ${fixes.join(', or ')}.`;
+  }
+  return page.notice ? `${why} ${page.notice}` : why;
+}
+
 export const iaFindSnapshots = tool('ia_find_snapshots', {
   title: 'Find Wayback Machine Snapshots',
   description:
-    'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture to a given timestamp, or the latest capture when timestamp is omitted, via the Availability API, falling back to a CDX closest-capture query when the Availability API finds no capture or answers with a rate limit, a server error, an unreadable response, or an error in place of a capture (one result). Mode "history" returns the full capture list via the CDX API — filterable by date range and HTTP status code, collapsed by default to one capture per day (collapse "timestamp:8"); collapse "timestamp:14" lists one row per distinct capture second. Use history mode to survey how a page changed over time; use closest mode when you need the snapshot nearest a specific date. History mode returns up to limit records (at most 10,000 per call) and supports resume-key pagination for URLs with very large capture histories.',
+    'Find Wayback Machine snapshots of a URL. Mode "closest" returns the single nearest capture to a given timestamp, or the latest capture when timestamp is omitted, via the Availability API, falling back to a CDX closest-capture query when the Availability API finds no capture or answers with a rate limit, a server error, an unreadable response, or an error in place of a capture (one result). Mode "history" returns the full capture list via the CDX API — filterable by date range and HTTP status code, collapsed by default to one capture per day (collapse "timestamp:8"); collapse "timestamp:14" lists one row per distinct capture second, "digest" one row each time the content changed, and "urlkey" one row per URL, for a url ending in "*", which lists every URL under that prefix. Use history mode to survey how a page changed over time; use closest mode when you need the snapshot nearest a specific date. History mode returns up to limit records (at most 10,000 per call) and supports resume-key pagination for URLs with very large capture histories. A history query that no capture matches returns an empty snapshots list and a notice saying why.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -31,7 +68,7 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       .trim()
       .min(1, 'Must not be blank — provide the URL to look up.')
       .describe(
-        "The URL to look up in the Wayback Machine. A Wayback capture URL — web.archive.org/web/<timestamp>/<url>, such as a replay_url — reads as the URL it archives: history mode lists that URL's captures, and closest mode looks up its timestamp, where a timestamp naming a different one fails as ambiguous_timestamp.",
+        'The URL to look up in the Wayback Machine. A Wayback capture URL — web.archive.org/web/<timestamp>/<url>, such as a replay_url — reads as the URL it archives: history mode lists that URL\'s captures, and closest mode looks up its timestamp, where a timestamp naming a different one fails as ambiguous_timestamp. In history mode, a url ending in "*", such as "example.com/docs/*", lists the captures of every URL under that prefix, ordered by URL and then by time, and a url starting with "*.", such as "*.example.com", lists the captures of that domain and its subdomains; a "*" anywhere else is part of the URL. A wide prefix can run past the call deadline and fail as cdx_unavailable: narrow the prefix, or from and to.',
       ),
     mode: z
       .enum(['closest', 'history'])
@@ -82,18 +119,18 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
         z.literal(''),
         z
           .string()
-          .regex(/^timestamp:\d{1,2}$/)
-          .describe('Collapse precision string.'),
+          .regex(/^(?:timestamp:\d{1,2}|digest|urlkey)$/)
+          .describe('A collapse key: "timestamp:N", "digest", or "urlkey".'),
       ])
       .optional()
       .describe(
-        'CDX collapse parameter (history mode only). Format: "timestamp:N" where N is 1–14 (4=year, 6=month, 8=day, 10=hour, 14=second): consecutive captures sharing the first N timestamp digits are listed once. Omitted or blank, it is "timestamp:8", one capture per day. Pass "timestamp:14" for one row per distinct capture second.',
+        'CDX collapse (history mode only): consecutive captures that share a key are listed once, as the first of them. "timestamp:N" keys on the first N timestamp digits (4=year, 6=month, 8=day, 10=hour): "timestamp:14" lists one row per distinct capture second, an N above 14 reads as 14, and "timestamp:0" lists only the first capture in range. "digest" keys on content: it lists the first capture in range and each capture whose digest differs from the one before it, so a change back to earlier content is listed as a change. "urlkey" lists one row per URL, its first capture in range: one row for an exact url, one per URL under a url ending in "*". status_filter applies before the collapse, so with "digest", status_filter "200" leaves out redirect captures, whose own digests otherwise list the page again after each one. Omitted or blank, it is "timestamp:8", one capture per day.',
       ),
     resume_key: z
       .string()
       .optional()
       .describe(
-        'Opaque pagination key from a previous history mode response. Pass this to continue from where the last page left off. Server cursors expire after one hour and bind the URL and original filters; omit filters on continuation or repeat their original values. Page size may change. Wildcard and legacy raw continuations can omit collapsed captures.',
+        "Opaque pagination key from a previous history mode response. Pass this to continue from where the last page left off. Server cursors expire after one hour and bind the URL and original filters; omit filters on continuation or repeat their original values. Page size may change. A wildcard url, or a key this server did not issue, pages by CDX's own key, which can omit the row at a page boundary; a wildcard page can instead return that row as a later capture of the same URL.",
       ),
   }),
 
@@ -121,7 +158,9 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
           })
           .describe('A single Wayback Machine snapshot record.'),
       )
-      .describe('List of snapshots matching the query.'),
+      .describe(
+        'Snapshots matching the query: one in closest mode; in history mode, empty when CDX lists no capture that matches, with notice saying why.',
+      ),
     resume_key: z
       .string()
       .optional()
@@ -143,7 +182,9 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     notice: z
       .string()
       .optional()
-      .describe('Pagination guidance, cap disclosure, or limitations of legacy raw continuation.'),
+      .describe(
+        "Why a history page holds no snapshots (no captures of the URL or under its wildcard, none matching the from, to, or status_filter sent, or none left past resume_key), pagination guidance, cap disclosure, or what CDX's own continuation can omit for a wildcard url or a resume_key the server did not issue, joined into one notice when several apply.",
+      ),
   },
 
   errors: [
@@ -179,13 +220,6 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
       when: 'Closest mode: url is a Wayback capture URL and timestamp names a different timestamp than the one the URL carries.',
       recovery:
         'Pass the URL the capture archives as url with the timestamp meant, or omit timestamp to find the capture the URL names.',
-      severity: 'warning',
-    },
-    {
-      reason: 'no_snapshots',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'No snapshots found for the given URL with the current filters.',
-      recovery: 'Broaden the date range, remove status_filter, or verify the URL is correct.',
       severity: 'warning',
     },
     {
@@ -274,27 +308,16 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     const collapseParam = input.collapse || undefined;
     const limit = Math.min(input.limit, LIMIT_CAP);
 
-    const histResult = await svc.fetchHistory(
-      {
-        url,
-        from: timestampOf('from'),
-        to: timestampOf('to'),
-        statusFilter: input.status_filter?.trim() || undefined,
-        limit,
-        collapse: collapseParam,
-        resumeKey: input.resume_key?.trim() || undefined,
-      },
-      ctx,
-      deadline,
-    );
-
-    if (histResult.records.length === 0) {
-      throw ctx.fail(
-        'no_snapshots',
-        `No snapshots found for "${url}" with the specified filters.${histResult.notice ? ` ${histResult.notice}` : ''}`,
-        ctx.recoveryFor('no_snapshots'),
-      );
-    }
+    const query: FetchHistoryParams = {
+      url,
+      from: timestampOf('from'),
+      to: timestampOf('to'),
+      statusFilter: input.status_filter?.trim() || undefined,
+      limit,
+      collapse: collapseParam,
+      resumeKey: input.resume_key?.trim() || undefined,
+    };
+    const histResult = await svc.fetchHistory(query, ctx, deadline);
 
     ctx.log.info('CDX history fetched', {
       url,
@@ -303,7 +326,9 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
     });
 
     const shown = histResult.records.length;
-    if (shown >= limit && !histResult.complete) {
+    if (shown === 0) {
+      ctx.enrich.notice(emptyPageNotice(query, histResult));
+    } else if (shown >= limit && !histResult.complete) {
       const clamped =
         limit < input.limit
           ? `limit ${input.limit} is above the cap of ${LIMIT_CAP.toLocaleString('en-US')} per call, so this page holds ${shown.toLocaleString('en-US')} captures. `
@@ -338,7 +363,9 @@ export const iaFindSnapshots = tool('ia_find_snapshots', {
   },
 
   format: (result) => {
-    const lines: string[] = [];
+    // An empty history page opens with its count; the blank line under it keeps a following
+    // `---` a thematic break rather than a setext heading underline.
+    const lines: string[] = result.snapshots.length === 0 ? ['**0 snapshots**', ''] : [];
     for (const snap of result.snapshots) {
       lines.push(`## ${escapeMarkdownInline(snap.timestamp)}`);
       lines.push(`**Replay URL:** ${markdownLink(snap.replay_url, snap.replay_url)}`);

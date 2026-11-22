@@ -6,6 +6,7 @@
  * @module tests/integration/ia-search-items-contract.int.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -791,6 +792,320 @@ describe('ia_search_items list-valued title and date', () => {
   });
 });
 
+describe('ia_search_items publicdate', () => {
+  /** Advanced Search records as returned on 2026-11-22 for fl[] identifier, date, publicdate, addeddate. */
+  const DATED = [
+    {
+      addeddate: '2006-12-06T00:00:00Z',
+      identifier: 'achristmascarol19505gut',
+      publicdate: '2014-10-24T16:15:43Z',
+    },
+    {
+      addeddate: '2012-08-02T21:50:12Z',
+      identifier: 'HisNewJobCharlesChaplin-1915',
+      publicdate: '2012-08-02T23:04:20Z',
+    },
+    {
+      addeddate: '2011-06-09T13:41:52Z',
+      date: '1931-01-01T00:00:00Z',
+      identifier: 'kinematographyea1931kine',
+      publicdate: '2011-06-09T13:41:55Z',
+    },
+    {
+      addeddate: '2007-07-26T11:49:10Z',
+      date: '1894-01-01T00:00:00Z',
+      identifier: 'prideprejudice00aust',
+      publicdate: '2007-07-26T11:49:20Z',
+    },
+  ];
+
+  /** `openmind_ep431` as Advanced Search returned it on 2026-11-22: an item indexed without publicdate. */
+  const NO_PUBLICDATE = {
+    collection: ['open_mind', 'newsandpublicaffairs'],
+    creator: 'Open Mind',
+    date: '2007-09-27T00:00:00Z',
+    downloads: 259,
+    identifier: 'openmind_ep431',
+    mediatype: 'movies',
+    title: "Boosting America's Sagging Self Image",
+  };
+
+  it('relays publicdate as received after date on both surfaces, and no addeddate', async () => {
+    routeSearch(4, DATED);
+
+    const result = await runToolContract(iaSearchItems, {
+      query:
+        'identifier:(achristmascarol19505gut OR prideprejudice00aust OR HisNewJobCharlesChaplin-1915 OR kinematographyea1931kine)',
+      sort: 'identifier asc',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { items: unknown[] }).items).toEqual([
+      { identifier: 'achristmascarol19505gut', publicdate: '2014-10-24T16:15:43Z' },
+      { identifier: 'HisNewJobCharlesChaplin-1915', publicdate: '2012-08-02T23:04:20Z' },
+      {
+        identifier: 'kinematographyea1931kine',
+        date: '1931-01-01T00:00:00Z',
+        publicdate: '2011-06-09T13:41:55Z',
+      },
+      {
+        identifier: 'prideprejudice00aust',
+        date: '1894-01-01T00:00:00Z',
+        publicdate: '2007-07-26T11:49:20Z',
+      },
+    ]);
+    expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
+    expect(contentText(result)).toBe(
+      '**4 total results** — Page 1 (4 shown, 50 per page)\n\n## achristmascarol19505gut\n**Identifier:** achristmascarol19505gut\n**Public Date:** 2014-10-24T16:15:43Z\n\n## HisNewJobCharlesChaplin-1915\n**Identifier:** HisNewJobCharlesChaplin-1915\n**Public Date:** 2012-08-02T23:04:20Z\n\n## kinematographyea1931kine\n**Identifier:** kinematographyea1931kine\n**Date:** 1931-01-01T00:00:00Z\n**Public Date:** 2011-06-09T13:41:55Z\n\n## prideprejudice00aust\n**Identifier:** prideprejudice00aust\n**Date:** 1894-01-01T00:00:00Z\n**Public Date:** 2007-07-26T11:49:20Z\n',
+    );
+  });
+
+  it('omits publicdate from a record that has none, and the page succeeds', async () => {
+    routeSearch(1, [NO_PUBLICDATE]);
+
+    const result = await runToolContract(iaSearchItems, { query: 'identifier:openmind_ep431' });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { items: unknown[] }).items).toEqual([NO_PUBLICDATE]);
+    expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
+    expect(contentText(result)).toBe(
+      "**1 total results** — Page 1 (1 shown, 50 per page)\n\n## Boosting America's Sagging Self Image\n**Identifier:** openmind_ep431\n**Media Type:** movies\n**Creator:** Open Mind\n**Date:** 2007-09-27T00:00:00Z\n**Downloads:** 259\n**Collection:**\n\n- open_mind\n- newsandpublicaffairs\n",
+    );
+  });
+
+  it('requests publicdate and sends the date_from / date_to clause unchanged', async () => {
+    routeSearch(1, [{ identifier: 'a' }]);
+
+    await runToolContract(iaSearchItems, { query: 'tesla', date_from: '1950', date_to: '1959' });
+
+    expect(solrQueries()).toEqual(['(tesla) AND date:[1950-01-01 TO 1959-12-31]']);
+    expect(http.calls.map((c) => c.request.url)).toEqual([
+      'https://archive.org/advancedsearch.php?q=%28tesla%29+AND+date%3A%5B1950-01-01+TO+1959-12-31%5D&output=json&rows=50&page=1&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&fl%5B%5D=mediatype&fl%5B%5D=date&fl%5B%5D=publicdate&fl%5B%5D=downloads&fl%5B%5D=collection&sort%5B%5D=downloads+desc&sort%5B%5D=identifier+asc',
+    ]);
+  });
+
+  it('says date_from and date_to match the publication date and points upload-time ranges at publicdate', () => {
+    for (const field of ['date_from', 'date_to'] as const) {
+      const description = iaSearchItems.input.shape[field].description ?? '';
+      expect(description).toContain('publication date');
+      expect(description).toContain('An item with no date never matches.');
+      expect(description).toContain(
+        'For an upload-time range, put publicdate in query instead, e.g. publicdate:[2026-11-01 TO 2026-11-21]; a bare upper date covers its whole day.',
+      );
+    }
+  });
+
+  it('describes publicdate on the row, and no description calls date an upload date', () => {
+    const row = iaSearchItems.output.shape.items.element.shape;
+    expect(row.publicdate.description).toContain('ISO 8601 in UTC');
+    expect(iaSearchItems.description).toContain('upload dates (publicdate)');
+    const advertised = JSON.stringify([
+      iaSearchItems.description,
+      z.toJSONSchema(iaSearchItems.input, { io: 'input' }),
+      z.toJSONSchema(iaSearchItems.output, { io: 'output' }),
+    ]);
+    expect(advertised).not.toMatch(/\bor\s+upload\b/);
+  });
+});
+
+describe('ia_search_items row fields of another shape', () => {
+  /** A constructed row with every string-or-list field well formed; each case replaces one. */
+  const carol = (): Record<string, unknown> => ({
+    identifier: 'achristmascarol19505gut',
+    title: 'A Christmas Carol',
+    creator: 'Dickens, Charles, 1812-1870',
+    mediatype: 'texts',
+    date: '1843-01-01T00:00:00Z',
+    publicdate: '2014-10-24T16:15:43Z',
+    downloads: 812,
+    collection: ['gutenberg', 'americana'],
+  });
+
+  /** A second constructed row, well formed, that every case returns unchanged. */
+  const pride = (): Record<string, unknown> => ({
+    identifier: 'prideprejudice00aust',
+    title: 'Pride and prejudice',
+    creator: ['Austen, Jane, 1775-1817', 'Thomson, Hugh, 1860-1920, ill'],
+    mediatype: 'texts',
+    date: '1894-01-01T00:00:00Z',
+    publicdate: '2007-07-26T11:49:20Z',
+    collection: ['newyorkpubliclibrary', 'americana'],
+  });
+
+  const HEADER = '**2 total results** — Page 1 (2 shown, 50 per page)\n\n';
+  const PRIDE_ITEM = {
+    identifier: 'prideprejudice00aust',
+    title: 'Pride and prejudice',
+    creator: ['Austen, Jane, 1775-1817', 'Thomson, Hugh, 1860-1920, ill'],
+    mediatype: 'texts',
+    date: '1894-01-01T00:00:00Z',
+    publicdate: '2007-07-26T11:49:20Z',
+    collection: ['newyorkpubliclibrary', 'americana'],
+  };
+  const PRIDE_TEXT =
+    '## Pride and prejudice\n**Identifier:** prideprejudice00aust\n**Media Type:** texts\n**Creator:**\n\n- Austen, Jane, 1775-1817\n- Thomson, Hugh, 1860-1920, ill\n\n**Date:** 1894-01-01T00:00:00Z\n**Public Date:** 2007-07-26T11:49:20Z\n**Collection:**\n\n- newyorkpubliclibrary\n- americana\n';
+
+  it.each([
+    {
+      field: 'title',
+      shape: 'an object',
+      value: { '#text': 'A Christmas Carol' },
+      item: {
+        identifier: 'achristmascarol19505gut',
+        creator: 'Dickens, Charles, 1812-1870',
+        mediatype: 'texts',
+        date: '1843-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 812,
+        collection: ['gutenberg', 'americana'],
+      },
+      text: '## achristmascarol19505gut\n**Identifier:** achristmascarol19505gut\n**Media Type:** texts\n**Creator:** Dickens, Charles, 1812-1870\n**Date:** 1843-01-01T00:00:00Z\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 812\n**Collection:**\n\n- gutenberg\n- americana\n\n',
+    },
+    {
+      field: 'creator',
+      shape: 'a list holding a number',
+      value: ['Dickens, Charles, 1812-1870', 1812],
+      item: {
+        identifier: 'achristmascarol19505gut',
+        title: 'A Christmas Carol',
+        mediatype: 'texts',
+        date: '1843-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 812,
+        collection: ['gutenberg', 'americana'],
+      },
+      text: '## A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Media Type:** texts\n**Date:** 1843-01-01T00:00:00Z\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 812\n**Collection:**\n\n- gutenberg\n- americana\n\n',
+    },
+    {
+      field: 'mediatype',
+      shape: 'a list, where the row takes a single string',
+      value: ['texts'],
+      item: {
+        identifier: 'achristmascarol19505gut',
+        title: 'A Christmas Carol',
+        creator: 'Dickens, Charles, 1812-1870',
+        date: '1843-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 812,
+        collection: ['gutenberg', 'americana'],
+      },
+      text: '## A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Creator:** Dickens, Charles, 1812-1870\n**Date:** 1843-01-01T00:00:00Z\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 812\n**Collection:**\n\n- gutenberg\n- americana\n\n',
+    },
+    {
+      field: 'date',
+      shape: 'a number',
+      value: 1843,
+      item: {
+        identifier: 'achristmascarol19505gut',
+        title: 'A Christmas Carol',
+        creator: 'Dickens, Charles, 1812-1870',
+        mediatype: 'texts',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 812,
+        collection: ['gutenberg', 'americana'],
+      },
+      text: '## A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Media Type:** texts\n**Creator:** Dickens, Charles, 1812-1870\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 812\n**Collection:**\n\n- gutenberg\n- americana\n\n',
+    },
+    {
+      field: 'publicdate',
+      shape: 'a number',
+      value: 1414167343,
+      item: {
+        identifier: 'achristmascarol19505gut',
+        title: 'A Christmas Carol',
+        creator: 'Dickens, Charles, 1812-1870',
+        mediatype: 'texts',
+        date: '1843-01-01T00:00:00Z',
+        downloads: 812,
+        collection: ['gutenberg', 'americana'],
+      },
+      text: '## A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Media Type:** texts\n**Creator:** Dickens, Charles, 1812-1870\n**Date:** 1843-01-01T00:00:00Z\n**Downloads:** 812\n**Collection:**\n\n- gutenberg\n- americana\n\n',
+    },
+    {
+      field: 'collection',
+      shape: 'a list holding an object',
+      value: ['gutenberg', { identifier: 'americana' }],
+      item: {
+        identifier: 'achristmascarol19505gut',
+        title: 'A Christmas Carol',
+        creator: 'Dickens, Charles, 1812-1870',
+        mediatype: 'texts',
+        date: '1843-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 812,
+      },
+      text: '## A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Media Type:** texts\n**Creator:** Dickens, Charles, 1812-1870\n**Date:** 1843-01-01T00:00:00Z\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 812\n\n',
+    },
+  ])(
+    'leaves out a $field that is $shape, keeping its row and the next on both surfaces',
+    async ({ field, value, item, text }) => {
+      routeSearch(2, [{ ...carol(), [field]: value }, pride()]);
+
+      const result = await runToolContract(iaSearchItems, { query: 'christmas carol' });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { items: unknown[] }).items).toEqual([item, PRIDE_ITEM]);
+      expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
+      expect(contentText(result)).toBe(`${HEADER}${text}${PRIDE_TEXT}`);
+    },
+  );
+
+  it('relays a row of strings and a row of lists in every string-or-list field as received on both surfaces', async () => {
+    routeSearch(2, [
+      {
+        identifier: 'every-field-a-string',
+        title: 'A title',
+        creator: 'An author',
+        mediatype: 'audio',
+        date: '1950-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 5,
+        collection: 'opensource_audio',
+      },
+      {
+        identifier: 'every-field-a-list',
+        title: ['First title', 'Second title'],
+        creator: ['Author One', 'Author Two'],
+        mediatype: 'texts',
+        date: ['1908-01-01T00:00:00Z', '1909-01-01T00:00:00Z'],
+        publicdate: ['2012-08-02T21:50:12Z', '2012-08-02T23:04:20Z'],
+        downloads: 37,
+        collection: ['americana', 'fav-reader', 'europeanlibraries'],
+      },
+    ]);
+
+    const result = await runToolContract(iaSearchItems, { query: 'tesla' });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { items: unknown[] }).items).toEqual([
+      {
+        identifier: 'every-field-a-string',
+        title: 'A title',
+        creator: 'An author',
+        mediatype: 'audio',
+        date: '1950-01-01T00:00:00Z',
+        publicdate: '2014-10-24T16:15:43Z',
+        downloads: 5,
+        collection: 'opensource_audio',
+      },
+      {
+        identifier: 'every-field-a-list',
+        title: ['First title', 'Second title'],
+        creator: ['Author One', 'Author Two'],
+        mediatype: 'texts',
+        date: ['1908-01-01T00:00:00Z', '1909-01-01T00:00:00Z'],
+        publicdate: ['2012-08-02T21:50:12Z', '2012-08-02T23:04:20Z'],
+        downloads: 37,
+        collection: ['americana', 'europeanlibraries'],
+      },
+    ]);
+    expect(() => iaSearchItems.output.parse(result.structuredContent)).not.toThrow();
+    expect(contentText(result)).toBe(
+      '**2 total results** — Page 1 (2 shown, 50 per page)\n\n## A title\n**Identifier:** every-field-a-string\n**Media Type:** audio\n**Creator:** An author\n**Date:** 1950-01-01T00:00:00Z\n**Public Date:** 2014-10-24T16:15:43Z\n**Downloads:** 5\n**Collection:** opensource_audio\n\n## every-field-a-list\n**Title:**\n\n- First title\n- Second title\n\n**Identifier:** every-field-a-list\n**Media Type:** texts\n**Creator:**\n\n- Author One\n- Author Two\n\n**Date:**\n\n- 1908-01-01T00:00:00Z\n- 1909-01-01T00:00:00Z\n\n**Public Date:**\n\n- 2012-08-02T21:50:12Z\n- 2012-08-02T23:04:20Z\n\n**Downloads:** 37\n**Collection:**\n\n- americana\n- europeanlibraries\n',
+    );
+  });
+});
+
 describe('ia_search_items collection and creator lists', () => {
   type Item = {
     identifier: string;
@@ -1227,6 +1542,53 @@ describe('ia_search_items Advanced Search error bodies', () => {
       expect(http.calls).toHaveLength(4);
     },
   );
+
+  it.each([
+    ['a docs list holding null', () => ({ numFound: 1, start: 0, docs: [null] })],
+    ['a docs object', () => ({ numFound: 1, start: 0, docs: { a: 1 } })],
+  ])(
+    'surfaces %s as search_unavailable, retried as an unparseable body is, with no engine text',
+    async (_label, response) => {
+      routeSearchWith(() => Response.json({ response: response() }));
+
+      const result = await runWithRetries({ query: 'tesla' });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message:
+            'Advanced Search returned results whose docs are not a list of records. (failed after 4 attempts)',
+          data: {
+            reason: 'search_unavailable',
+            retryAttempts: 4,
+            recovery: { hint: OUTAGE_HINT },
+          },
+        },
+      });
+      expect(contentText(result)).toContain(
+        'Advanced Search returned results whose docs are not a list of records. (failed after 4 attempts)',
+      );
+      expect(contentText(result)).toContain(`Recovery: ${OUTAGE_HINT}`);
+      for (const surface of [JSON.stringify(result.structuredContent), contentText(result)]) {
+        expect(surface).not.toMatch(/is not an object|\.map\b|TypeError|evaluating/);
+      }
+      expect(http.calls).toHaveLength(4);
+    },
+  );
+
+  it.each([
+    ['absent', () => ({ numFound: 0, start: 0 })],
+    ['null', () => ({ numFound: 0, start: 0, docs: null })],
+  ])('reads %s docs as an empty page after one request', async (_label, response) => {
+    routeSearchWith(() => Response.json({ response: response() }));
+
+    const result = await runToolContract(iaSearchItems, { query: 'tesla' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ items: [], total_found: 0 });
+    expect(contentText(result)).toContain('No items matched "tesla"');
+    expect(http.calls).toHaveLength(1);
+  });
 
   it('answers an HTTP 429 as search_unavailable after one request with a wait hint', async () => {
     routeSearchWith(

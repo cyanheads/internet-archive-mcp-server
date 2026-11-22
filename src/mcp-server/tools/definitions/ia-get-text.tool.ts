@@ -12,6 +12,7 @@ import {
   type TextFileSummary,
 } from '@/services/archive-metadata/archive-metadata-service.js';
 import { requireItemReference } from '@/services/archive-metadata/item-reference.js';
+import { compilePhrase } from '@/services/archive-metadata/phrase-matcher.js';
 import { startCallDeadline } from '@/services/call-deadline.js';
 
 /** Quoted values as an "or" list: `"a"`, `"a" or "b"`, `"a", "b", or "c"`. */
@@ -34,7 +35,7 @@ const textFilesNotice = ({ count, formats, unformatted }: TextFileSummary): stri
 export const iaGetText = tool('ia_get_text', {
   title: 'Get Internet Archive Item Text',
   description:
-    'Retrieve readable OCR DjVuTXT or plain text from an Internet Archive item, including public-domain books, documents, scanned periodicals, and transcripts. Each call reads one text file: the one file names, or by default the first DjVuTXT file (else Text, Plain Text, or another .txt file). An item can hold several, such as one per volume; a notice then gives the count. Set max_chars for page size, then pass next_continuation as continuation with the same identifier and omit char_offset. Direct char_offset access remains available. To list the DjVuTXT files of an item, call ia_get_item with format "DjVuTXT".',
+    "Retrieve readable OCR DjVuTXT or plain text from an Internet Archive item, including public-domain books, documents, scanned periodicals, and transcripts. Each call reads one text file: the one file names, or by default the first DjVuTXT file (else Text, Plain Text, or another .txt file). An item can hold several, such as one per volume; a notice then gives the count. Set max_chars for page size, then pass next_continuation as continuation with the same identifier and omit char_offset. Direct char_offset access remains available. To jump to a passage, pass find with a phrase: the page starts at its first match at or after char_offset or the continuation's position, and match_offset reports where; that page's next_continuation, passed back with the same find, searches on from the page's end. To list the DjVuTXT files of an item, call ia_get_item with format \"DjVuTXT\".",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -59,7 +60,7 @@ export const iaGetText = tool('ia_get_text', {
       .min(0)
       .optional()
       .describe(
-        'Character offset to start reading from (default 0). For sequential pages use next_continuation as continuation instead. Omit char_offset when using continuation.',
+        'Character offset to start reading from (default 0); with find, where the search starts. For sequential pages use next_continuation as continuation instead. Omit char_offset when using continuation.',
       ),
     continuation: z
       .string()
@@ -74,6 +75,14 @@ export const iaGetText = tool('ia_get_text', {
       .describe(
         'The text file to read, named exactly as ia_get_item lists it, e.g. "Strabo 02 Geography 3-5_djvu.txt". It must be readable text: format DjVuTXT, Text, or Plain Text, or a .txt name whose format is not Metadata. Omit to read the default: the first DjVuTXT file, else Text, else Plain Text, else another .txt file. With continuation, omit it or name the file the continuation reads; blank is omitted.',
       ),
+    find: z
+      .string()
+      .max(500)
+      .trim()
+      .optional()
+      .describe(
+        "A literal phrase of at most 500 characters to find in the file read; the page then starts at its first match at or after char_offset or the continuation's position. Letters match regardless of case, one character to one (ß never matches ss); a whitespace run in the phrase matches any whitespace run in the text, line breaks included; every other character matches itself. OCR misreads and words hyphenated across line ends break a phrase, so prefer a short, distinctive one. Blank is omitted.",
+      ),
   }),
 
   output: z.object({
@@ -84,7 +93,17 @@ export const iaGetText = tool('ia_get_text', {
         'Opaque next-page token; use as continuation with the same identifier and omit char_offset. Expires after one hour.',
       ),
     text: z.string().describe('The text slice starting at char_offset up to max_chars characters.'),
-    char_offset: z.number().describe('Character offset used for this response.'),
+    char_offset: z
+      .number()
+      .describe(
+        'Character offset used for this response: with find, where its first match begins (equal to match_offset), or where the search started when nothing matched.',
+      ),
+    match_offset: z
+      .number()
+      .optional()
+      .describe(
+        'With find, the character offset where its first match begins, equal to char_offset. Omitted when find matched nothing or was not given.',
+      ),
     max_chars: z
       .number()
       .describe(
@@ -109,7 +128,7 @@ export const iaGetText = tool('ia_get_text', {
       .string()
       .optional()
       .describe(
-        'Explains a max_chars clamp or why efficient continuation is unavailable, with the next char_offset or end-of-document status, or — when file was omitted — how many readable text files the item holds and how to list them.',
+        'Explains a max_chars clamp or why efficient continuation is unavailable, with the next char_offset or end-of-document status; that find matched nothing from char_offset to the end of source_file; or — when file was omitted — how many readable text files the item holds and how to list them.',
       ),
   },
 
@@ -138,6 +157,14 @@ export const iaGetText = tool('ia_get_text', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Both a nonblank continuation and char_offset were supplied.',
       recovery: 'Supply continuation alone, or omit continuation and provide char_offset.',
+    },
+    {
+      reason: 'find_incomplete',
+      code: JsonRpcErrorCode.Timeout,
+      when: "With find, the search stopped before the download's request timeout or the call deadline would have cut it off, once past its start, or at a later char_offset it reached with a continuation stored there; or the first match was found past a whitespace run longer than the text one call holds, so the call names the match's char_offset instead of returning its page.",
+      recovery:
+        'Call again with the same find and the continuation the error names. With no continuation, pass the char_offset it names: that call reads the file from its first byte, so after a stop it searches further only if the download runs faster.',
+      thrownBy: 'service',
     },
     {
       reason: 'item_not_found',
@@ -187,7 +214,7 @@ export const iaGetText = tool('ia_get_text', {
     {
       reason: 'archive_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The Internet Archive Metadata API or the text file download did not answer within the request timeout or the call's 55 s deadline (the request timeout when that is longer), could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or the metadata response was unreadable.",
+      when: "The Internet Archive Metadata API or the text file download did not answer within the request timeout or the call's 55 s deadline (the request timeout when that is longer), could not be reached, answered HTTP 5xx after retries, 429, or another 4xx, or the metadata response was unreadable; or, with find, the download was too slow for the search to get past its start before then.",
       recovery:
         'The Internet Archive is temporarily unavailable or overloaded; retry in a few minutes. When the message names the download as timed out or cut off by the call deadline, a retry can stall the same way; the download_url ia_get_item lists for the file serves it whole.',
       thrownBy: 'service',
@@ -206,10 +233,13 @@ export const iaGetText = tool('ia_get_text', {
     if (continuation && input.char_offset !== undefined) throw ctx.fail('ambiguous_pagination');
     const charOffset = input.char_offset ?? 0;
     const file = input.file?.trim() ? input.file : item.file;
+    // The service's own test, not the schema's String#trim (which keeps U+0085): only White_Space is blank.
+    const find = input.find !== undefined && compilePhrase(input.find) ? input.find : undefined;
 
     const result = await svc.getTextContent(item.identifier, maxChars, charOffset, ctx, deadline, {
       continuation,
       file,
+      find,
     });
 
     ctx.log.info('Text content retrieved', {
@@ -220,7 +250,13 @@ export const iaGetText = tool('ia_get_text', {
       hasMore: result.hasMore,
     });
 
+    // One string: a later ctx.enrich.notice() call replaces an earlier one.
     const notices: string[] = [];
+    if (find !== undefined && result.matchOffset === undefined) {
+      notices.push(
+        `No match for find in "${result.sourceFile}" from char_offset ${result.charOffset.toLocaleString('en-US')} to its end. OCR misreads and words hyphenated across line ends break a phrase; a shorter or different phrase may still match.`,
+      );
+    }
     if (result.continuationNotice) notices.push(result.continuationNotice);
     if (input.max_chars !== undefined && input.max_chars > ceiling) {
       const next = result.hasMore
@@ -236,6 +272,7 @@ export const iaGetText = tool('ia_get_text', {
     return {
       text: result.text,
       char_offset: result.charOffset,
+      ...(result.matchOffset !== undefined && { match_offset: result.matchOffset }),
       max_chars: maxChars,
       has_more: result.hasMore,
       source_file: result.sourceFile,
@@ -250,10 +287,14 @@ export const iaGetText = tool('ia_get_text', {
       result.source_file_bytes === undefined
         ? ''
         : ` | **File Size:** ${result.source_file_bytes.toLocaleString()} bytes`;
+    const matchOffset =
+      result.match_offset === undefined
+        ? ''
+        : ` | **Match Offset:** ${result.match_offset.toLocaleString()}`;
     const lines: string[] = [
       ...(result.next_continuation ? [`**Next continuation:** ${result.next_continuation}`] : []),
       `**Source:** ${escapeMarkdownInline(result.source_file)}${fileSize}`,
-      `**Max Chars:** ${result.max_chars.toLocaleString()} | **Offset:** ${result.char_offset.toLocaleString()}${result.has_more ? ` — more follows (next offset: ${nextOffset.toLocaleString()})` : ' — end of document'}`,
+      `**Max Chars:** ${result.max_chars.toLocaleString()} | **Offset:** ${result.char_offset.toLocaleString()}${result.has_more ? ` — more follows (next offset: ${nextOffset.toLocaleString()})` : ' — end of document'}${matchOffset}`,
       '',
       '---',
       '',

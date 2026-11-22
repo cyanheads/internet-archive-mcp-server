@@ -87,6 +87,23 @@ describe('pushLabelledField', () => {
     ]);
   });
 
+  it('renders each value through render when one is given, inline and as list items', () => {
+    const link = (v: string) => `[${v}](<${v}>)`;
+    const lines: string[] = [];
+    pushLabelledField(lines, 'License', 'https://a', '', link);
+    pushLabelledField(lines, 'License', ['https://a'], '', link);
+    pushLabelledField(lines, 'License', ['https://a', 'https://b'], ' (2)', link);
+    expect(lines).toEqual([
+      '**License:** [https://a](<https://a>)',
+      '**License:** [https://a](<https://a>)',
+      '**License:** (2)',
+      '',
+      '- [https://a](<https://a>)',
+      '- [https://b](<https://b>)',
+      '',
+    ]);
+  });
+
   it('keeps a note on the label line: after the value inline, after the label for a list', () => {
     const note = ' (2 of 409; ia_get_item lists all)';
     expect(labelledField('Creator', 'A', note)).toEqual([

@@ -13,7 +13,7 @@ import {
   parseItemReference,
   requireItemReference,
 } from '@/services/archive-metadata/item-reference.js';
-import { cpuMsPerCall } from '../helpers/cpu-time.js';
+import { expectLinearDoubling } from '../helpers/cpu-time.js';
 
 const STRABO = 'Strabo08Geography17AndIndex';
 const VOLUME_2 = 'Strabo 02 Geography 3-5_djvu.txt';
@@ -281,33 +281,16 @@ describe('parseItemReference in linear time', () => {
     ['a long digit run', (n) => fill('1', n)],
   ];
 
-  /** Smallest input; each larger size doubles it, up to 64× at 320k. */
-  const BASE = 5_000;
-  const LARGEST = 320_000;
-
   /** CPU ceiling per call: 1 µs per character, about 25× the slowest shape measured (13 ms at 320k). */
   const MAX_CPU_MS_PER_CHAR = 0.001;
 
   it.each(WORST_CASES)(
     'reads %s in linear time',
     async (_name, build) => {
-      const base = build(BASE);
-      for (let n = BASE * 2; n <= LARGEST; n *= 2) {
-        const large = build(n);
-        let growth = Number.POSITIVE_INFINITY;
-        for (let round = 0; round < 3; round++) {
-          const tBase = await cpuMsPerCall(() => parseItemReference(base));
-          const tLarge = await cpuMsPerCall(() => parseItemReference(large));
-          expect(tLarge, `${tLarge.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(
-            n * MAX_CPU_MS_PER_CHAR,
-          );
-          growth = Math.min(growth, tLarge / tBase);
-        }
-        // Linear work grows ×(n / BASE); the bound leaves it 4× headroom, 256 at the full span.
-        expect(growth, `×${growth.toFixed(1)} from ${BASE} to ${n} characters`).toBeLessThan(
-          4 * (n / BASE),
-        );
-      }
+      await expectLinearDoubling((n) => {
+        const reference = build(n);
+        return () => parseItemReference(reference);
+      }, MAX_CPU_MS_PER_CHAR);
     },
     0,
   );

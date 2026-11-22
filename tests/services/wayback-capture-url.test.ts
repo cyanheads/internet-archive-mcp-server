@@ -2,13 +2,18 @@
  * @fileoverview Unit tests for the Wayback capture-URL reader: which `url` values read as a
  * capture (its original URL and timestamp) and which pass through unchanged, how the original
  * is taken from the raw string, the explicit `timestamp` beside it (filled, accepted, invalid,
- * or ambiguous), the shared host set, and linear time.
+ * or ambiguous), the shared host set, and linear time; and the URL each form of `href` Wayback
+ * writes on a replayed page names (`hrefTarget`), in linear time.
  * @module tests/services/wayback-capture-url.test
  */
 
 import { describe, expect, it } from 'vitest';
-import { readCaptureTarget, WAYBACK_HOSTS } from '@/services/wayback/wayback-capture-url.js';
-import { cpuMsPerCall } from '../helpers/cpu-time.js';
+import {
+  hrefTarget,
+  readCaptureTarget,
+  WAYBACK_HOSTS,
+} from '@/services/wayback/wayback-capture-url.js';
+import { expectLinearDoubling } from '../helpers/cpu-time.js';
 
 const UCD = 'https://digital.ucd.ie/';
 const CAPTURE = `https://web.archive.org/web/20241231012939/${UCD}`;
@@ -259,6 +264,137 @@ describe('readCaptureTarget: the timestamp beside url', () => {
   });
 });
 
+describe('hrefTarget (#67)', () => {
+  const PAGE = new URL('http://info.cern.ch/hypertext/WWW/TheProject.html');
+
+  it.each([
+    [
+      'a root-relative capture URL',
+      '/web/20151231164925/http://info.cern.ch/hypertext/DataSources/Top.html',
+      'http://info.cern.ch/hypertext/DataSources/Top.html',
+    ],
+    [
+      'an absolute capture URL',
+      'https://web.archive.org/web/20221231052306/https://www.rfc-editor.org/info/rfc2606',
+      'https://www.rfc-editor.org/info/rfc2606',
+    ],
+    [
+      'a protocol-relative capture URL',
+      '//web.archive.org/web/20200101030920/https://en.wikipedia.org/wiki/Axis_powers',
+      'https://en.wikipedia.org/wiki/Axis_powers',
+    ],
+    [
+      'a capture URL on the alias host, in upper case',
+      'HTTP://WAYBACK.ARCHIVE.ORG/web/2015/http://a.example/x',
+      'http://a.example/x',
+    ],
+    [
+      'a link to an archived copy, read once to its capture URL',
+      '/web/20200101030920/https://web.archive.org/web/20180325210216/http://ibiblio.org/pha/policy/1941/411209b.html',
+      'https://web.archive.org/web/20180325210216/http://ibiblio.org/pha/policy/1941/411209b.html',
+    ],
+    [
+      'a rewritten mailto:',
+      'https://web.archive.org/web/20221231052306/mailto:d3e3e3%40gmail.com',
+      'mailto:d3e3e3%40gmail.com',
+    ],
+    [
+      'a rewritten ftp:',
+      'https://web.archive.org/web/20221231052306/ftp://rs.internic.net/archives/namedroppers',
+      'ftp://rs.internic.net/archives/namedroppers',
+    ],
+    [
+      'a capture whose original’s scheme is percent-encoded',
+      '/web/2015/https%3A%2F%2Fa.example%2Fb',
+      'https://a.example/b',
+    ],
+    [
+      'a capture of a bare host',
+      '/web/20070101025432/http://typo3.sunsite.dk',
+      'http://typo3.sunsite.dk/',
+    ],
+    ['a plain relative path', 'Summary.html', 'http://info.cern.ch/hypertext/WWW/Summary.html'],
+    [
+      'a relative path with a fragment, kept',
+      'Status.html#35',
+      'http://info.cern.ch/hypertext/WWW/Status.html#35',
+    ],
+    ['a ../ path', '../DataSources/Top.html', 'http://info.cern.ch/hypertext/DataSources/Top.html'],
+    ['a fragment', '#section-1', `${PAGE.href}#section-1`],
+    ['an empty href, as the base', '', PAGE.href],
+    ['a javascript: href, scheme kept', 'javascript:void(0)', 'javascript:void(0)'],
+    [
+      'tabs, line breaks, and edge spaces',
+      ' \tSum\nmary.html \r\n',
+      'http://info.cern.ch/hypertext/WWW/Summary.html',
+    ],
+    [
+      'a /web/ path naming no capture, against the base',
+      '/web/*/http://a.example/',
+      'http://info.cern.ch/web/*/http://a.example/',
+    ],
+    [
+      'a relative path that starts like a scheme-less capture URL',
+      'web.archive.org/web/2015/http://a.example/',
+      'http://info.cern.ch/hypertext/WWW/web.archive.org/web/2015/http://a.example/',
+    ],
+    ['a Wayback URL naming no capture', 'https://web.archive.org/', 'https://web.archive.org/'],
+    [
+      'a protocol-relative URL off Wayback, in the base’s scheme',
+      '//cdn.example/x.js',
+      'http://cdn.example/x.js',
+    ],
+    ['an href that does not parse', 'http://[', undefined],
+    ['a capture whose original does not parse', '/web/2015/not a url', undefined],
+  ])('reads %s', (_label, href, want) => {
+    expect(hrefTarget(href, PAGE)?.href).toBe(want);
+  });
+
+  it('resolves a relative href against the base it is given, not the page', () => {
+    expect(hrefTarget('about/', new URL('http://typo3.org/'))?.href).toBe(
+      'http://typo3.org/about/',
+    );
+  });
+
+  it('reads an absolute href with no base, and no relative one', () => {
+    expect(hrefTarget('https://a.example/x#y', undefined)?.href).toBe('https://a.example/x#y');
+    expect(hrefTarget('/web/2015/http://a.example/', undefined)?.href).toBe('http://a.example/');
+    expect(hrefTarget('Summary.html', undefined)).toBeUndefined();
+  });
+});
+
+describe('hrefTarget in linear time (#67)', () => {
+  const fill = (unit: string, n: number): string =>
+    unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+  const PAGE = new URL('http://info.cern.ch/hypertext/WWW/TheProject.html');
+
+  /** Long hrefs of each form, padding the trim and the tab and line-break removal works through, and the two line-break shapes. */
+  const WORST_CASES: [name: string, build: (n: number) => string][] = [
+    ['a long relative path', (n) => fill('a/', n)],
+    ['a long capture original', (n) => `/web/2015/http://a.example/${fill('b/', n - 27)}`],
+    ['a long protocol-relative host', (n) => `//${fill('a', n - 2)}`],
+    ['a long capture digit run', (n) => `/web/${fill('1', n - 5)}`],
+    ['tabs and line breaks throughout', (n) => fill('a\t\n\r', n)],
+    ['spaces at both ends', (n) => `${fill(' ', n / 2)}x${fill(' ', n / 2 - 1)}`],
+    ['one long line ending in a break', (n) => `${fill('§1 x', n - 2)}\ny`],
+    ['breaks throughout', (n) => fill('  \r\n', n)],
+  ];
+
+  /** CPU ceiling per call: 1 µs per character. */
+  const MAX_CPU_MS_PER_CHAR = 0.001;
+
+  it.each(WORST_CASES)(
+    'reads %s in linear time',
+    async (_name, build) => {
+      await expectLinearDoubling((n) => {
+        const href = build(n);
+        return () => hrefTarget(href, PAGE);
+      }, MAX_CPU_MS_PER_CHAR);
+    },
+    0,
+  );
+});
+
 describe('readCaptureTarget in linear time', () => {
   const fill = (unit: string, n: number): string =>
     unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
@@ -297,33 +433,16 @@ describe('readCaptureTarget in linear time', () => {
     ['a long timestamp beside a capture URL', (n) => [CAPTURE, fill('1', n)]],
   ];
 
-  /** Smallest input; each larger size doubles it, up to 64× at 320k. */
-  const BASE = 5_000;
-  const LARGEST = 320_000;
-
   /** CPU ceiling per call: 0.1 µs per character, about 40× the slowest shape measured (0.83 ms at 320k). */
   const MAX_CPU_MS_PER_CHAR = 0.0001;
 
   it.each(WORST_CASES)(
     'reads %s in linear time',
     async (_name, build) => {
-      const [baseUrl, baseTimestamp] = build(BASE);
-      for (let n = BASE * 2; n <= LARGEST; n *= 2) {
+      await expectLinearDoubling((n) => {
         const [url, timestamp] = build(n);
-        let growth = Number.POSITIVE_INFINITY;
-        for (let round = 0; round < 3; round++) {
-          const tBase = await cpuMsPerCall(() => readCaptureTarget(baseUrl, baseTimestamp));
-          const tLarge = await cpuMsPerCall(() => readCaptureTarget(url, timestamp));
-          expect(tLarge, `${tLarge.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(
-            n * MAX_CPU_MS_PER_CHAR,
-          );
-          growth = Math.min(growth, tLarge / tBase);
-        }
-        // Linear work grows ×(n / BASE); the bound leaves it 4× headroom, 256 at the full span.
-        expect(growth, `×${growth.toFixed(1)} from ${BASE} to ${n} characters`).toBeLessThan(
-          4 * (n / BASE),
-        );
-      }
+        return () => readCaptureTarget(url, timestamp);
+      }, MAX_CPU_MS_PER_CHAR);
     },
     0,
   );

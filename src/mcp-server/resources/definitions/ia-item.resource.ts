@@ -11,7 +11,7 @@ import { startCallDeadline } from '@/services/call-deadline.js';
 export const iaItemResource = resource('ia://item/{identifier}', {
   name: 'Internet Archive Item Metadata',
   description:
-    'Metadata snapshot for an Internet Archive item — title, creator, mediatype, description (converted from HTML to plain text), subjects, collections, date, license, language, publisher, ISBN, OCLC and LCCN numbers, Open Library edition and work IDs, volume, the page-image count of a text item, whether the item is access-restricted, and file count. Provides stable injectable context for agents that need to reference an item by URI without fetching the full file manifest.',
+    'Metadata snapshot for an Internet Archive item — title, creator, mediatype, description (converted from HTML to plain text), subjects, collections, date, publicdate and addeddate (when the item was made public and when it was added to the Archive), license, language, publisher, ISBN, OCLC and LCCN numbers, Open Library edition and work IDs, volume, the running time (runtime) of an audio or video item, the page-image count of a text item, whether the item is access-restricted, and file count. Provides stable injectable context for agents that need to reference an item by URI without fetching the full file manifest.',
   mimeType: 'application/json',
   params: z.object({
     identifier: z

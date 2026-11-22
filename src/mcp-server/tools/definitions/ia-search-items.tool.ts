@@ -53,7 +53,7 @@ const collectionIdentifier = (value: string): string => {
 export const iaSearchItems = tool('ia_search_items', {
   title: 'Search Internet Archive Items',
   description:
-    'Search the Internet Archive library (40M+ items) using the Advanced Search (Solr) API. Filter by media type (texts, audio, movies, software, image, etc.), collection, creator, date range, and language. Sort by downloads (the default), date, title, or random. Supports pagination via page/rows. Returns identifiers, titles, creators (the first 10, with creator_count when a record lists more), media types, dates, download counts, collections (without fav- favorites lists), total_found, and current page/rows for pagination context. Use ia_get_item with a returned identifier to get full metadata and file manifests.',
+    'Search the Internet Archive library (40M+ items) using the Advanced Search (Solr) API. Filter by media type (texts, audio, movies, software, image, etc.), collection, creator, publication date range, and language. Sort by downloads (the default), date, title, or random. Supports pagination via page/rows. Returns identifiers, titles, creators (the first 10, with creator_count when a record lists more), media types, publication dates, upload dates (publicdate), download counts, collections (without fav- favorites lists), total_found, and current page/rows for pagination context. Use ia_get_item with a returned identifier to get full metadata and file manifests.',
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   input: z.object({
@@ -90,13 +90,13 @@ export const iaSearchItems = tool('ia_search_items', {
       .string()
       .optional()
       .describe(
-        'Inclusive start of date range: YYYY, YYYY-MM, or YYYY-MM-DD. A year or month starts on its first day; blank means no lower bound. Must be a real Gregorian date.',
+        'Inclusive start of a range on the publication date (date): YYYY, YYYY-MM, or YYYY-MM-DD. A year or month starts on its first day; blank means no lower bound. Must be a real Gregorian date. An item with no date never matches. For an upload-time range, put publicdate in query instead, e.g. publicdate:[2026-11-01 TO 2026-11-21]; a bare upper date covers its whole day.',
       ),
     date_to: z
       .string()
       .optional()
       .describe(
-        'Inclusive end of date range: YYYY, YYYY-MM, or YYYY-MM-DD. A year or month ends on its last day; blank means no upper bound. Must be a real Gregorian date.',
+        'Inclusive end of a range on the publication date (date): YYYY, YYYY-MM, or YYYY-MM-DD. A year or month ends on its last day; blank means no upper bound. Must be a real Gregorian date. An item with no date never matches. For an upload-time range, put publicdate in query instead, e.g. publicdate:[2026-11-01 TO 2026-11-21]; a bare upper date covers its whole day.',
       ),
     language: z
       .string()
@@ -164,8 +164,17 @@ export const iaSearchItems = tool('ia_search_items', {
                 z.array(z.string().describe('Date value.')).describe('Multiple date values.'),
               ])
               .optional()
+              .describe('Publication date; a few records carry a list, relayed as received.'),
+            publicdate: z
+              .union([
+                z.string().describe('Single public date.'),
+                z
+                  .array(z.string().describe('Public date value.'))
+                  .describe('Multiple public date values.'),
+              ])
+              .optional()
               .describe(
-                'Publication or upload date; a few records carry a list, relayed as received.',
+                'When the item became public on the Archive (its upload time), ISO 8601 in UTC as Advanced Search returns it, e.g. 2014-10-24T16:15:43Z; the value a publicdate sort orders by. Omitted when the record has none.',
               ),
             downloads: z.number().optional().describe('Total download count.'),
             collection: z
@@ -383,6 +392,7 @@ export const iaSearchItems = tool('ia_search_items', {
         pushLabelledField(lines, 'Creator', item.creator, cut);
       }
       if (item.date) pushLabelledField(lines, 'Date', item.date);
+      if (item.publicdate) pushLabelledField(lines, 'Public Date', item.publicdate);
       if (item.downloads != null) lines.push(`**Downloads:** ${item.downloads.toLocaleString()}`);
       if (item.collection) pushLabelledField(lines, 'Collection', item.collection);
       // A list of two or more values already ends with the blank line between items.

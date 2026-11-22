@@ -31,9 +31,9 @@ export interface ClosestSnapshot {
 
 /** Paginated CDX history result. */
 export interface CdxHistoryResult {
-  /** True only when an exact collapsed lookahead proves no further captures remain. */
+  /** True only when an exact-URL lookahead proves no further captures remain. */
   complete?: boolean;
-  /** Continuation limitations, including legacy collapsed paging. */
+  /** What paging by CDX's own key can omit: a wildcard url, or a key the server did not issue. */
   notice?: string;
   /** CDX records for this page. */
   records: CdxRecord[];
@@ -75,8 +75,29 @@ export type RedirectDeadEnd =
   | { kind: 'no_location'; status: number; captureTimestamp?: string }
   | { kind: 'bad_location'; status: number; location: string; captureTimestamp?: string };
 
+/** A link in a capture's page text. */
+export interface PageLink {
+  /**
+   * UTF-16 offset in `SnapshotContent.text` where the link's first occurrence starts: its
+   * text, or for an occurrence with none (an image-only link), the end of the text before it.
+   */
+  offset: number;
+  /**
+   * The link's text as it reads in the page text, on one line: the first non-empty text among
+   * its occurrences; empty when none has any, as for an image-only link.
+   */
+  text: string;
+  /** Where it points: an absolute http(s) URL, fragment dropped. */
+  url: string;
+}
+
 /** Fetched snapshot content. */
 export interface SnapshotContent {
+  /**
+   * The page's links, each target once in document order (ascending `offset`); set only when
+   * `fetchContent` was asked for links, and empty for a capture that is not HTML.
+   */
+  links?: PageLink[] | undefined;
   /**
    * The archived redirects the replay followed to the served capture, in order; absent when
    * it passed through none. Wayback's own redirects to a nearest capture are not listed.

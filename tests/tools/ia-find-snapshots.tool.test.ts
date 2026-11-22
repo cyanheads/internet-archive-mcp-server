@@ -18,8 +18,9 @@ const contentText = (result: ToolResult): string =>
     .map((b) => b.text)
     .join('\n');
 
-// Mock the wayback service module so no real HTTP calls are made.
-vi.mock('@/services/wayback/wayback-service.js', () => ({
+// Mock the wayback service so no real HTTP calls are made; its pure helpers stay real.
+vi.mock('@/services/wayback/wayback-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/wayback/wayback-service.js')>()),
   getWaybackService: vi.fn(),
 }));
 
@@ -307,17 +308,239 @@ describe('iaFindSnapshots', () => {
       expect(result.resume_key).toBe('abc123resumekey');
     });
 
-    it('throws no_snapshots when CDX returns zero records', async () => {
-      mockService.fetchHistory.mockResolvedValue({ records: [] });
-
-      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
-      const input = iaFindSnapshots.input.parse({
-        url: 'https://no-snapshots.example.com',
-        mode: 'history',
+    it('renders a page of captures on both surfaces block for block', async () => {
+      mockService.fetchHistory.mockResolvedValue({
+        records: [
+          {
+            timestamp: '20200601120000',
+            statuscode: '200',
+            mimetype: 'text/html',
+            original: 'https://example.com/',
+            digest: 'ABCDEF1234',
+            length: '481',
+          },
+          {
+            timestamp: '20200602120000',
+            statuscode: '301',
+            mimetype: 'text/html',
+            original: 'https://example.com/',
+            digest: 'GHIJ5678',
+          },
+        ],
+        resumeKey: 'ia-history-v1/key',
       });
 
-      await expect(iaFindSnapshots.handler(input, ctx)).rejects.toMatchObject({
-        data: { reason: 'no_snapshots' },
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'history',
+        limit: 2,
+      });
+
+      const first = 'https://web.archive.org/web/20200601120000/https://example.com/';
+      const second = 'https://web.archive.org/web/20200602120000/https://example.com/';
+      const guidance =
+        "This page holds 2 captures, the limit. Pass this response's resume_key as resume_key for the next page.";
+      expect(result.structuredContent).toEqual({
+        snapshots: [
+          {
+            timestamp: '20200601120000',
+            replay_url: first,
+            statuscode: '200',
+            mimetype: 'text/html',
+            original_url: 'https://example.com/',
+            digest: 'ABCDEF1234',
+            length: '481',
+          },
+          {
+            timestamp: '20200602120000',
+            replay_url: second,
+            statuscode: '301',
+            mimetype: 'text/html',
+            original_url: 'https://example.com/',
+            digest: 'GHIJ5678',
+          },
+        ],
+        resume_key: 'ia-history-v1/key',
+        truncated: true,
+        shown: 2,
+        cap: 2,
+        notice: guidance,
+      });
+      expect(result.content).toEqual([
+        {
+          type: 'text',
+          text: [
+            '## 20200601120000',
+            `**Replay URL:** [${first}](<${first}>)`,
+            '**Status:** 200',
+            '**MIME:** text/html',
+            '**Original URL:** [https://example.com/](<https://example.com/>)',
+            '**Digest:** ABCDEF1234',
+            '**Length:** 481',
+            '',
+            '## 20200602120000',
+            `**Replay URL:** [${second}](<${second}>)`,
+            '**Status:** 301',
+            '**MIME:** text/html',
+            '**Original URL:** [https://example.com/](<https://example.com/>)',
+            '**Digest:** GHIJ5678',
+            '',
+            '---',
+            '**Resume Key:** ia-history-v1/key _(pass as resume_key to get the next page)_',
+          ].join('\n'),
+        },
+        {
+          type: 'text',
+          text: `\n\n**truncated:** true\n**shown:** 2\n**cap:** 2\n> ${guidance}`,
+        },
+      ]);
+    });
+
+    describe('a page CDX lists no rows for', () => {
+      /** The service's own continuation notice, as it reports one. */
+      const OMISSION = 'SERVICE CONTINUATION NOTICE.';
+
+      it.each([
+        [
+          'no from, to, or status_filter',
+          { url: 'https://no-snapshots.example.com' },
+          { records: [], complete: true },
+          'The Wayback Machine lists no captures of this URL.',
+        ],
+        [
+          'from, to, and status_filter',
+          { url: 'iana.org/domains/reserved', from: '2015', to: '2015', status_filter: '301' },
+          { records: [], complete: true },
+          'No captures of this URL match from "2015", to "2015", status_filter "301"; widen from and to, or remove status_filter.',
+        ],
+        [
+          'an ISO from alone, quoted as sent to CDX',
+          { url: 'example.com', from: '2015-06-15' },
+          { records: [], complete: true },
+          'No captures of this URL match from "20150615"; widen from.',
+        ],
+        [
+          'to alone',
+          { url: 'example.com', to: '2015-06-15T12:34:56Z' },
+          { records: [], complete: true },
+          'No captures of this URL match to "20150615123456"; widen to.',
+        ],
+        [
+          'status_filter alone',
+          { url: 'example.com', status_filter: '404' },
+          { records: [], complete: true },
+          'No captures of this URL match status_filter "404"; remove status_filter.',
+        ],
+        [
+          'a reversed range',
+          { url: 'example.com', from: '20160101', to: '20150101' },
+          { records: [], complete: true },
+          'No captures of this URL match from "20160101", to "20150101"; widen from and to.',
+        ],
+        [
+          'a url ending in *',
+          { url: 'example.com/_a_[b]*' },
+          { records: [] },
+          'No URL under this prefix has captures.',
+        ],
+        [
+          'a url ending in * with filters',
+          { url: 'example.com/*', from: '2015', status_filter: '200' },
+          { records: [] },
+          'No captures under this prefix match from "2015", status_filter "200"; widen from, or remove status_filter.',
+        ],
+        [
+          'a domain wildcard',
+          { url: '*.example.com' },
+          { records: [] },
+          'No URL under this domain has captures.',
+        ],
+        [
+          'a * inside the url, which CDX matches literally',
+          { url: 'example.com/a*b' },
+          { records: [], complete: true },
+          'The Wayback Machine lists no captures of this URL.',
+        ],
+        [
+          'a server cursor whose range emptied',
+          { url: 'example.com', resume_key: 'ia-history-v1/key' },
+          { records: [], complete: true },
+          'No captures remain past this resume_key.',
+        ],
+        [
+          'a CDX key whose next page is empty, joining the service notice',
+          { url: 'example.com/*', resume_key: 'RAW', from: '2015' },
+          { records: [], notice: OMISSION },
+          `No captures remain past this resume_key. ${OMISSION}`,
+        ],
+      ])(
+        'returns an empty list and one notice on both surfaces for %s',
+        async (_label, input, page, notice) => {
+          mockService.fetchHistory.mockResolvedValue(page);
+
+          const result = await runToolContract(iaFindSnapshots, { mode: 'history', ...input });
+
+          expect(result.isError).toBeFalsy();
+          expect(result.structuredContent).toEqual({ snapshots: [], notice });
+          expect(result.content).toEqual([
+            { type: 'text', text: '**0 snapshots**\n' },
+            { type: 'text', text: `\n\n> ${notice}` },
+          ]);
+          expect(notice).not.toContain(input.url);
+          expect(mockService.fetchHistory).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      it('returns the resume_key CDX sent with a page holding no rows, with a rule under the count', async () => {
+        mockService.fetchHistory.mockResolvedValue({
+          records: [],
+          resumeKey: 'eJxLzs_VSa1I',
+          notice: OMISSION,
+        });
+
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com/*',
+          mode: 'history',
+          status_filter: '301',
+        });
+
+        const notice = `This page holds no captures; pass this response's resume_key as resume_key for the next page. ${OMISSION}`;
+        expect(result.structuredContent).toEqual({
+          snapshots: [],
+          resume_key: 'eJxLzs_VSa1I',
+          notice,
+        });
+        expect(result.content).toEqual([
+          {
+            type: 'text',
+            text: '**0 snapshots**\n\n---\n**Resume Key:** eJxLzs_VSa1I _(pass as resume_key to get the next page)_',
+          },
+          { type: 'text', text: `\n\n> ${notice}` },
+        ]);
+      });
+
+      it('returns the next resume_key CDX sent with an empty page a resume_key reached, saying the next page may hold captures', async () => {
+        mockService.fetchHistory.mockResolvedValue({
+          records: [],
+          resumeKey: 'K2',
+          notice: OMISSION,
+        });
+
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com/*',
+          mode: 'history',
+          resume_key: 'K1',
+        });
+
+        const notice = `This page holds no captures; pass this response's resume_key as resume_key for the next page. ${OMISSION}`;
+        expect(result.structuredContent).toEqual({ snapshots: [], resume_key: 'K2', notice });
+        expect(result.content).toEqual([
+          {
+            type: 'text',
+            text: '**0 snapshots**\n\n---\n**Resume Key:** K2 _(pass as resume_key to get the next page)_',
+          },
+          { type: 'text', text: `\n\n> ${notice}` },
+        ]);
       });
     });
 
@@ -445,6 +668,73 @@ describe('iaFindSnapshots', () => {
         CALL_DEADLINE,
       );
     });
+
+    describe('collapse keys (#69)', () => {
+      it.each([
+        'timestamp:0',
+        'timestamp:8',
+        'timestamp:14',
+        'timestamp:20',
+        'timestamp:99',
+        'digest',
+        'urlkey',
+      ])('passes collapse %s to the service as given', async (collapse) => {
+        mockService.fetchHistory.mockResolvedValue(oneRecord);
+
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com',
+          mode: 'history',
+          collapse,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(mockService.fetchHistory).toHaveBeenCalledWith(
+          expect.objectContaining({ collapse }),
+          expect.anything(),
+          CALL_DEADLINE,
+        );
+      });
+
+      it.each([
+        'Digest',
+        'DIGEST',
+        'urlKey',
+        'original',
+        'timestamp',
+        'timestamp:',
+        'timestamp:100',
+        'digest ',
+        'timestamp:8,digest',
+      ])('rejects collapse %j at the schema, before any lookup', async (collapse) => {
+        const result = await runToolContract(iaFindSnapshots, {
+          url: 'example.com',
+          mode: 'history',
+          collapse,
+        });
+
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
+        });
+        expect(contentText(result)).toContain('collapse');
+        expect(mockService.fetchHistory).not.toHaveBeenCalled();
+      });
+
+      it('describes what every accepted collapse value lists and the prefix url form', () => {
+        const collapse = iaFindSnapshots.input.shape.collapse.description ?? '';
+
+        expect(collapse).not.toContain('1–14');
+        for (const named of [
+          '"timestamp:0" lists only the first capture in range',
+          'an N above 14 reads as 14',
+          '"digest" keys on content',
+          '"urlkey" lists one row per URL',
+          'status_filter applies before the collapse',
+        ])
+          expect(collapse).toContain(named);
+        expect(iaFindSnapshots.input.shape.url.description).toContain('a url ending in "*"');
+        expect(iaFindSnapshots.description).toContain('"digest"');
+      });
+    });
   });
 
   describe('a Wayback capture URL as url (#59)', () => {
@@ -525,15 +815,20 @@ describe('iaFindSnapshots', () => {
       });
     });
 
-    it('history mode names the original URL when it finds no captures', async () => {
-      mockService.fetchHistory.mockResolvedValue({ records: [] });
+    it('history mode answers an original URL with no captures with an empty list', async () => {
+      mockService.fetchHistory.mockResolvedValue({ records: [], complete: true });
 
       const result = await runToolContract(iaFindSnapshots, { url: CAPTURE, mode: 'history' });
 
-      expect(errorOf(result)).toMatchObject({
-        message: `No snapshots found for "${ORIGINAL}" with the specified filters.`,
-        data: { reason: 'no_snapshots' },
+      expect(result.structuredContent).toEqual({
+        snapshots: [],
+        notice: 'The Wayback Machine lists no captures of this URL.',
       });
+      expect(mockService.fetchHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ url: ORIGINAL }),
+        expect.anything(),
+        CALL_DEADLINE,
+      );
     });
 
     it.each(['closest', 'history'] as const)(

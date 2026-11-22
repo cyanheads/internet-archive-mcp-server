@@ -167,6 +167,22 @@ const getItem = () => runToolContract(iaGetItem, { identifier: ID });
 const getText = (charOffset = 0) =>
   runToolContract(iaGetText, { identifier: ID, char_offset: charOffset });
 
+/** Keep production tenant state across contract-runner requests (the runner creates a context per call). */
+const session = (state = createMockContext().state) => {
+  const definition = {
+    ...iaGetText,
+    handler: (
+      input: Parameters<typeof iaGetText.handler>[0],
+      ctx: Parameters<typeof iaGetText.handler>[1],
+    ) => {
+      Object.assign(ctx, { state });
+      return iaGetText.handler(input, ctx);
+    },
+  };
+  return (input: Record<string, unknown>) =>
+    runToolContract(definition, { identifier: ID, ...input });
+};
+
 /** The upstream body never reaches either surface. */
 const expectNoBody = (result: ToolResult) => {
   const data = errorOf(result).data;
@@ -303,22 +319,6 @@ describe('ia_get_text conditional Range continuation transport', () => {
         'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
       },
     });
-  };
-
-  /** Keep production tenant state across contract-runner requests (the runner creates a context per call). */
-  const session = (state = createMockContext().state) => {
-    const definition = {
-      ...iaGetText,
-      handler: (
-        input: Parameters<typeof iaGetText.handler>[0],
-        ctx: Parameters<typeof iaGetText.handler>[1],
-      ) => {
-        Object.assign(ctx, { state });
-        return iaGetText.handler(input, ctx);
-      },
-    };
-    return (input: Record<string, unknown>) =>
-      runToolContract(definition, { identifier: ID, ...input });
   };
 
   beforeEach(() =>
@@ -882,6 +882,366 @@ describe('ia_get_text download failures surface as archive_unavailable', () => {
     });
     expect(errorOf(result).data?.reason).toBeUndefined();
     expect(calls(isDownload)).toHaveLength(1);
+  });
+});
+
+describe('ia_get_text find (#70)', () => {
+  const etag = '"stable"';
+  /** Two bytes a character before the search's partial match, so byte and character offsets differ. */
+  const head = `${'Ä'.repeat(1_000)} Pride and Prejudice. Pemb`;
+  const full = `${head}erley  as  with  it, and the house stood well. ${'z'.repeat(200)}`;
+  const bytes = new TextEncoder().encode(full);
+  /** Where "Pemb", the partial match the stall cuts, begins: the earliest place a match can still begin. */
+  const RESUME = head.length - 'Pemb'.length;
+  const resumeByte = new TextEncoder().encode(full.slice(0, RESUME)).length;
+  const identity = { etag, 'content-length': String(bytes.length) };
+  const whole: FetchMockResponder = () => new Response(bytes, { headers: identity });
+  /** Headers and every byte through the partial match arrive; the rest never does. */
+  const stallInMatch: FetchMockResponder = (request) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(head));
+          request.signal.addEventListener('abort', () => controller.error(request.signal.reason));
+        },
+      }),
+      { headers: identity },
+    );
+  const fromRange: FetchMockResponder = (request) => {
+    const start = Number(/^bytes=(\d+)-$/.exec(request.headers.get('range') ?? '')?.[1]);
+    return new Response(bytes.subarray(start), {
+      status: 206,
+      headers: {
+        etag,
+        'content-length': String(bytes.length - start),
+        'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+      },
+    });
+  };
+  const stopped = `The search of "${FILE}" stopped before the download's request timeout or the call deadline could cut it off. No match begins from char_offset 0 up to char_offset ${RESUME}, where the search resumes.`;
+
+  beforeEach(() =>
+    routeMetadata(() =>
+      Response.json({
+        metadata: {},
+        files: [{ name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' }],
+      }),
+    ),
+  );
+
+  it('fails a find whose download stalls as find_incomplete at 29 s after one download, with its offset and continuation on both surfaces', async () => {
+    routeDownload(stallInMatch);
+    expect(full.indexOf('Pemberley')).toBe(RESUME);
+
+    const { result, elapsedMs } = await runTimed(() =>
+      session()({ find: 'Pemberley', max_chars: 20 }),
+    );
+
+    expect(calls(isDownload)).toHaveLength(1);
+    expect(elapsedMs).toBe(29_000);
+    const error = errorOf(result);
+    const token = error.data.next_continuation as string;
+    expect(token).toMatch(/^[0-9a-f-]{36}$/);
+    const resume = `Call again with the same find and continuation ${token}.`;
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: stopped,
+      data: { reason: 'find_incomplete', char_offset: RESUME, recovery: { hint: resume } },
+    });
+    expect(error.data).not.toHaveProperty('retryable');
+    const text = contentText(result);
+    expect(text).toContain(`Error: ${stopped}`);
+    expect(text).toContain(`Recovery: ${resume}`);
+    expect(text).toContain('(reason find_incomplete)');
+    expectNoBody(result);
+  });
+
+  it('resumes from find_incomplete by continuation, ranged from its byte, or by char_offset, to the match one uninterrupted search finds', async () => {
+    routeDownload(inSequence(stallInMatch, fromRange, whole, whole));
+    const run = session();
+    const { result: incomplete } = await runTimed(() => run({ find: 'Pemberley', max_chars: 20 }));
+    vi.useRealTimers();
+    const { next_continuation: continuation, char_offset } = errorOf(incomplete).data as {
+      next_continuation: string;
+      char_offset: number;
+    };
+
+    const byContinuation = await run({ find: 'Pemberley', max_chars: 20, continuation });
+    const byOffset = await run({ find: 'Pemberley', max_chars: 20, char_offset });
+    const uninterrupted = await run({ find: 'Pemberley', max_chars: 20 });
+
+    const page = {
+      text: full.slice(RESUME, RESUME + 20),
+      char_offset: RESUME,
+      match_offset: RESUME,
+      max_chars: 20,
+      has_more: true,
+      source_file: FILE,
+      source_file_bytes: bytes.length,
+    };
+    for (const result of [byContinuation, byOffset, uninterrupted]) {
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject(page);
+      expect(contentText(result)).toContain(`**Match Offset:** ${RESUME.toLocaleString()}`);
+    }
+    const downloads = calls(isDownload);
+    expect(downloads).toHaveLength(4);
+    expect(downloads[1]?.request.headers.get('range')).toBe(`bytes=${resumeByte}-`);
+    expect(downloads[1]?.request.headers.get('if-range')).toBe(etag);
+    expect(downloads[2]?.request.headers.get('range')).toBeNull();
+  });
+
+  /** The message of a find that could not search past its start offset `start` before the stop. */
+  const tooSlow = (start: number) =>
+    `The download of "${FILE}" was too slow to search past char_offset ${start} before its request timeout or the call deadline would have cut it off.`;
+
+  /** The find failed as a read without find does: archive_unavailable, no find_incomplete, no resume recipe. */
+  const expectStalled = (result: ToolResult, start: number) => {
+    expectUnavailable(result, hint(iaGetText.errors, 'archive_unavailable'));
+    expect(errorOf(result).message).toBe(tooSlow(start));
+    expect(contentText(result)).toContain(`Error: ${tooSlow(start)}`);
+    expect(Object.keys(errorOf(result).data).sort()).toEqual(['reason', 'recovery']);
+    for (const surface of [JSON.stringify(result.structuredContent), contentText(result)]) {
+      expect(surface).not.toContain('find_incomplete');
+      expect(surface).not.toContain('Call again');
+    }
+  };
+
+  it('fails a find whose download stalls before char_offset as archive_unavailable after one download, as the read without find fails, on both surfaces', async () => {
+    /** 1 MiB of text arrives, then nothing, far short of char_offset 5,000,000. */
+    routeDownload(stall('x'.repeat(1024 * 1024)));
+
+    const { result, elapsedMs } = await runTimed(() =>
+      runToolContract(iaGetText, { identifier: ID, char_offset: 5_000_000, find: 'Pemberley' }),
+    );
+    vi.useRealTimers();
+
+    expect(calls(isDownload)).toHaveLength(1);
+    expect(elapsedMs).toBe(29_000);
+    expectStalled(result, 5_000_000);
+
+    // The same read without find: the same code, reason, and hint, after a second download.
+    const { result: withoutFind } = await runTimed(() => getText(5_000_000));
+    expect(calls(isDownload)).toHaveLength(3);
+    expect(errorOf(withoutFind)).toMatchObject({
+      code: errorOf(result).code,
+      message: deadlineMessage(DOWNLOAD),
+      data: errorOf(result).data,
+    });
+  });
+
+  /** The walks' text: "Pemberley" at char 50,176 (byte 100,352), after two-byte characters only. */
+  const WALK_AT = 50_176;
+  const walkText = `${'Ä'.repeat(WALK_AT)}Pemberley  stood well. ${'z'.repeat(200)}`;
+  const walkBytes = new TextEncoder().encode(walkText);
+  /** Characters one hop at 1 KiB a second decodes before its stop: 28 chunks of 512 two-byte characters. */
+  const HOP_CHARS = 28 * 512;
+
+  /**
+   * Serves `walkText` slowly: download `n` (0-based) sends `chunkKib(n)` KiB a second, the first
+   * 1.5 s after the headers, so 28 chunks arrive before a search stops at 29 s. With `etag`, it
+   * honors a conditional Range from the byte the request names.
+   */
+  const throttled =
+    (chunkKib: (n: number) => number, walkEtag?: string): FetchMockResponder =>
+    (request) => {
+      const size = chunkKib(calls(isDownload).length - 1) * 1_024;
+      const range = /^bytes=(\d+)-$/.exec(request.headers.get('range') ?? '');
+      const start = range && request.headers.get('if-range') === walkEtag ? Number(range[1]) : 0;
+      let at = start;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull: (controller) =>
+            new Promise<void>((resolve) => {
+              const delayMs = at === start ? 1_500 : 1_000;
+              timer = setTimeout(() => {
+                if (at >= walkBytes.length) controller.close();
+                else controller.enqueue(walkBytes.subarray(at, at + size));
+                at += size;
+                resolve();
+              }, delayMs);
+            }),
+          cancel: () => clearTimeout(timer),
+        },
+        { highWaterMark: 0 },
+      );
+      return new Response(body, {
+        status: start > 0 ? 206 : 200,
+        headers: {
+          ...(walkEtag !== undefined && { etag: walkEtag }),
+          'content-length': String(walkBytes.length - start),
+          ...(start > 0 && {
+            'content-range': `bytes ${start}-${walkBytes.length - 1}/${walkBytes.length}`,
+          }),
+        },
+      });
+    };
+
+  /** One call under fake timers, run to completion, and the downloads it sent. */
+  const hop = async (call: () => Promise<ToolResult>) => {
+    vi.useFakeTimers();
+    const before = calls(isDownload).length;
+    const pending = call();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    vi.useRealTimers();
+    return { downloads: calls(isDownload).length - before, result };
+  };
+
+  /**
+   * From char_offset 0, call again as each find_incomplete names — its continuation when it names
+   * one, else its char_offset — until a call ends any other way, or 10 calls.
+   */
+  const walk = async () => {
+    const run = session();
+    const hops: { downloads: number; result: ToolResult }[] = [];
+    let input: Record<string, unknown> = { find: 'Pemberley', max_chars: 20 };
+    while (hops.length < 10) {
+      const next = await hop(() => run(input));
+      hops.push(next);
+      const data = next.result.isError ? errorOf(next.result).data : undefined;
+      if (data?.reason !== 'find_incomplete') break;
+      input = {
+        find: 'Pemberley',
+        max_chars: 20,
+        ...(data.next_continuation
+          ? { continuation: data.next_continuation }
+          : { char_offset: data.char_offset }),
+      };
+    }
+    return hops;
+  };
+
+  /** The search from char_offset 0 as one call that nothing interrupts. */
+  const uninterrupted = async () =>
+    (
+      await hop(() =>
+        runToolContract(iaGetText, { identifier: ID, find: 'Pemberley', max_chars: 20 }),
+      )
+    ).result;
+
+  /** The recovery of a search that advanced to `at` from a download with no ETag. */
+  const offsetHint = (at: number) =>
+    `Call again with the same find and char_offset ${at}. That call reads the file from its first byte, so it searches past char_offset ${at} only if the download runs faster than this one did; no continuation is available because the download lacks a stable identity validator or byte length.`;
+
+  /** Each hop a find_incomplete at the next HOP_CHARS boundary, with `hintFor`'s recovery. */
+  const expectStops = (
+    hops: { downloads: number; result: ToolResult }[],
+    hintFor: (data: Record<string, unknown>, at: number) => string,
+  ) => {
+    hops.forEach(({ result }, k) => {
+      const at = (k + 1) * HOP_CHARS;
+      const error = errorOf(result);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        data: {
+          reason: 'find_incomplete',
+          char_offset: at,
+          recovery: { hint: hintFor(error.data, at) },
+        },
+      });
+      expect(contentText(result)).toContain(`Recovery: ${hintFor(error.data, at)}`);
+    });
+  };
+
+  it('walks a slow download by continuation, each hop ranged from the last stop, to the match one uninterrupted search finds', async () => {
+    let fast = false;
+    routeDownload(throttled(() => (fast ? 1_024 : 1), etag));
+
+    const hops = await walk();
+    fast = true;
+    const whole = await uninterrupted();
+
+    expect(hops.map((h) => h.downloads)).toEqual([1, 1, 1, 1]);
+    expectStops(hops.slice(0, 3), (data) => {
+      expect(data.next_continuation).toMatch(/^[0-9a-f-]{36}$/);
+      return `Call again with the same find and continuation ${data.next_continuation}.`;
+    });
+    const hit = hops[3]?.result as ToolResult;
+    expect(hit.isError).toBeFalsy();
+    expect(hit.structuredContent).toMatchObject({
+      match_offset: WALK_AT,
+      text: walkText.slice(WALK_AT, WALK_AT + 20),
+    });
+    const { next_continuation: _a, ...hitPage } = hit.structuredContent as Record<string, unknown>;
+    const { next_continuation: _b, ...wholePage } = whole.structuredContent as Record<
+      string,
+      unknown
+    >;
+    expect(hitPage).toEqual(wholePage);
+    expect(
+      calls(isDownload)
+        .slice(0, 4)
+        .map((c) => c.request.headers.get('range')),
+    ).toEqual([null, ...[1, 2, 3].map((k) => `bytes=${2 * k * HOP_CHARS}-`)]);
+  });
+
+  it('walks a slow download by char_offset with no cursor to store, and ends at the hop that cannot search past its start', async () => {
+    routeDownload(throttled(() => 1));
+
+    const hops = await walk();
+
+    expect(hops.map((h) => h.downloads)).toEqual([1, 1]);
+    expectStops(hops.slice(0, 1), (data, at) => {
+      expect(data).not.toHaveProperty('next_continuation');
+      return offsetHint(at);
+    });
+    expectStalled(hops[1]?.result as ToolResult, HOP_CHARS);
+    expect(calls(isDownload).every((c) => c.request.headers.get('range') === null)).toBe(true);
+  });
+
+  it('walks a download that runs faster each time by char_offset with no cursor, advancing every hop to the match', async () => {
+    let fast = false;
+    routeDownload(throttled((n) => (fast ? 1_024 : n + 1)));
+
+    const hops = await walk();
+    fast = true;
+    const whole = await uninterrupted();
+
+    expect(hops.map((h) => h.downloads)).toEqual([1, 1, 1, 1]);
+    expectStops(hops.slice(0, 3), (_data, at) => offsetHint(at));
+    expect(hops[3]?.result.structuredContent).toEqual(whole.structuredContent);
+    expect(hops[3]?.result.structuredContent).toMatchObject({ match_offset: WALK_AT });
+  });
+
+  it('starts a hit page where the page at its char_offset without find starts, on both surfaces', async () => {
+    const text = `${'Ä'.repeat(300)} P  ember  ley.  Pem- \nberley.  Pemberley  as  with  it, ${'z'.repeat(100)}`;
+    const at = text.indexOf('Pemberley');
+    routeDownload(() => new Response(text));
+
+    const found = await runToolContract(iaGetText, {
+      identifier: ID,
+      find: 'PEMBERLEY',
+      max_chars: 40,
+    });
+    const offset = await runToolContract(iaGetText, {
+      identifier: ID,
+      char_offset: at,
+      max_chars: 40,
+    });
+
+    const { match_offset, ...page } = found.structuredContent as Record<string, unknown>;
+    expect(match_offset).toBe(at);
+    expect(page).toEqual(offset.structuredContent);
+    expect(page.char_offset).toBe(at);
+    const matchLine = ` | **Match Offset:** ${at.toLocaleString()}`;
+    expect(contentText(found)).toContain(matchLine);
+    expect(contentText(found).replace(matchLine, '')).toBe(contentText(offset));
+  });
+
+  it.each([
+    ['U+0085, which String#trim keeps', '\u0085'],
+    ['U+FEFF, which String#trim strips', String.fromCodePoint(0xfeff)],
+  ])('answers a find of only %s exactly as the call without find', async (_label, find) => {
+    routeDownload(() => new Response('Chapter one. It was a dark night.'));
+
+    const without = await runToolContract(iaGetText, { identifier: ID, max_chars: 11 });
+    const blank = await runToolContract(iaGetText, { identifier: ID, max_chars: 11, find });
+
+    expect(blank.structuredContent).toEqual(without.structuredContent);
+    expect(blank.content).toEqual(without.content);
+    expect(JSON.stringify(blank.structuredContent)).not.toContain('No match');
   });
 });
 

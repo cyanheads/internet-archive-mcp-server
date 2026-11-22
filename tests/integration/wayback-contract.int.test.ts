@@ -814,7 +814,7 @@ describe('ia_find_snapshots collapsed cursor contract', () => {
     expect(contentText(result)).not.toContain('captures past it');
   });
 
-  it('preserves no_snapshots when a previously valid cursor reaches an empty index range', async () => {
+  it('answers a previously valid cursor that reaches an empty index range with an empty list', async () => {
     const shared = createMockContext();
     const definition = {
       ...iaFindSnapshots,
@@ -836,11 +836,14 @@ describe('ia_find_snapshots collapsed cursor contract', () => {
       mode: 'history',
       resume_key: out(first).resume_key,
     });
-    expect(result.structuredContent).toMatchObject({
-      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshots' } },
-    });
-    expect(contentText(result)).toContain('No snapshots found');
-    expect(contentText(result)).toContain('Recovery:');
+    const notice = 'No captures remain past this resume_key.';
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({ snapshots: [], notice });
+    expect(result.content).toEqual([
+      { type: 'text', text: '**0 snapshots**\n' },
+      { type: 'text', text: `\n\n> ${notice}` },
+    ]);
+    expect(calls(isCdx)).toHaveLength(2);
   });
 
   it('walks three pages without loss, inherits filters and allows a different page size on both surfaces', async () => {
@@ -951,11 +954,34 @@ describe('ia_find_snapshots collapsed cursor contract', () => {
         resume_key: 'RAW',
         limit: 10,
       });
-      expect(contentText(result)).toContain('can omit captures');
-      expect(JSON.stringify(result.structuredContent)).toContain('can omit captures');
+      expect(result.isError).toBeFalsy();
+      expect(contentText(result)).toContain('can omit the row at each page boundary');
+      expect(JSON.stringify(result.structuredContent)).toContain(
+        'can omit the row at each page boundary',
+      );
       expect(new URL(calls(isCdx)[0]!.request.url).searchParams.get('resumeKey')).toBe('RAW');
     },
   );
+
+  it('answers a CDX key whose next page is empty with the continuation notice, then the omission notice', async () => {
+    let empty = false;
+    routeCdx(() => Response.json(empty ? [] : [header, rows[0]]));
+    const continuation = { url: 'example.com/*', mode: 'history', resume_key: 'RAW', limit: 10 };
+    // The final non-empty page carries the omission notice alone.
+    const omission = out(await runToolContract(iaFindSnapshots, continuation)).notice;
+    expect(omission).toContain('can omit the row at each page boundary');
+    empty = true;
+
+    const result = await runToolContract(iaFindSnapshots, continuation);
+
+    const notice = `No captures remain past this resume_key. ${omission}`;
+    expect(result.structuredContent).toEqual({ snapshots: [], notice });
+    expect(result.content).toEqual([
+      { type: 'text', text: '**0 snapshots**\n' },
+      { type: 'text', text: `\n\n> ${notice}` },
+    ]);
+    expect(calls(isCdx)).toHaveLength(2);
+  });
 });
 
 describe('ia_find_snapshots history-mode collapse', () => {
@@ -996,6 +1022,684 @@ describe('ia_find_snapshots history-mode collapse', () => {
     expect(described).not.toMatch(/uncollapsed/i);
     expect(described).toContain('timestamp:14');
     expect(iaFindSnapshots.description).toContain('timestamp:14');
+  });
+});
+
+describe('ia_find_snapshots history mode under digest, urlkey, and every timestamp:N (#69)', () => {
+  const HEADER = ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'];
+  const IANA_URL = 'iana.org/domains/reserved';
+  const PLAIN = 'http://www.iana.org/domains/reserved';
+  const PORT = 'http://www.iana.org:80/domains/reserved';
+  const HTTPS = 'https://www.iana.org/domains/reserved';
+  const PLAIN_SLASH = `${PLAIN}/`;
+  const PORT_SLASH = `${PORT}/`;
+  const D_ONNC = 'ONNCCJLMUVS2PL2CNK4CKUILPASQDCEA';
+  const D_35IR = '35IR2OY2P6ZGGKZP6CQ5OUXPWOFOYA3E';
+  const D_3I42 = '3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ';
+  const D_7K6Z = '7K6ZBEISILYB5HWZTYHAAVMAMK2R7W4C';
+  const D_5VTQ = '5VTQRB2ABYNIPDTWK5CADHWBVIQEUAI3';
+
+  /**
+   * The uncollapsed 2015 index of iana.org/domains/reserved as CDX served it on 2026-11-22
+   * (timestamp, status, original, digest, length): 73 captures, two in the second
+   * 20150716092504 — a 200 repeating the digest before it, then a 302.
+   */
+  const IANA_2015 = (
+    [
+      ['20150103131822', '200', PLAIN, D_ONNC, '3765'],
+      ['20150110014937', '200', PORT, D_35IR, '3411'],
+      ['20150112061215', '200', PORT, D_35IR, '3413'],
+      ['20150206004741', '200', PORT, D_35IR, '3406'],
+      ['20150207071712', '200', PORT, D_35IR, '3412'],
+      ['20150208110504', '200', PORT, D_35IR, '3412'],
+      ['20150211192805', '200', PORT, D_35IR, '3409'],
+      ['20150216062601', '200', PORT, D_35IR, '3413'],
+      ['20150219030410', '200', HTTPS, D_35IR, '3562'],
+      ['20150219124803', '200', PORT, D_35IR, '3411'],
+      ['20150222115936', '200', PORT, D_35IR, '3411'],
+      ['20150222143730', '200', PORT, D_35IR, '3404'],
+      ['20150226191831', '200', PORT, D_35IR, '3411'],
+      ['20150302054208', '200', PORT, D_35IR, '3413'],
+      ['20150305133051', '200', PORT, D_35IR, '3413'],
+      ['20150309025406', '200', PORT, D_35IR, '3413'],
+      ['20150311033649', '200', PORT, D_35IR, '3414'],
+      ['20150315164644', '-', PLAIN, D_35IR, '490'],
+      ['20150317080243', '200', PORT, D_35IR, '3412'],
+      ['20150329213709', '200', HTTPS, D_35IR, '3559'],
+      ['20150402094419', '302', PLAIN_SLASH, D_3I42, '424'],
+      ['20150402094422', '-', PLAIN, D_35IR, '492'],
+      ['20150415001619', '200', PORT, D_35IR, '3413'],
+      ['20150416013817', '200', PORT, D_35IR, '3413'],
+      ['20150419042212', '200', PORT, D_35IR, '3412'],
+      ['20150511122649', '-', PLAIN, D_35IR, '540'],
+      ['20150523125833', '200', PLAIN, D_ONNC, '3748'],
+      ['20150530075231', '200', PLAIN, D_ONNC, '3753'],
+      ['20150606053528', '200', PLAIN, D_ONNC, '3761'],
+      ['20150606053545', '200', PLAIN, D_ONNC, '3768'],
+      ['20150618172525', '200', HTTPS, D_ONNC, '3762'],
+      ['20150619101923', '-', PLAIN, D_35IR, '539'],
+      ['20150625172949', '-', PLAIN, D_35IR, '538'],
+      ['20150629002329', '200', PORT, D_35IR, '3414'],
+      ['20150630075815', '-', PLAIN, D_35IR, '520'],
+      ['20150630145444', '200', PORT, D_35IR, '3414'],
+      ['20150630173807', '-', PLAIN, D_35IR, '495'],
+      ['20150701020807', '-', PLAIN, D_35IR, '492'],
+      ['20150702233256', '-', PLAIN, D_35IR, '487'],
+      ['20150704115145', '-', PLAIN, D_35IR, '487'],
+      ['20150704213630', '-', PLAIN, D_35IR, '486'],
+      ['20150705034018', '-', PLAIN, D_35IR, '487'],
+      ['20150705221116', '-', PLAIN, D_35IR, '485'],
+      ['20150707032545', '-', PLAIN, D_35IR, '511'],
+      ['20150708174621', '-', PLAIN, D_35IR, '516'],
+      ['20150708193843', '-', PLAIN, D_35IR, '514'],
+      ['20150708194649', '-', PLAIN, D_35IR, '516'],
+      ['20150714230802', '-', HTTPS, D_35IR, '521'],
+      ['20150716092504', '200', PORT, D_35IR, '3437'],
+      ['20150716092504', '302', PORT_SLASH, D_3I42, '288'],
+      ['20150816075616', '200', PLAIN, D_7K6Z, '3588'],
+      ['20150906130640', '200', PLAIN, D_5VTQ, '3588'],
+      ['20150907025837', '200', PORT, D_5VTQ, '3438'],
+      ['20150910223047', '200', HTTPS, D_5VTQ, '3576'],
+      ['20150923163429', '200', PLAIN, D_5VTQ, '3792'],
+      ['20150924041913', '200', PLAIN, D_5VTQ, '3587'],
+      ['20150924154636', '200', PLAIN, D_5VTQ, '3588'],
+      ['20151004164058', '-', PLAIN, D_5VTQ, '551'],
+      ['20151006031756', '200', PORT, D_5VTQ, '3435'],
+      ['20151009122707', '200', PORT, D_5VTQ, '3439'],
+      ['20151014153638', '200', PLAIN, D_5VTQ, '3591'],
+      ['20151026064135', '200', PORT, D_5VTQ, '3434'],
+      ['20151031171701', '200', PORT, D_5VTQ, '3437'],
+      ['20151104143046', '200', PORT, D_5VTQ, '3437'],
+      ['20151106054313', '200', PLAIN, D_5VTQ, '3586'],
+      ['20151108134616', '200', PORT, D_5VTQ, '3437'],
+      ['20151109161653', '200', PORT, D_5VTQ, '3437'],
+      ['20151113110920', '200', PORT, D_5VTQ, '3420'],
+      ['20151117054113', '200', PORT, D_5VTQ, '3416'],
+      ['20151121085556', '200', PORT, D_5VTQ, '3433'],
+      ['20151127172023', '200', PORT, D_5VTQ, '3437'],
+      ['20151129035359', '200', PLAIN, D_5VTQ, '3585'],
+      ['20151212201327', '200', PORT, D_5VTQ, '3435'],
+    ] satisfies [string, string, string, string, string][]
+  ).map(([timestamp, status, original, digest, length]) => [
+    timestamp,
+    status,
+    status === '-' ? 'warc/revisit' : 'text/html',
+    original,
+    digest,
+    length,
+  ]);
+
+  /** CDX's own `collapse=digest` listing of `IANA_2015`, as captured (timestamp, status, digest). */
+  const CHANGES_2015 = [
+    ['20150103131822', '200', D_ONNC],
+    ['20150110014937', '200', D_35IR],
+    ['20150402094419', '302', D_3I42],
+    ['20150402094422', '-', D_35IR],
+    ['20150523125833', '200', D_ONNC],
+    ['20150619101923', '-', D_35IR],
+    ['20150716092504', '302', D_3I42],
+    ['20150816075616', '200', D_7K6Z],
+    ['20150906130640', '200', D_5VTQ],
+  ];
+
+  /** The same with `filter=statuscode:200`, which CDX applies before the collapse. */
+  const CHANGES_2015_200 = [
+    ['20150103131822', '200', D_ONNC],
+    ['20150110014937', '200', D_35IR],
+    ['20150523125833', '200', D_ONNC],
+    ['20150629002329', '200', D_35IR],
+    ['20150816075616', '200', D_7K6Z],
+    ['20150906130640', '200', D_5VTQ],
+  ];
+
+  /**
+   * A CDX server over `index`, one URL's uncollapsed rows in index order, answering as CDX
+   * answered every captured query of `IANA_2015`: it keeps the rows within from and to that pass
+   * the status filter, starting just past the row a resumeKey names, lists the first of each run
+   * sharing the collapse key, and closes a page that reached limit with a key naming the last row
+   * it read — the next group's first row, which a resumed query then skips.
+   */
+  const cdxOver =
+    (index: string[][]): FetchMockResponder =>
+    (request) => {
+      const qp = new URL(request.url).searchParams;
+      const from = (qp.get('from') ?? '').padEnd(14, '0');
+      const to = (qp.get('to') ?? '').padEnd(14, '9');
+      const status = qp.get('filter')?.replace(/^statuscode:/, '');
+      const collapse = qp.get('collapse') ?? '';
+      const keyOf = (row: string[]) =>
+        collapse === 'digest'
+          ? row[4]
+          : collapse === 'urlkey'
+            ? ''
+            : row[0]!.slice(0, Number(collapse.slice('timestamp:'.length)));
+      const limit = Number(qp.get('limit'));
+      const start = qp.has('resumeKey') ? Number(qp.get('resumeKey')) + 1 : 0;
+      const listed: string[][] = [];
+      let lastKey: string | undefined;
+      let lastRead = -1;
+      for (const [i, row] of index.entries()) {
+        if (i < start || row[0]! < from || row[0]! > to || (status && row[1] !== status)) continue;
+        const key = keyOf(row);
+        if (listed.length === limit) {
+          lastRead = i;
+          if (key === lastKey) continue;
+          break;
+        }
+        if (key !== lastKey) listed.push(row);
+        lastKey = key;
+        lastRead = i;
+      }
+      if (listed.length === 0) return Response.json([]);
+      const full = listed.length === limit;
+      return Response.json([HEADER, ...listed, ...(full ? [[], [String(lastRead)]] : [])]);
+    };
+
+  type Page = {
+    snapshots: { timestamp: string; statuscode?: string; digest?: string }[];
+    resume_key?: string;
+    notice?: string;
+  };
+  const out = (result: ToolResult) => result.structuredContent as Page;
+
+  /** The rows of `pages`, joined, as [timestamp, statuscode, digest]. */
+  const joined = (pages: ToolResult[]) =>
+    pages.flatMap((page) => out(page).snapshots.map((s) => [s.timestamp, s.statuscode, s.digest]));
+
+  /**
+   * Every page of `query` at `limit`, following each resume_key with limit alone, through one
+   * state store as a session's cursors persist between its calls.
+   */
+  const walk = async (query: Record<string, unknown>, limit: number): Promise<ToolResult[]> => {
+    const shared = createMockContext();
+    const definition = {
+      ...iaFindSnapshots,
+      handler: (
+        input: Parameters<typeof iaFindSnapshots.handler>[0],
+        ctx: Parameters<typeof iaFindSnapshots.handler>[1],
+      ) => iaFindSnapshots.handler(input, { ...ctx, state: shared.state }),
+    };
+    const pages: ToolResult[] = [];
+    let resume_key: string | undefined;
+    do {
+      const page = await runToolContract(
+        definition,
+        resume_key ? { url: query.url, mode: 'history', limit, resume_key } : { ...query, limit },
+      );
+      expect(page.isError, contentText(page)).toBeFalsy();
+      pages.push(page);
+      resume_key = out(page).resume_key;
+      if (pages.length > 100) throw new Error(`the walk at limit ${limit} did not end`);
+    } while (resume_key);
+    return pages;
+  };
+
+  /** Each page's content[] carries every row's timestamp and digest, and its resume_key. */
+  const expectBothSurfaces = (pages: ToolResult[]) => {
+    for (const page of pages) {
+      const text = contentText(page);
+      for (const row of out(page).snapshots) {
+        expect(text).toContain(`## ${row.timestamp}`);
+        expect(text).toContain(`**Digest:** ${row.digest}`);
+      }
+      if (out(page).resume_key) expect(text).toContain(`**Resume Key:** ${out(page).resume_key}`);
+    }
+  };
+
+  const sentParams = () =>
+    calls(isCdx).map((c) => Object.fromEntries(new URL(c.request.url).searchParams));
+
+  it('walks the captured digest listing at every limit, with and without status_filter "200", joining to the unpaged listing row for row', async () => {
+    routeCdx(cdxOver(IANA_2015));
+
+    for (const [filter, listing] of [
+      [{}, CHANGES_2015],
+      [{ status_filter: '200' }, CHANGES_2015_200],
+    ] as const) {
+      const query = {
+        url: IANA_URL,
+        mode: 'history',
+        from: '2015',
+        to: '2015',
+        collapse: 'digest',
+      };
+      const unpaged = await runToolContract(iaFindSnapshots, { ...query, ...filter });
+      expect(joined([unpaged])).toEqual(listing);
+      for (let limit = 1; limit <= listing.length; limit++) {
+        const pages = await walk({ ...query, ...filter }, limit);
+        expect(joined(pages), `limit ${limit}`).toEqual(listing);
+        expect(pages, `limit ${limit}`).toHaveLength(Math.ceil(listing.length / limit));
+        expectBothSurfaces(pages);
+      }
+    }
+    expect(sentParams().every((p) => !Object.hasOwn(p, 'resumeKey'))).toBe(true);
+  });
+
+  it('walks a second whose digests alternate at every limit without re-listing or skipping a capture', async () => {
+    const version = (timestamp: string, digest: string) => [
+      timestamp,
+      '200',
+      'text/html',
+      'http://example.com/',
+      digest,
+      '1',
+    ];
+    routeCdx(
+      cdxOver([
+        version('20200101000000', 'A'),
+        version('20200102000000', 'A'),
+        version('20200102000000', 'B'),
+        version('20200102000000', 'A'),
+        version('20200102000000', 'B'),
+        version('20200103000000', 'B'),
+        version('20200104000000', 'C'),
+        version('20200105000000', 'A'),
+        version('20200105000000', 'B'),
+        version('20200105000000', 'A'),
+        version('20200106000000', 'D'),
+      ]),
+    );
+    const listing = [
+      ['20200101000000', '200', 'A'],
+      ['20200102000000', '200', 'B'],
+      ['20200102000000', '200', 'A'],
+      ['20200102000000', '200', 'B'],
+      ['20200104000000', '200', 'C'],
+      ['20200105000000', '200', 'A'],
+      ['20200105000000', '200', 'B'],
+      ['20200105000000', '200', 'A'],
+      ['20200106000000', '200', 'D'],
+    ];
+
+    for (let limit = 1; limit <= listing.length; limit++) {
+      const pages = await walk({ url: 'example.com', mode: 'history', collapse: 'digest' }, limit);
+      expect(joined(pages), `limit ${limit}`).toEqual(listing);
+    }
+  });
+
+  it('lists one row for an exact url under urlkey, with no resume_key and no notice, on both surfaces', async () => {
+    routeCdx(cdxOver(IANA_2015));
+
+    const result = await runToolContract(iaFindSnapshots, {
+      url: IANA_URL,
+      mode: 'history',
+      collapse: 'urlkey',
+      limit: 1,
+    });
+
+    const replay = `https://web.archive.org/web/20150103131822/${PLAIN}`;
+    expect(result.structuredContent).toEqual({
+      snapshots: [
+        {
+          timestamp: '20150103131822',
+          replay_url: replay,
+          statuscode: '200',
+          mimetype: 'text/html',
+          original_url: PLAIN,
+          digest: D_ONNC,
+          length: '3765',
+        },
+      ],
+    });
+    expect(result.content).toEqual([
+      {
+        type: 'text',
+        text: [
+          '## 20150103131822',
+          `**Replay URL:** [${replay}](<${replay}>)`,
+          '**Status:** 200',
+          '**MIME:** text/html',
+          `**Original URL:** [${PLAIN}](<${PLAIN}>)`,
+          `**Digest:** ${D_ONNC}`,
+          '**Length:** 3765',
+          '',
+        ].join('\n'),
+      },
+    ]);
+    expect(sentParams()).toEqual([expect.objectContaining({ collapse: 'urlkey', limit: '2' })]);
+  });
+
+  it('pages a url ending in * under urlkey by CDX’s own key, with its notice on both surfaces', async () => {
+    // CDX's two pages of info.cern.ch/hypertext/WWW/Summary* at limit 4, captured on 2026-11-22:
+    // its timestamps, statuses, and originals, with digests cut short and one length throughout.
+    const keyOne =
+      'eJxLztBJTi3K08nMS8vX1M-oLEgtKkmtKNEvLy_XLy7NzU0sqtTLKMnNMcrLTM0pTs1TMDIwMjIwNDI0MDc0MzICAOm2FW0';
+    const summary = 'http://info.cern.ch/hypertext/WWW/Summary.html';
+    const pulua = `${summary}http://pulua.hcc.hawaii.edu`;
+    const row = (timestamp: string, status: string, original: string, digest: string) => [
+      timestamp,
+      status,
+      'text/html',
+      original,
+      digest,
+      '338',
+    ];
+    const pageOne = [
+      HEADER,
+      row('19981207062434', '200', 'http://info.cern.ch:80/hypertext/WWW/Summary.html', 'YE4R'),
+      row('20240526183313', '404', `${summary}%C2%AF`, 'FHEO'),
+      row('20230108151537', '404', `${summary})`, 'WCB6'),
+      row('20240616132359', '404', `${summary}2`, 'ZEBG'),
+      [],
+      [keyOne],
+    ];
+    const pageTwo = [
+      HEADER,
+      row('20220401071825', '404', `${summary}2Nielsen`, 'L4UL'),
+      row('20240724193400', '404', pulua, '2ZF2'),
+      row('20240724195024', '404', `${pulua}/guide/www.guide.html`, '2ZF2'),
+      row('20240724193422', '404', `${pulua}/guide/www.guide.htmlhttp://info.cern.ch`, '2ZF2'),
+      [],
+      ['eJxNjEEKhDAMAL_iVZCkFsVlf1Ni1hSslm5C9ffSPe1tDjNDMhCXY4jH5'],
+    ];
+    routeCdx((request) =>
+      Response.json(new URL(request.url).searchParams.has('resumeKey') ? pageTwo : pageOne),
+    );
+    const query = {
+      url: 'info.cern.ch/hypertext/WWW/Summary*',
+      mode: 'history',
+      collapse: 'urlkey',
+      limit: 4,
+    };
+
+    const first = await runToolContract(iaFindSnapshots, query);
+    const second = await runToolContract(iaFindSnapshots, {
+      ...query,
+      resume_key: out(first).resume_key,
+    });
+
+    const notice =
+      "This page holds 4 captures, the limit. Pass this response's resume_key as resume_key for the next page. CDX raw continuation pages a wildcard url and can omit the row at each page boundary or return it as a later capture of the same URL; a limit that holds the whole listing (up to 10,000 rows) avoids both.";
+    for (const page of [first, second]) {
+      expect(out(page).snapshots).toHaveLength(4);
+      expect(out(page).notice).toBe(notice);
+      expect(contentText(page)).toContain(`> ${notice}`);
+    }
+    expect(out(first).resume_key).toBe(keyOne);
+    expect(sentParams()[1]).toMatchObject({ collapse: 'urlkey', limit: '4', resumeKey: keyOne });
+  });
+
+  it('pages timestamp:20, which CDX reads as timestamp:14, through server cursors without losing a capture', async () => {
+    routeCdx(cdxOver(IANA_2015));
+    // CDX lists one row per capture second: 72 of the 73 captures, as captured.
+    const perSecond = IANA_2015.filter((row, i) => row[0] !== IANA_2015[i - 1]?.[0]);
+    expect(perSecond).toHaveLength(72);
+
+    const pages = await walk(
+      { url: IANA_URL, mode: 'history', from: '2015', to: '2015', collapse: 'timestamp:20' },
+      10,
+    );
+
+    expect(joined(pages)).toEqual(perSecond.map((row) => [row[0], row[1], row[4]]));
+    expect(pages).toHaveLength(8);
+    const sent = sentParams();
+    for (const params of sent) {
+      expect(params).toMatchObject({ collapse: 'timestamp:20', limit: '11' });
+      expect(params).not.toHaveProperty('resumeKey');
+    }
+    expect(sent.slice(1).map((p) => p.from)).toEqual(
+      pages.slice(1).map((page) => out(page).snapshots[0]?.timestamp),
+    );
+  });
+
+  it('answers timestamp:0 with the first capture in range and nothing to resume, even at limit 1', async () => {
+    routeCdx(cdxOver(IANA_2015));
+
+    const result = await runToolContract(iaFindSnapshots, {
+      url: IANA_URL,
+      mode: 'history',
+      from: '2015',
+      to: '2015',
+      collapse: 'timestamp:0',
+      limit: 1,
+    });
+
+    expect(joined([result])).toEqual([['20150103131822', '200', D_ONNC]]);
+    for (const absent of ['resume_key', 'truncated', 'notice'])
+      expect(result.structuredContent).not.toHaveProperty(absent);
+    expect(contentText(result)).not.toContain('Resume Key');
+    expect(sentParams()).toEqual([
+      expect.objectContaining({ collapse: 'timestamp:0', limit: '2' }),
+    ]);
+  });
+
+  it('sends a timestamp:N page and its resumed page as it always has', async () => {
+    routeCdx(cdxOver(IANA_2015));
+
+    const pages = await walk(
+      { url: IANA_URL, mode: 'history', from: '2015', to: '2015', collapse: 'timestamp:8' },
+      3,
+    );
+
+    expect(pages.length).toBeGreaterThan(1);
+    const [first, second] = calls(isCdx).map((c) => new URL(c.request.url).search);
+    expect(first).toBe(
+      '?url=iana.org%2Fdomains%2Freserved&output=json&fl=timestamp%2Cstatuscode%2Cmimetype%2Coriginal%2Cdigest%2Clength&collapse=timestamp%3A8&limit=4&showResumeKey=true&from=2015&to=2015',
+    );
+    expect(second).toBe(
+      '?url=iana.org%2Fdomains%2Freserved&output=json&fl=timestamp%2Cstatuscode%2Cmimetype%2Coriginal%2Cdigest%2Clength&collapse=timestamp%3A8&limit=4&showResumeKey=true&from=20150206004741&to=2015',
+    );
+  });
+});
+
+describe('ia_find_snapshots history mode: an empty list means CDX listed no rows (#72)', () => {
+  const history = (input: Record<string, unknown> = {}, signal?: AbortSignal) =>
+    runToolContract(
+      iaFindSnapshots,
+      { url: 'example.com', mode: 'history', ...input },
+      signal && { context: { signal } },
+    );
+
+  /** A failed call: its code and reason, no `snapshots` on either surface. */
+  const expectFailed = (result: ToolResult, code: number, reason: string | undefined) => {
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).not.toHaveProperty('snapshots');
+    const { error } = result.structuredContent as {
+      error: { code: number; data?: Record<string, unknown> };
+    };
+    expect(error.code).toBe(code);
+    expect(error.data?.reason).toBe(reason);
+    expect(contentText(result)).not.toContain('0 snapshots');
+  };
+
+  /** CDX's answer for a site excluded from the archive: a 403 with an empty body. */
+  const BLOCKED_SITE = () =>
+    new Response('', {
+      status: 403,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-archive-wayback-runtime-error':
+          'AdministrativeAccessControlException: Blocked Site Error',
+      },
+    });
+
+  describe('every other way a history call can end with no rows stays a failure', () => {
+    const UNAVAILABLE_AS = [JsonRpcErrorCode.ServiceUnavailable, 'cdx_unavailable'] as const;
+
+    it.each([
+      ['an HTTP 503 after its retries', UNAVAILABLE, ...UNAVAILABLE_AS],
+      [
+        'an excluded site’s HTTP 403',
+        BLOCKED_SITE,
+        JsonRpcErrorCode.NotFound,
+        'no_snapshot_available',
+      ],
+      [
+        'an HTML page',
+        () =>
+          new Response('<html><body>Temporarily Offline</body></html>', {
+            headers: { 'content-type': 'text/html' },
+          }),
+        ...UNAVAILABLE_AS,
+      ],
+      [
+        'text that is not JSON',
+        () =>
+          new Response('[["timestamp","statuscode"', {
+            headers: { 'content-type': 'application/json' },
+          }),
+        ...UNAVAILABLE_AS,
+      ],
+      ['headers that never arrive', hang, ...UNAVAILABLE_AS],
+      ['a body that never completes', stall('[["timestamp"'), ...UNAVAILABLE_AS],
+    ] as const)('%s', async (_label, respond, code, reason) => {
+      routeCdx(respond);
+      const url = reason === 'no_snapshot_available' ? 'excluded.example.com' : 'example.com';
+
+      const result = await runWithRetries(() => history({ url }));
+
+      expectFailed(result, code, reason);
+    });
+
+    it('the call deadline running out mid-retry', async () => {
+      routeCdx(answerAfter(29_900, UNAVAILABLE));
+
+      const result = await runWithRetries(() => history());
+
+      expectFailed(result, ...UNAVAILABLE_AS);
+      expect(contentText(result)).toContain(
+        'CDX API did not finish within the 55 s call deadline.',
+      );
+    });
+
+    it('the caller cancelling mid-request', async () => {
+      vi.useFakeTimers();
+      routeCdx(hang);
+      const controller = new AbortController();
+
+      const pending = history({}, controller.signal);
+      await vi.advanceTimersByTimeAsync(5_000);
+      controller.abort();
+      const result = await pending;
+
+      expectFailed(result, JsonRpcErrorCode.RequestCancelled, undefined);
+    });
+  });
+
+  describe('CDX answering with no rows is an empty list and a notice, after one request', () => {
+    /** CDX's answer for a query that matches nothing, as it sends it. */
+    const NO_ROWS = () => new Response('[]\n', { headers: { 'content-type': 'application/json' } });
+
+    it('the filters sent, quoted as CDX received them, on both surfaces', async () => {
+      routeCdx(NO_ROWS);
+
+      const result = await history({
+        url: 'iana.org/domains/reserved',
+        from: '2015',
+        to: '2015',
+        status_filter: '301',
+      });
+
+      const notice =
+        'No captures of this URL match from "2015", to "2015", status_filter "301"; widen from and to, or remove status_filter.';
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toEqual({ snapshots: [], notice });
+      expect(result.content).toEqual([
+        { type: 'text', text: '**0 snapshots**\n' },
+        { type: 'text', text: `\n\n> ${notice}` },
+      ]);
+      expect(calls(isCdx)).toHaveLength(1);
+      expect(Object.fromEntries(new URL(calls(isCdx)[0]!.request.url).searchParams)).toMatchObject({
+        from: '2015',
+        to: '2015',
+        filter: 'statuscode:301',
+      });
+    });
+
+    const NONE_OF_URL = 'The Wayback Machine lists no captures of this URL.';
+    const HEADER_ONLY = () =>
+      Response.json([['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length']]);
+
+    it.each([
+      ['a URL never captured', 'example.com/never-captured', NO_ROWS, NONE_OF_URL],
+      ['a header row alone', 'example.com', HEADER_ONLY, NONE_OF_URL],
+      [
+        'a prefix nothing is under',
+        'example.com/no-such-dir/*',
+        NO_ROWS,
+        'No URL under this prefix has captures.',
+      ],
+    ])('%s', async (_label, url, respond, notice) => {
+      routeCdx(respond);
+
+      const result = await history({ url });
+
+      expect(result.structuredContent).toEqual({ snapshots: [], notice });
+      expect(contentText(result)).toBe(`**0 snapshots**\n\n\n\n> ${notice}`);
+      expect(calls(isCdx)).toHaveLength(1);
+    });
+  });
+
+  describe('a 200 whose JSON is not a list of rows fails as the asking call’s unavailable reason', () => {
+    const NOT_ROWS = () => Response.json({});
+
+    it('history mode: cdx_unavailable, retried like an unparseable body', async () => {
+      routeCdx(NOT_ROWS);
+
+      const result = await runWithRetries(() => history());
+
+      expectFailed(result, JsonRpcErrorCode.ServiceUnavailable, 'cdx_unavailable');
+      expect(contentText(result)).toContain('CDX API returned JSON that is not a list of rows.');
+      expect(contentText(result)).toContain(
+        `Recovery: ${hint(iaFindSnapshots.errors, 'cdx_unavailable')}`,
+      );
+      expect(calls(isCdx)).toHaveLength(4);
+    });
+
+    it('ia_find_snapshots closest, after an empty Availability answer: cdx_unavailable, never a miss', async () => {
+      routeAvailability(EMPTY_AVAILABILITY);
+      routeCdx(NOT_ROWS);
+
+      const result = await runToolContract(iaFindSnapshots, {
+        url: 'example.com',
+        mode: 'closest',
+        timestamp: '20200101',
+      });
+
+      expectFailed(result, JsonRpcErrorCode.ServiceUnavailable, 'cdx_unavailable');
+      expect(contentText(result)).toMatch(FALLBACK_MESSAGE);
+      expect(calls(isCdx)).toHaveLength(1);
+    });
+
+    it('ia_find_snapshots closest, after Availability 503s: availability_unavailable, never a miss', async () => {
+      routeAvailability(UNAVAILABLE);
+      routeCdx(NOT_ROWS);
+
+      const result = await runWithRetries(() =>
+        runToolContract(iaFindSnapshots, {
+          url: 'example.com',
+          mode: 'closest',
+          timestamp: '20200101',
+        }),
+      );
+
+      expectFailed(result, JsonRpcErrorCode.ServiceUnavailable, 'availability_unavailable');
+      expect(contentText(result)).toMatch(
+        /closest-capture lookup for example\.com near 20200101 did not complete/,
+      );
+      expect(calls(isCdx)).toHaveLength(1);
+    });
+
+    it('ia_get_snapshot, after an empty Availability answer: content_fetch_failed, with no replay', async () => {
+      routeAvailability(EMPTY_AVAILABILITY);
+      routeCdx(NOT_ROWS);
+
+      const result = await runToolContract(iaGetSnapshot, {
+        url: 'example.com',
+        timestamp: '2020',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'content_fetch_failed' },
+        },
+      });
+      expect(contentText(result)).toContain('CDX API returned JSON that is not a list of rows.');
+      expect(calls(isCdx)).toHaveLength(1);
+      expect(calls(isReplay)).toHaveLength(0);
+    });
   });
 });
 
@@ -1281,7 +1985,7 @@ describe('ia_get_snapshot', () => {
     });
 
     const sc = result.structuredContent as { text: string; notice?: string };
-    expect(sc.text.startsWith('news news')).toBe(true);
+    expect(sc.text.startsWith('news\nnews')).toBe(true);
     expect(sc.notice).toContain('first 4,194,304 bytes');
     expect(contentText(result)).toContain('first 4,194,304 bytes');
     expect(cancelled).toBe(true);
@@ -2078,6 +2782,225 @@ describe('ia_get_snapshot paging (#44)', () => {
     expect(result.structuredContent).toMatchObject({
       error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'non_text_capture' } },
     });
+  });
+});
+
+describe('ia_get_snapshot links (#67)', () => {
+  const CERN = {
+    url: 'http://info.cern.ch/hypertext/WWW/TheProject.html',
+    timestamp: '20151231164925',
+  };
+  /** The page markup of the CERN capture at 20151231164925 as Wayback replays it, its hrefs as rewritten. */
+  const CERN_PAGE = `<header>
+<title>The World Wide Web project</title>
+<nextid n="55">
+</header>
+<body>
+<h1>World Wide Web</h1>The WorldWideWeb (W3) is a wide-area<a name="0" href="WhatIs.html">
+hypermedia</a> information retrieval
+initiative aiming to give universal
+access to a large universe of documents.<p>
+Everything there is online about
+W3 is linked directly or indirectly
+to this document, including an <a name="24" href="Summary.html">executive
+summary</a> of the project, <a name="29" href="Administration/Mailing/Overview.html">Mailing lists</a>
+, <a name="30" href="Policy.html">Policy</a> , November's  <a name="34" href="News/9211.html">W3  news</a> ,
+<a name="41" href="FAQ/List.html">Frequently Asked Questions</a> .
+<dl>
+<dt><a name="44" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/Top.html">What's out there?</a>
+<dd> Pointers to the
+world's online information,<a name="45" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/bySubject/Overview.html"> subjects</a>
+, <a name="z54" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/WWW/Servers.html">W3 servers</a>, etc.
+<dt><a name="46" href="Help.html">Help</a>
+<dd> on the browser you are using
+<dt><a name="13" href="Status.html">Software Products</a>
+<dd> A list of W3 project
+components and their current state.
+(e.g. <a name="27" href="LineMode/Browser.html">Line Mode</a> ,X11 <a name="35" href="Status.html#35">Viola</a> ,  <a name="26" href="NeXT/WorldWideWeb.html">NeXTStep</a>
+, <a name="25" href="Daemon/Overview.html">Servers</a> , <a name="51" href="Tools/Overview.html">Tools</a> ,<a name="53" href="MailRobot/Overview.html"> Mail robot</a> ,<a name="52" href="Status.html#57">
+Library</a> )
+<dt><a name="47" href="Technical.html">Technical</a>
+<dd> Details of protocols, formats,
+program internals etc
+<dt><a name="40" href="Bibliography.html">Bibliography</a>
+<dd> Paper documentation
+on  W3 and references.
+<dt><a name="14" href="People.html">People</a>
+<dd> A list of some people involved
+in the project.
+<dt><a name="15" href="History.html">History</a>
+<dd> A summary of the history
+of the project.
+<dt><a name="37" href="Helping.html">How can I help</a> ?
+<dd> If you would like
+to support the web..
+<dt><a name="48" href="/web/20151231164925/http://info.cern.ch/hypertext/README.html">Getting code</a>
+<dd> Getting the code by<a name="49" href="LineMode/Defaults/Distribution.html">
+anonymous FTP</a> , etc.</a>
+</dl>
+</body>`;
+  const WWW = 'http://info.cern.ch/hypertext/WWW/';
+  const DATA = 'http://info.cern.ch/hypertext/DataSources/';
+  /** The page's 23 targets in document order: Status.html#35 and #57 fold into Status.html. */
+  const CERN_URLS = [
+    `${WWW}WhatIs.html`,
+    `${WWW}Summary.html`,
+    `${WWW}Administration/Mailing/Overview.html`,
+    `${WWW}Policy.html`,
+    `${WWW}News/9211.html`,
+    `${WWW}FAQ/List.html`,
+    `${DATA}Top.html`,
+    `${DATA}bySubject/Overview.html`,
+    `${DATA}WWW/Servers.html`,
+    `${WWW}Help.html`,
+    `${WWW}Status.html`,
+    `${WWW}LineMode/Browser.html`,
+    `${WWW}NeXT/WorldWideWeb.html`,
+    `${WWW}Daemon/Overview.html`,
+    `${WWW}Tools/Overview.html`,
+    `${WWW}MailRobot/Overview.html`,
+    `${WWW}Technical.html`,
+    `${WWW}Bibliography.html`,
+    `${WWW}People.html`,
+    `${WWW}History.html`,
+    `${WWW}Helping.html`,
+    'http://info.cern.ch/hypertext/README.html',
+    `${WWW}LineMode/Defaults/Distribution.html`,
+  ];
+  type Link = { text: string; url: string };
+  type Page = {
+    text: string;
+    char_offset: number;
+    has_more: boolean;
+    total_chars: number;
+    links?: Link[];
+    total_links?: number;
+    notice?: string;
+  };
+  const read = async (input: Record<string, unknown> = {}) => {
+    const result = await runToolContract(iaGetSnapshot, { ...CERN, ...input });
+    expect(result.isError).toBeFalsy();
+    return { page: result.structuredContent as Page, content: contentText(result) };
+  };
+
+  it('lists the CERN capture’s 23 link targets, resolved and folded, from its one replay request, on both surfaces', async () => {
+    routeReplay(replay(CERN_PAGE));
+
+    const { page, content } = await read({ include_links: true });
+
+    expect(calls(isReplay)).toHaveLength(1);
+    expect(page.links?.map((l) => l.url)).toEqual(CERN_URLS);
+    expect(page.total_links).toBe(23);
+    expect(page.links?.[0]).toStrictEqual({ text: 'hypermedia', url: `${WWW}WhatIs.html` });
+    expect(page.links).toContainEqual({ text: "What's out there?", url: `${DATA}Top.html` });
+    expect(page.links?.filter((l) => l.url.startsWith(`${WWW}Status.html`))).toStrictEqual([
+      { text: 'Software Products', url: `${WWW}Status.html` },
+    ]);
+    // Each label reads in the page text as it does in the list.
+    for (const l of page.links ?? []) expect(page.text).toContain(l.text);
+    expect(content).toContain(
+      `**Links on this page:** 23 of 23\n\n- [hypermedia](<${WWW}WhatIs.html>)\n- [executive summary](<${WWW}Summary.html>)`,
+    );
+    expect(content).toContain(`- [What's out there?](<${DATA}Top.html>)`);
+  });
+
+  it('without include_links, sends the same one request and answers the same but for links and total_links', async () => {
+    routeReplay(replay(CERN_PAGE));
+
+    const without = await read();
+    const withLinks = await read({ include_links: true });
+
+    expect(calls(isReplay)).toHaveLength(2);
+    expect(Object.keys(without.page)).not.toContain('links');
+    expect(Object.keys(without.page)).not.toContain('total_links');
+    const { links: _links, total_links: _total, ...rest } = withLinks.page;
+    expect(rest).toStrictEqual(without.page);
+    expect(
+      withLinks.content.slice(0, withLinks.content.indexOf('\n\n**Links on this page:**')),
+    ).toBe(without.content);
+  });
+
+  it('gives each link to one page of a read that follows has_more, every next-page notice naming include_links', async () => {
+    routeReplay(replay(CERN_PAGE));
+
+    const seen: Link[] = [];
+    let pages = 0;
+    for (let char_offset = 0; ; char_offset += 300) {
+      const { page, content } = await read({ include_links: true, char_offset, max_chars: 300 });
+      pages++;
+      expect(page.total_links).toBe(23);
+      seen.push(...(page.links ?? []));
+      if (!page.has_more) break;
+      expect(page.notice).toContain(`char_offset ${char_offset + 300}, and include_links true`);
+      expect(content).toContain(page.notice);
+    }
+
+    expect(pages).toBeGreaterThan(3);
+    expect(calls(isReplay)).toHaveLength(pages);
+    expect(seen.map((l) => l.url)).toEqual(CERN_URLS);
+  });
+
+  it('lists no links for a capture that is not HTML, sending the same requests as without', async () => {
+    const json = JSON.stringify({
+      see: 'https://example.com/',
+      a: '<a href="https://example.com/">x</a>',
+    });
+    routeReplay((request) =>
+      request.url.includes('20200116122222id_/')
+        ? new Response(new TextEncoder().encode(json), {
+            headers: { 'content-type': 'application/json' },
+          })
+        : new Response(new TextEncoder().encode('rewritten'), {
+            headers: { 'content-type': 'application/json' },
+          }),
+    );
+    const github = { url: 'https://api.github.com/', timestamp: '20200116122222' };
+
+    const without = await runToolContract(iaGetSnapshot, github);
+    const sentWithout = calls(isReplay).length;
+    const withLinks = await runToolContract(iaGetSnapshot, { ...github, include_links: true });
+
+    expect(sentWithout).toBe(2);
+    expect(calls(isReplay)).toHaveLength(4);
+    expect(withLinks.structuredContent).toMatchObject({ text: json, links: [], total_links: 0 });
+    expect(contentText(withLinks)).toContain('**Links on this page:** 0 of 0');
+    expect(without.structuredContent).not.toHaveProperty('links');
+  });
+
+  it('resolves relative hrefs against the capture an archived redirect led to, leaving that page out, on both surfaces', async () => {
+    const asked = 'https://web.archive.org/web/20240515003448/http://example.com/';
+    const target = 'https://web.archive.org/web/20240515003448/http://example.com/home/index.html';
+    http.route({
+      match: asked,
+      respond: archivedRedirect(
+        302,
+        'Wed, 15 May 2024 00:34:48 GMT',
+        '/web/20240515003448/http://example.com/home/index.html',
+      ),
+    });
+    http.route({
+      match: target,
+      respond: replay('<a href="about.html">About</a> <a href="index.html">Home</a>'),
+    });
+    routeUnrouted();
+
+    const result = await runToolContract(iaGetSnapshot, {
+      url: 'http://example.com/',
+      timestamp: '20240515003448',
+      include_links: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const page = result.structuredContent as Page & { replay_url: string };
+    expect(page.replay_url).toBe(target);
+    expect(page.links).toStrictEqual([
+      { text: 'About', url: 'http://example.com/home/about.html' },
+    ]);
+    expect(page.total_links).toBe(1);
+    expect(contentText(result)).toContain(
+      '**Links on this page:** 1 of 1\n\n- [About](<http://example.com/home/about.html>)',
+    );
+    expect(replayUrls()).toEqual([asked, target]);
   });
 });
 
@@ -3501,20 +4424,23 @@ describe('timestamp forms reach every Wayback endpoint as digits (#48)', () => {
     expect(query.get('to')).toBe(to);
   });
 
-  it('still answers a reversed range with no_snapshots, as CDX does', async () => {
+  it('answers a reversed range as an empty list, as CDX does, after one request', async () => {
     routeCdx(() => Response.json([]));
 
     const result = await runToolContract(iaFindSnapshots, {
       url: 'example.com',
       mode: 'history',
-      from: '20160101',
+      from: '2016-01-01',
       to: '20150101',
     });
 
-    expect(result.structuredContent).toMatchObject({
-      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_snapshots' } },
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      snapshots: [],
+      notice: 'No captures of this URL match from "20160101", to "20150101"; widen from and to.',
     });
     expect(calls(isCdx)).toHaveLength(1);
+    expect(searchOf(calls(isCdx)[0]?.request).get('from')).toBe('20160101');
   });
 
   it.each([

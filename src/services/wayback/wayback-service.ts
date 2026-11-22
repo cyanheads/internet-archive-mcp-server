@@ -16,7 +16,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, isRecord, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getUserAgent } from '@/config/server-config.js';
 import type { CallDeadline } from '../call-deadline.js';
-import { htmlToText } from '../html-text.js';
+import { type AnchoredText, htmlToText, htmlToTextAndAnchors } from '../html-text.js';
 import {
   bodyReadError,
   isHtmlPage,
@@ -32,10 +32,11 @@ import type {
   CdxHistoryResult,
   CdxRecord,
   ClosestSnapshot,
+  PageLink,
   RedirectDeadEnd,
   SnapshotContent,
 } from './types.js';
-import { captureOf, WAYBACK_HOSTS } from './wayback-capture-url.js';
+import { captureOf, hrefTarget, WAYBACK_HOSTS } from './wayback-capture-url.js';
 
 /** Parameters for fetching CDX capture history. */
 export interface FetchHistoryParams {
@@ -118,8 +119,29 @@ const CDX_FIELDS = 'timestamp,statuscode,mimetype,original,digest,length';
 /** Cursor keys use the tenant-scoped store; expiry is in seconds. */
 const HISTORY_CURSOR_PREFIX = 'ia-history-v1/';
 const HISTORY_CURSOR_TTL = 3_600;
+/** The continuation notice for an exact URL paged by a CDX key the server did not issue. */
 const LEGACY_HISTORY_NOTICE =
-  'CDX raw continuation can omit captures when collapse is enabled. For complete paging on a stable index, restart with an exact URL and timestamp:N collapse (N=1–14).';
+  'CDX raw continuation can omit captures at page boundaries. Restarting without resume_key pages an exact URL through server resume keys, which omit none on a stable index.';
+/** The continuation notice for a wildcard url, which always pages by CDX's own key. */
+const WILDCARD_HISTORY_NOTICE =
+  'CDX raw continuation pages a wildcard url and can omit the row at each page boundary or return it as a later capture of the same URL; a limit that holds the whole listing (up to 10,000 rows) avoids both.';
+
+/**
+ * Where a resumed `digest` page starts within the second it resumes at: the digest of the
+ * lookahead row it resumes on, and how many rows of the listing at that second earlier pages
+ * returned (`resumedDigestRows`).
+ */
+const DigestResume = z.object({
+  digest: z.string(),
+  returned: z.number().int().min(0),
+});
+type DigestResume = z.infer<typeof DigestResume>;
+
+/**
+ * A server history cursor: the query it continues and the unreturned lookahead row's timestamp,
+ * which the next page resumes at inclusively. Only a `digest` cursor carries `digestResume`, so a
+ * cursor written before it existed still parses.
+ */
 const HistoryCursor = z.object({
   url: z.string(),
   collapse: z.string(),
@@ -127,7 +149,42 @@ const HistoryCursor = z.object({
   to: z.string().optional(),
   statusFilter: z.string().optional(),
   nextTimestamp: z.string().regex(/^\d{14}$/),
+  digestResume: DigestResume.optional(),
 });
+
+/**
+ * How CDX reads a `url`: a leading `*.` asks for a domain and its subdomains, a trailing `*` for
+ * every URL under a prefix, and anything else is one exact URL — a `*` elsewhere in it included,
+ * which CDX matches literally.
+ */
+export function cdxMatchType(url: string): 'domain' | 'exact' | 'prefix' {
+  if (url.startsWith('*.')) return 'domain';
+  return url.endsWith('*') ? 'prefix' : 'exact';
+}
+
+/**
+ * The rows of a resumed `digest` page from its lookahead row on. CDX restarts the collapse at the
+ * page's `from`, the lookahead's second, so it first re-lists the rows of the listing at that second
+ * which earlier pages returned, preceded by a capture the unpaged listing collapsed whenever one
+ * shares that second: the lookahead's digest, which differs from the row before it in the listing,
+ * tells whether that capture is there. Dropping by count rather than by the first row carrying the
+ * digest keeps a second whose digests run A, B, A from resuming on its first A again.
+ */
+function resumedDigestRows(
+  records: CdxRecord[],
+  { timestamp, digest, returned }: DigestResume & { timestamp: string },
+): CdxRecord[] {
+  const atResume = (i: number) => records[i]?.timestamp === timestamp;
+  let drop = 0;
+  while (drop < returned && atResume(drop)) drop++;
+  if (
+    atResume(drop + 1) &&
+    records[drop]?.digest !== digest &&
+    records[drop + 1]?.digest === digest
+  )
+    drop++;
+  return records.slice(drop);
+}
 
 /** CDX rows read around the requested timestamp when the Availability API cannot answer. */
 const CDX_CLOSEST_WINDOW = 10;
@@ -253,9 +310,17 @@ export class WaybackService {
   /**
    * Fetch paginated capture history from the CDX API. Every CDX request — the page, and the
    * re-query a cursor-storage outage falls back to — runs under what remains of the call's
-   * `deadline`. Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a
-   * 429 or a timeout (after one request), an HTML page, an unparseable body, or the deadline
-   * running out, mid-request or mid-backoff.
+   * `deadline`. A page with no `records` is CDX listing no rows for the query, and nothing
+   * else. Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429 or a
+   * timeout (after one request), an HTML page, an unparseable body or JSON that is not a list
+   * of rows (after retries), or the deadline running out, mid-request or mid-backoff.
+   *
+   * An exact URL pages through server cursors under every collapse: each page asks CDX for one
+   * row past `limit`, and the next page resumes at that unreturned lookahead row's timestamp,
+   * inclusively, sending no CDX key. A resumed `digest` page also drops what CDX re-lists ahead
+   * of the lookahead (`resumedDigestRows`), asking for that many more rows. A wildcard url, or a
+   * resume key the server did not issue, pages by CDX's own key, with a notice of what that can
+   * omit whenever a key is returned or consumed.
    */
   async fetchHistory(
     params: FetchHistoryParams,
@@ -264,6 +329,7 @@ export class WaybackService {
   ): Promise<CdxHistoryResult> {
     let query = params;
     let originalBounds = params.from;
+    let digestResume: (DigestResume & { timestamp: string }) | undefined;
     const token = params.resumeKey;
     const serverCursor = token?.startsWith(HISTORY_CURSOR_PREFIX);
     if (token && serverCursor) {
@@ -292,27 +358,31 @@ export class WaybackService {
         }
       }
       originalBounds = stored.from;
+      if (stored.digestResume)
+        digestResume = { ...stored.digestResume, timestamp: stored.nextTimestamp };
       query = { ...stored, limit: params.limit, from: stored.nextTimestamp };
     }
     const collapse = query.collapse ?? 'timestamp:8';
-    const exact = !query.url.includes('*');
-    const eligible =
-      exact &&
-      /^timestamp:(?:[1-9]|1[0-4])$/.test(collapse) &&
-      (!token || serverCursor) &&
-      !!ctx.state;
-    if (!eligible) {
+    const exact = cdxMatchType(query.url) === 'exact';
+    if (!exact || (token && !serverCursor) || !ctx.state) {
       const result = await this.historyPage(query, ctx, deadline);
-      return { ...result, ...((token || result.resumeKey) && { notice: LEGACY_HISTORY_NOTICE }) };
+      const notice = exact ? LEGACY_HISTORY_NOTICE : WILDCARD_HISTORY_NOTICE;
+      return { ...result, ...((token || result.resumeKey) && { notice }) };
     }
     const limit = query.limit ?? 100;
-    const result = await this.historyPage({ ...query, limit: limit + 1 }, ctx, deadline);
-    const lookahead = result.records[limit];
+    // At most the rows earlier pages returned at the resumed second, and one collapsed capture.
+    const droppable = digestResume ? digestResume.returned + 1 : 0;
+    const page = await this.historyPage({ ...query, limit: limit + 1 + droppable }, ctx, deadline);
+    const records = digestResume ? resumedDigestRows(page.records, digestResume) : page.records;
+    const dropped = page.records.length - records.length;
+    const lookahead = records[limit];
     if (!lookahead)
       return {
-        ...result,
-        ...(result.resumeKey ? { notice: LEGACY_HISTORY_NOTICE } : { complete: true }),
+        ...page,
+        records,
+        ...(page.resumeKey ? { notice: LEGACY_HISTORY_NOTICE } : { complete: true }),
       };
+    const returned = records.slice(0, limit);
     const key = `${HISTORY_CURSOR_PREFIX}${crypto.randomUUID()}`;
     // Preserve original bounds in the cursor, separately from the inclusive seek bound.
     const cursor = {
@@ -322,13 +392,24 @@ export class WaybackService {
       ...(query.to && { to: query.to }),
       ...(query.statusFilter && { statusFilter: query.statusFilter }),
       nextTimestamp: lookahead.timestamp,
+      ...(collapse === 'digest' && {
+        digestResume: {
+          digest: lookahead.digest,
+          // The listing's rows at the lookahead's second before it: this page's, plus those
+          // earlier pages returned when this page resumed at that same second.
+          returned:
+            returned.filter((r) => r.timestamp === lookahead.timestamp).length +
+            (digestResume?.timestamp === lookahead.timestamp ? digestResume.returned : 0),
+        } satisfies DigestResume,
+      }),
     };
     try {
       await ctx.state.set(key, cursor, { ttl: HISTORY_CURSOR_TTL });
     } catch (error) {
       ctx.signal.throwIfAborted();
-      // Generated cursor values are JSON-safe; a typed storage failure can degrade to
-      // the legacy path. Re-query at the original limit so its raw key loses no extra row.
+      // Generated cursor values are JSON-safe; a typed storage failure can degrade to the
+      // legacy path. Re-query at the original limit, plus the rows a resumed digest page
+      // dropped ahead of it, so its raw key loses no extra row.
       if (
         !(error instanceof McpError) ||
         ![
@@ -339,10 +420,14 @@ export class WaybackService {
         ].includes(error.code)
       )
         throw error;
-      const raw = await this.historyPage(query, ctx, deadline);
-      return { ...raw, notice: `History cursor storage is unavailable. ${LEGACY_HISTORY_NOTICE}` };
+      const raw = await this.historyPage({ ...query, limit: limit + dropped }, ctx, deadline);
+      return {
+        ...raw,
+        records: raw.records.slice(dropped),
+        notice: `History cursor storage is unavailable. ${LEGACY_HISTORY_NOTICE}`,
+      };
     }
-    return { records: result.records.slice(0, limit), resumeKey: key };
+    return { records: returned, resumeKey: key };
   }
 
   /** One CDX page, retaining the raw trailer for legacy paging and storage fallback. */
@@ -365,13 +450,11 @@ export class WaybackService {
       if (params.statusFilter) qp.set('filter', `statuscode:${params.statusFilter}`);
       if (params.resumeKey) qp.set('resumeKey', params.resumeKey);
 
-      const rows = await this.queryCdx(qp, ctx, limits);
-      if (rows.length === 0) {
+      // First row is the header: ["timestamp","statuscode","mimetype","original","digest","length"]
+      const [header, ...body] = await this.queryCdx(qp, ctx, limits);
+      if (!header) {
         return { records: [] };
       }
-
-      // First row is the header: ["timestamp","statuscode","mimetype","original","digest","length"]
-      const header = rows[0] as string[];
       const colIndex = (col: string) => header.indexOf(col);
 
       /**
@@ -382,34 +465,26 @@ export class WaybackService {
        * both rows as captures and drop the key.
        */
       let resumeKey: string | undefined;
-      let dataRows = rows.slice(1);
+      let dataRows = body;
 
       if (dataRows.length >= 2) {
         const secondLast = dataRows[dataRows.length - 2];
         const last = dataRows[dataRows.length - 1];
-        const key = Array.isArray(last) && last.length === 1 ? last[0] : undefined;
-        if (
-          Array.isArray(secondLast) &&
-          secondLast.every((cell) => cell === '') &&
-          typeof key === 'string' &&
-          key !== ''
-        ) {
+        const key = last?.length === 1 ? last[0] : undefined;
+        if (secondLast?.every((cell) => cell === '') && key) {
           resumeKey = key;
           dataRows = dataRows.slice(0, -2);
         }
       }
 
-      const records: CdxRecord[] = dataRows.map((row) => {
-        const r = row as string[];
-        return {
-          timestamp: r[colIndex('timestamp')] ?? '',
-          statuscode: r[colIndex('statuscode')] ?? '',
-          mimetype: r[colIndex('mimetype')] ?? '',
-          original: r[colIndex('original')] ?? '',
-          digest: r[colIndex('digest')] ?? '',
-          ...(r[colIndex('length')] ? { length: r[colIndex('length')] } : {}),
-        };
-      });
+      const records: CdxRecord[] = dataRows.map((r) => ({
+        timestamp: r[colIndex('timestamp')] ?? '',
+        statuscode: r[colIndex('statuscode')] ?? '',
+        mimetype: r[colIndex('mimetype')] ?? '',
+        original: r[colIndex('original')] ?? '',
+        digest: r[colIndex('digest')] ?? '',
+        ...(r[colIndex('length')] ? { length: r[colIndex('length')] } : {}),
+      }));
 
       return { records, ...(resumeKey ? { resumeKey } : {}) };
     });
@@ -434,6 +509,10 @@ export class WaybackService {
    * `truncatedAtBytes` set — then decoded with the charset the response declares, or the one
    * Wayback guessed for the capture.
    *
+   * With `options.links`, `links` lists an HTML page's links, read by `pageLinks` from the
+   * same bytes, and so the same scan, as its text; a capture read as another text type has
+   * none, `[]`. Without it no link is read and `links` is absent.
+   *
    * A non-2xx carrying `Memento-Datetime` is an archived error page, not a Wayback failure:
    * it is not retried and throws `NotFound` with `status` and `captureTimestamp`. Any other
    * 4xx but a 404, 408, 425, or 429 is Wayback refusing the request — a 403 is its answer
@@ -451,6 +530,7 @@ export class WaybackService {
     snapshotUrl: string,
     ctx: Context,
     deadline: CallDeadline,
+    options: { links?: boolean } = {},
   ): Promise<SnapshotContent> {
     const served = await this.retry(REPLAY, ctx, deadline, async (limits) => {
       const { response, replayUrl, redirects } = await this.followReplay(
@@ -464,7 +544,8 @@ export class WaybackService {
       const mediaType = mediaTypeOf(response.headers.get('content-type'));
       const kind = bodyKind(mediaType);
       if (kind === 'html') {
-        return { ...capture, body: await readBody(response, 'html', guessedCharset) };
+        const linksOf = options.links ? replayUrl : undefined;
+        return { ...capture, body: await readBody(response, 'html', guessedCharset, linksOf) };
       }
       await response.body?.cancel();
       if (kind === 'other') {
@@ -488,6 +569,7 @@ export class WaybackService {
       status: served.status,
       ...(served.redirects.length > 0 && { redirects: served.redirects }),
       ...(body.truncated && { truncatedAtBytes: REPLAY_BYTE_CEILING }),
+      ...(options.links && { links: body.links ?? [] }),
     };
   }
 
@@ -808,7 +890,7 @@ export class WaybackService {
       },
     );
 
-    const captures = rows.slice(1) as string[][];
+    const captures = rows.slice(1);
     const [captureTs, original, status = '-'] =
       captures.find((row) => row[2] === '200') ?? captures[0] ?? [];
     if (!captureTs || !original) return;
@@ -817,20 +899,33 @@ export class WaybackService {
   }
 
   /**
-   * Rows of a CDX JSON query. Throws `cdx_unavailable` on a 5xx, a 429, another 4xx, an
-   * HTML page, or unparseable text, and `no_snapshot_available` on a `NOT_SERVED` status.
+   * Rows of a CDX JSON query, empty only when CDX listed none. Throws `cdx_unavailable` on a
+   * 5xx, a 429, another 4xx, an HTML page, unparseable text, or JSON that is not a list of
+   * rows of strings, and `no_snapshot_available` on a `NOT_SERVED` status.
    */
   private async queryCdx(
     params: URLSearchParams,
     ctx: Context,
     limits: RequestLimits,
-  ): Promise<unknown[][]> {
+  ): Promise<string[][]> {
     const response = await this.fetchUpstream(`${CDX_BASE}?${params}`, CDX_API, ctx, {
       ...limits,
       target: params.get('url') ?? '',
     });
     const rows = await readJson(response, CDX_API, ctx);
-    return Array.isArray(rows) ? rows : [];
+    if (
+      !Array.isArray(rows) ||
+      !rows.every(
+        (row): row is string[] =>
+          Array.isArray(row) && row.every((cell) => typeof cell === 'string'),
+      )
+    ) {
+      throw serviceUnavailable(
+        `${CDX_API.name} returned JSON that is not a list of rows.`,
+        declaredReason(CDX_API, ctx),
+      );
+    }
+    return rows;
   }
 
   /**
@@ -1211,20 +1306,26 @@ function bodyKind(mediaType: string | undefined): 'html' | 'text' | 'other' {
     : 'other';
 }
 
-/** The text of a replay body and whether the read stopped at `REPLAY_BYTE_CEILING`. */
+/**
+ * The text of a replay body, whether the read stopped at `REPLAY_BYTE_CEILING`, and an HTML
+ * page's links when they were asked for.
+ */
 interface ReplayBody {
+  links?: PageLink[];
   text: string;
   truncated: boolean;
 }
 
 /**
  * A replay body streamed up to `REPLAY_BYTE_CEILING` and decoded with the charset its
- * response declares, else `guessedCharset`; an HTML body is then stripped to its text.
+ * response declares, else `guessedCharset`; an HTML body is then stripped to its text, and
+ * given `linksOf`, the replay URL it was served from, its links are read with that text.
  */
 async function readBody(
   response: Response,
   kind: 'html' | 'text',
   guessedCharset: string | null,
+  linksOf?: string,
 ): Promise<ReplayBody> {
   const { bytes, truncated } = await readCapped(response, REPLAY_BYTE_CEILING).catch(
     (err: unknown) => {
@@ -1232,10 +1333,38 @@ async function readBody(
     },
   );
   const source = { contentType: response.headers.get('content-type'), guessedCharset, truncated };
-  return {
-    text: kind === 'html' ? htmlToText(decodeHtml(bytes, source)) : decodeText(bytes, source),
-    truncated,
-  };
+  if (kind === 'text') return { text: decodeText(bytes, source), truncated };
+  const html = decodeHtml(bytes, source);
+  if (linksOf === undefined) return { text: htmlToText(html), truncated };
+  const page = htmlToTextAndAnchors(html);
+  return { text: page.text, truncated, links: pageLinks(page, linksOf) };
+}
+
+/**
+ * The links of a page served from `replayUrl`: each anchor's target read by `hrefTarget`
+ * against the page's base — the first `<base href>`, read the same way against the page's
+ * own URL, or else that URL, the original `replayUrl` names. A target is kept when it is
+ * http(s) and, its fragment dropped, is not the page's own URL. Each target is listed once,
+ * at its first anchor, with the first non-empty text among its anchors.
+ */
+function pageLinks({ anchors, baseHref }: AnchoredText, replayUrl: string): PageLink[] {
+  const original = captureOf(replayUrl)?.original;
+  const page = original === undefined ? undefined : (URL.parse(original) ?? undefined);
+  const base = (baseHref !== undefined && hrefTarget(baseHref, page)) || page;
+  const self = page && withoutFragment(page);
+  const links = new Map<string, PageLink>();
+  for (const { href, offset, text } of anchors) {
+    const target = hrefTarget(href, base);
+    if (!target || !HTTP_PROTOCOLS.has(target.protocol)) continue;
+    const url = withoutFragment(target);
+    const listed = links.get(url);
+    if (listed) {
+      if (listed.text === '') listed.text = text;
+    } else if (url !== self) {
+      links.set(url, { offset, text, url });
+    }
+  }
+  return [...links.values()];
 }
 
 // --- Init/accessor pattern ---

@@ -3,6 +3,7 @@
  * @module tests/tools/ia-get-item.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -694,6 +695,445 @@ describe('iaGetItem', () => {
       const singles = { publisher: 'a', isbn: '1', oclc_id: '3', lccn: '5' };
       expect(iaGetItem.output.parse({ ...base, ...lists })).toMatchObject(lists);
       expect(iaGetItem.output.parse({ ...base, ...singles })).toMatchObject(singles);
+    });
+  });
+
+  describe('rights, licenseurl, volume, mediatype, and Open Library IDs as strings or lists', () => {
+    const WIDENED = [
+      'mediatype',
+      'licenseurl',
+      'rights',
+      'volume',
+      'openlibrary_edition',
+      'openlibrary_work',
+    ] as const;
+
+    /** format() text for one output with no files. */
+    const render = (fields: Record<string, unknown>) =>
+      (
+        iaGetItem.format!({ identifier: 'x', file_count: 0, files: [], ...fields })[0] as {
+          text: string;
+        }
+      ).text;
+
+    it('returns a list in each of the six fields through output validation, one item per value', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: {
+          identifier: 'x',
+          mediatype: ['texts', 'texts'],
+          licenseurl: [
+            'https://opensource.org/licenses/MIT',
+            'http://creativecommons.org/licenses/by-nc-sa/3.0',
+          ],
+          rights: ['Accessible without restriction.', 'Archived under fair use.'],
+          volume: ['1931', '18'],
+          openlibrary_edition: ['OL1M', 'OL2M'],
+          openlibrary_work: ['OL1W', 'OL2W'],
+        },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'x' });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        mediatype: ['texts', 'texts'],
+        licenseurl: [
+          'https://opensource.org/licenses/MIT',
+          'http://creativecommons.org/licenses/by-nc-sa/3.0',
+        ],
+        rights: ['Accessible without restriction.', 'Archived under fair use.'],
+        volume: ['1931', '18'],
+        openlibrary_edition: ['OL1M', 'OL2M'],
+        openlibrary_work: ['OL1W', 'OL2W'],
+      });
+      expect(contentText(result)).toBe(
+        '# x\n**Identifier:** x\n**Media Type:**\n\n- texts\n- texts\n\n**Volume:**\n\n- 1931\n- 18\n\n**Open Library Edition:**\n\n- OL1M\n- OL2M\n\n**Open Library Work:**\n\n- OL1W\n- OL2W\n\n**License:**\n\n- [https://opensource.org/licenses/MIT](<https://opensource.org/licenses/MIT>)\n- [http://creativecommons.org/licenses/by-nc-sa/3.0](<http://creativecommons.org/licenses/by-nc-sa/3.0>)\n\n**Rights:**\n\n- Accessible without restriction.\n- Archived under fair use.\n\n**Files (0):**',
+      );
+    });
+
+    it('renders a string or one-value list license as an inline link, and a string rights statement escaped', () => {
+      expect(render({ licenseurl: 'https://opensource.org/licenses/MIT', rights: '*r*' })).toBe(
+        '# x\n**Identifier:** x\n**License:** [https://opensource.org/licenses/MIT](<https://opensource.org/licenses/MIT>)\n**Rights:** \\*r\\*\n\n**Files (0):**',
+      );
+      expect(render({ licenseurl: ['https://opensource.org/licenses/MIT'], rights: ['*r*'] })).toBe(
+        '# x\n**Identifier:** x\n**License:** [https://opensource.org/licenses/MIT](<https://opensource.org/licenses/MIT>)\n**Rights:** \\*r\\*\n\n**Files (0):**',
+      );
+    });
+
+    it('renders a license value that is not a web URL as literal text, never a link', () => {
+      expect(render({ licenseurl: 'CC0 1.0' })).toBe(
+        '# x\n**Identifier:** x\n**License:** CC0 1.0\n\n**Files (0):**',
+      );
+      expect(
+        render({ licenseurl: ['javascript:alert(1)', 'https://example.org/a_(b)', 'CC0 1.0'] }),
+      ).toBe(
+        '# x\n**Identifier:** x\n**License:**\n\n- javascript:alert(1)\n- [https://example.org/a\\_(b)](<https://example.org/a_(b)>)\n- CC0 1.0\n\n**Files (0):**',
+      );
+    });
+
+    it.each([
+      ['a relative path', '/licenses/mit', '/licenses/mit'],
+      ['an ftp URL', 'ftp://example.org/l', 'ftp://example.org/l'],
+      ['a URL with a line break', 'https://a.org/\nx', 'https://a.org/\\\nx'],
+      ['Markdown syntax', '*CC* [x](y)', '\\*CC\\* \\[x\\](y)'],
+      ['a URL with a carriage return', 'https://a.org/\rx', 'https://a.org/\\\nx'],
+    ])('renders a license value that is %s once, escaped', (_label, licenseurl, rendered) => {
+      expect(render({ licenseurl })).toBe(
+        `# x\n**Identifier:** x\n**License:** ${rendered}\n\n**Files (0):**`,
+      );
+    });
+
+    it('links an http or https license URL in any letter case, as markdownLink does', () => {
+      expect(render({ licenseurl: ['HTTPS://Example.org/A', 'http://a.org/b c'] })).toBe(
+        '# x\n**Identifier:** x\n**License:**\n\n- [HTTPS://Example.org/A](<HTTPS://Example.org/A>)\n- [http://a.org/b c](<http://a.org/b c>)\n\n**Files (0):**',
+      );
+    });
+
+    it('keeps the rights items apart from the access line after them, commas and line breaks inside their item', () => {
+      expect(
+        render({ rights: ['a, b', 'c\nd'], access_restricted: true, description: 'Desc' }),
+      ).toBe(
+        '# x\n**Identifier:** x\n**Rights:**\n\n- a, b\n- c\\\nd\n\n**Access Restricted:** true\n\n**Description:** Desc\n\n**Files (0):**',
+      );
+    });
+
+    it('accepts a single value or a list for each of the six fields', () => {
+      const base = { identifier: 'x', file_count: 0, files: [] };
+      for (const key of WIDENED) {
+        expect(iaGetItem.output.parse({ ...base, [key]: ['a', 'b'] })).toHaveProperty(key, [
+          'a',
+          'b',
+        ]);
+        expect(iaGetItem.output.parse({ ...base, [key]: 'a' })).toHaveProperty(key, 'a');
+        expect(() => iaGetItem.output.parse({ ...base, [key]: 5 })).toThrow();
+      }
+    });
+
+    it('declares each of the six fields as a string or a list of strings', () => {
+      const { properties } = z.toJSONSchema(iaGetItem.output) as {
+        properties: Record<string, { anyOf?: { type: string; items?: { type: string } }[] }>;
+      };
+      for (const key of WIDENED) {
+        expect(properties[key]?.anyOf?.map((s) => [s.type, s.items?.type])).toEqual([
+          ['string', undefined],
+          ['array', 'string'],
+        ]);
+      }
+    });
+  });
+
+  describe('publicdate and addeddate (when the item reached the Archive)', () => {
+    it('returns both upload dates on both surfaces, after the publication date', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: {
+          identifier: 'prideprejudice00aust',
+          title: 'Pride and prejudice',
+          date: '1894',
+          publicdate: '2007-07-26 11:49:20',
+          addeddate: '2007-07-26 11:49:10',
+          language: 'eng',
+        },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'prideprejudice00aust' });
+
+      expect(result.isError).toBeFalsy();
+      expect(Object.keys(result.structuredContent as object)).toEqual([
+        'identifier',
+        'title',
+        'date',
+        'publicdate',
+        'addeddate',
+        'language',
+        'file_count',
+        'files',
+      ]);
+      expect(result.structuredContent).toMatchObject({
+        publicdate: '2007-07-26 11:49:20',
+        addeddate: '2007-07-26 11:49:10',
+      });
+      expect(contentText(result)).toBe(
+        '# Pride and prejudice\n**Identifier:** prideprejudice00aust\n**Date:** 1894\n**Public Date:** 2007-07-26 11:49:20\n**Added Date:** 2007-07-26 11:49:10\n**Language:** eng\n\n**Files (0):**',
+      );
+    });
+
+    it('omits either date the record lacks, on both surfaces, and the call succeeds', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: 'openmind_ep431', date: '2020', addeddate: '2020-01-02' },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'openmind_ep431' });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).not.toHaveProperty('publicdate');
+      expect(contentText(result)).toBe(
+        '# openmind_ep431\n**Identifier:** openmind_ep431\n**Date:** 2020\n**Added Date:** 2020-01-02\n\n**Files (0):**',
+      );
+    });
+
+    it('lists each value of a list-valued publicdate', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: 'x', publicdate: ['2007-07-26 11:49:20', '2008-01-01 00:00:00'] },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'x' });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { publicdate: unknown }).publicdate).toEqual([
+        '2007-07-26 11:49:20',
+        '2008-01-01 00:00:00',
+      ]);
+      expect(contentText(result)).toBe(
+        '# x\n**Identifier:** x\n**Public Date:**\n\n- 2007-07-26 11:49:20\n- 2008-01-01 00:00:00\n\n**Files (0):**',
+      );
+    });
+
+    it('describes date as the publication date only, pointing to the upload dates', () => {
+      const { properties } = z.toJSONSchema(iaGetItem.output) as {
+        properties: Record<string, { description?: string }>;
+      };
+      expect(JSON.stringify(z.toJSONSchema(iaGetItem.output))).not.toMatch(/or upload/);
+      expect(iaGetItem.description).toContain(
+        'description (as plain text), the publication date, when the item was made public and when it was added to the Archive, subjects,',
+      );
+      expect(properties.date?.description).toBe(
+        'Publication date when provided; a few records carry a list, relayed as received. For when the item reached the Archive, see publicdate and addeddate.',
+      );
+      expect(properties.publicdate?.description).toBe(
+        'When the item was made public on the Archive, as the Metadata API stores it: "YYYY-MM-DD HH:MM:SS" in UTC; a list is relayed as received. Nearly every item has it, dated or not.',
+      );
+      expect(properties.addeddate?.description).toBe(
+        'When the item was added to the Archive, as the Metadata API stores it: "YYYY-MM-DD HH:MM:SS" in UTC, or on some records a bare "YYYY-MM-DD"; a list is relayed as received.',
+      );
+    });
+  });
+
+  describe('each audio or video file’s title, track, and length, and the item’s runtime', () => {
+    const GD = 'gd77-05-08.sbd.hicks.4982.sbeok.shnf';
+    const url = (name: string) => `https://archive.org/download/${GD}/${name}`;
+    const link = (name: string) => `[${url(name)}](<${url(name)}>)`;
+
+    /** format() text for one output; files carry only their name and URL unless given more. */
+    const render = (fields: Record<string, unknown>) =>
+      (
+        iaGetItem.format!({ identifier: GD, file_count: 0, files: [], ...fields })[0] as {
+          text: string;
+        }
+      ).text;
+
+    it('returns each file’s title, track, and length on both surfaces, a nested item per detail', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: GD, title: 'Grateful Dead Live at Barton Hall' },
+        files: [
+          {
+            name: 'gd77-05-08eaton-d1t01.mp3',
+            downloadUrl: url('gd77-05-08eaton-d1t01.mp3'),
+            format: 'VBR MP3',
+            size: '8838656',
+            md5: '96d1fc48cae5e3bdd62c383d5b458a43',
+            title: 'Minglewood Blues',
+            track: '1',
+            length: '06:21',
+          },
+          {
+            name: 'gd77-05-08eaton-d1t01.ogg',
+            downloadUrl: url('gd77-05-08eaton-d1t01.ogg'),
+            format: 'Ogg Vorbis',
+            length: '381.1',
+          },
+          {
+            name: 'gd77-05-08eaton-d1t01.shn',
+            downloadUrl: url('gd77-05-08eaton-d1t01.shn'),
+            format: 'Shorten',
+            title: 'Minglewood Blues',
+            track: '1',
+            length: '232.58',
+            private: true,
+          },
+        ],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: GD });
+
+      expect(result.isError).toBeFalsy();
+      expect(JSON.stringify((result.structuredContent as { files: unknown }).files)).toBe(
+        JSON.stringify([
+          {
+            name: 'gd77-05-08eaton-d1t01.mp3',
+            title: 'Minglewood Blues',
+            track: '1',
+            length: '06:21',
+            format: 'VBR MP3',
+            size: '8838656',
+            md5: '96d1fc48cae5e3bdd62c383d5b458a43',
+            download_url: url('gd77-05-08eaton-d1t01.mp3'),
+          },
+          {
+            name: 'gd77-05-08eaton-d1t01.ogg',
+            length: '381.1',
+            format: 'Ogg Vorbis',
+            download_url: url('gd77-05-08eaton-d1t01.ogg'),
+          },
+          {
+            name: 'gd77-05-08eaton-d1t01.shn',
+            title: 'Minglewood Blues',
+            track: '1',
+            length: '232.58',
+            format: 'Shorten',
+            private: true,
+            download_url: url('gd77-05-08eaton-d1t01.shn'),
+          },
+        ]),
+      );
+      expect(contentText(result)).toBe(
+        `# Grateful Dead Live at Barton Hall\n**Identifier:** ${GD}\n\n**Files (3):**\n- **gd77-05-08eaton-d1t01.mp3** (VBR MP3, 8838656 bytes, md5:96d1fc48cae5e3bdd62c383d5b458a43): ${link('gd77-05-08eaton-d1t01.mp3')}\n  - **Title:** Minglewood Blues\n  - **Track:** 1\n  - **Length:** 06:21\n- **gd77-05-08eaton-d1t01.ogg** (Ogg Vorbis): ${link('gd77-05-08eaton-d1t01.ogg')}\n  - **Length:** 381.1\n- **gd77-05-08eaton-d1t01.shn** (Shorten, private): ${link('gd77-05-08eaton-d1t01.shn')}\n  - **Title:** Minglewood Blues\n  - **Track:** 1\n  - **Length:** 232.58`,
+      );
+    });
+
+    it('renders a file with none of the three on exactly its one line', () => {
+      const files = [
+        { name: 'gd77-05-08eaton-d1t01.png', format: 'PNG', size: '9430', md5: 'd1' },
+        { name: 'notes.txt' },
+      ].map((f) => ({ ...f, download_url: url(f.name) }));
+
+      expect(render({ file_count: 2, files })).toBe(
+        `# ${GD}\n**Identifier:** ${GD}\n\n**Files (2):**\n- **gd77-05-08eaton-d1t01.png** (PNG, 9430 bytes, md5:d1): ${link('gd77-05-08eaton-d1t01.png')}\n- **notes.txt**: ${link('notes.txt')}`,
+      );
+    });
+
+    it('keeps a title holding a comma, a line break, or Markdown syntax inside its own item', () => {
+      const files = [
+        {
+          name: 'a.mp3',
+          title: 'One, two\nthree',
+          track: '- 1',
+          length: '*06:21*',
+          download_url: url('a.mp3'),
+        },
+        { name: 'b.mp3', title: '# [x](y) <b>z</b>', download_url: url('b.mp3') },
+      ];
+
+      expect(render({ file_count: 2, files })).toBe(
+        `# ${GD}\n**Identifier:** ${GD}\n\n**Files (2):**\n- **a.mp3**: ${link('a.mp3')}\n  - **Title:** One, two\\\nthree\n  - **Track:** \\- 1\n  - **Length:** \\*06:21\\*\n- **b.mp3**: ${link('b.mp3')}\n  - **Title:** \\# \\[x\\](y) \\<b>z\\</b>`,
+      );
+      expect(files[0]?.title).toBe('One, two\nthree');
+    });
+
+    it('renders the track "0" a checksum file is catalogued with as its own item', () => {
+      const files = [
+        {
+          name: 'gd1977-05-08-d1.md5',
+          format: 'Checksums',
+          title: 'gd77-05-08.sbd.hicks.4982.sbeok.shnf_shn.zip',
+          track: '0',
+          download_url: url('gd1977-05-08-d1.md5'),
+        },
+      ];
+
+      expect(render({ file_count: 1, files })).toBe(
+        `# ${GD}\n**Identifier:** ${GD}\n\n**Files (1):**\n- **gd1977-05-08-d1.md5** (Checksums): ${link('gd1977-05-08-d1.md5')}\n  - **Title:** gd77-05-08.sbd.hicks.4982.sbeok.shnf_shn.zip\n  - **Track:** 0`,
+      );
+    });
+
+    it('returns runtime on both surfaces as a Runtime line, after the Open Library IDs', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: {
+          identifier: 'pride_and_prejudice_librivox',
+          title: 'Pride and Prejudice',
+          mediatype: 'audio',
+          openlibrary_work: 'OL66554W',
+          runtime: '13:06:44',
+        },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, {
+        identifier: 'pride_and_prejudice_librivox',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(Object.keys(result.structuredContent as object)).toEqual([
+        'identifier',
+        'title',
+        'mediatype',
+        'openlibrary_work',
+        'runtime',
+        'file_count',
+        'files',
+      ]);
+      expect(result.structuredContent).toMatchObject({ runtime: '13:06:44' });
+      expect(contentText(result)).toBe(
+        '# Pride and Prejudice\n**Identifier:** pride_and_prejudice_librivox\n**Media Type:** audio\n**Open Library Work:** OL66554W\n**Runtime:** 13:06:44\n\n**Files (0):**',
+      );
+    });
+
+    it('lists each value of a list runtime, through output validation', async () => {
+      mockService.getItem.mockResolvedValue({
+        metadata: { identifier: 'x', runtime: ['00:03:09', '27 min 13 sec'], image_count: 2 },
+        files: [],
+      });
+
+      const result = await runToolContract(iaGetItem, { identifier: 'x' });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { runtime: unknown }).runtime).toEqual([
+        '00:03:09',
+        '27 min 13 sec',
+      ]);
+      expect(contentText(result)).toBe(
+        '# x\n**Identifier:** x\n**Runtime:**\n\n- 00:03:09\n- 27 min 13 sec\n\n**Page Images:** 2\n\n**Files (0):**',
+      );
+    });
+
+    it('declares runtime as a string or a list, and title, track, and length as file strings', () => {
+      const schema = z.toJSONSchema(iaGetItem.output) as {
+        properties: Record<
+          string,
+          {
+            anyOf?: { type: string; items?: { type: string } }[];
+            items?: { properties: Record<string, { type: string; description: string }> };
+          }
+        >;
+      };
+      const { runtime, files } = schema.properties;
+      expect(runtime?.anyOf?.map((s) => [s.type, s.items?.type])).toEqual([
+        ['string', undefined],
+        ['array', 'string'],
+      ]);
+      const file = files?.items?.properties ?? {};
+      expect(Object.keys(file)).toEqual([
+        'name',
+        'title',
+        'track',
+        'length',
+        'format',
+        'size',
+        'md5',
+        'private',
+        'download_url',
+      ]);
+      expect([file.title?.type, file.track?.type, file.length?.type]).toEqual([
+        'string',
+        'string',
+        'string',
+      ]);
+      expect(() =>
+        iaGetItem.output.parse({
+          identifier: 'x',
+          file_count: 1,
+          files: [{ name: 'a', download_url: 'u', track: 1 }],
+        }),
+      ).toThrow();
+      expect(iaGetItem.description).toContain(
+        'volume, the running time of an audio or video item, the page-image count of a text item,',
+      );
+      expect(iaGetItem.description).toContain(
+        'and for an audio or video file the track title, track number, and duration it is catalogued with;',
+      );
     });
   });
 

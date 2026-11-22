@@ -553,5 +553,30 @@ describe('iaSearchItems', () => {
         '**1 total results** — Page 1 (1 shown, 50 per page)\n\n## Afganistan\n**Identifier:** 00hamigoog\n**Creator:** Berezovskīĭ, V.\n**Date:** 1908\n**Downloads:** 12\n**Collection:** americana\n',
       );
     });
+
+    it('renders publicdate after the date, inline as a string and one item per value as a list', () => {
+      const output = {
+        items: [
+          {
+            identifier: 'prideprejudice00aust',
+            date: '1894-01-01T00:00:00Z',
+            publicdate: '2007-07-26T11:49:20Z',
+            downloads: 5,
+          },
+          {
+            identifier: 'two-public-dates',
+            publicdate: ['2012-08-02T21:50:12Z', '2012-08-02T23:04:20Z'],
+          },
+        ],
+        total_found: 2,
+        page: 1,
+        rows: 50,
+      };
+      expect(() => iaSearchItems.output.parse(output)).not.toThrow();
+      const [block] = iaSearchItems.format!(output) as [{ text: string }];
+      expect(block.text).toBe(
+        '**2 total results** — Page 1 (2 shown, 50 per page)\n\n## prideprejudice00aust\n**Identifier:** prideprejudice00aust\n**Date:** 1894-01-01T00:00:00Z\n**Public Date:** 2007-07-26T11:49:20Z\n**Downloads:** 5\n\n## two-public-dates\n**Identifier:** two-public-dates\n**Public Date:**\n\n- 2012-08-02T21:50:12Z\n- 2012-08-02T23:04:20Z\n',
+      );
+    });
   });
 });

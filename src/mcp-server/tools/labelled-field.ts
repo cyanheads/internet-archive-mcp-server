@@ -12,22 +12,24 @@ import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
  * per value, and a blank line, so a value holding a comma or a line break keeps its boundaries. The
  * blank line after the label keeps an empty first item from reading as a setext underline; the one
  * after the list keeps the next line from continuing the last item. `note` is authored text kept on
- * the label line: after the value inline, after the label for a list. Items are appended one at a
- * time, since a list holds as many values as the upstream record sends.
+ * the label line: after the value inline, after the label for a list. `render` turns one value
+ * into inline Markdown — escaped text by default, a link for a URL field. Items are appended one at
+ * a time, since a list holds as many values as the upstream record sends.
  */
 export function pushLabelledField(
   lines: string[],
   label: string,
   value: string | string[],
   note = '',
+  render: (value: string) => string = escapeMarkdownInline,
 ): void {
   if (typeof value === 'string' || value.length < 2) {
     const text = typeof value === 'string' ? value : (value[0] ?? '');
-    lines.push(`**${label}:** ${escapeMarkdownInline(text)}${note}`);
+    lines.push(`**${label}:** ${render(text)}${note}`);
     return;
   }
   lines.push(`**${label}:**${note}`, '');
-  for (const v of value) lines.push(`- ${escapeMarkdownInline(v)}`);
+  for (const v of value) lines.push(`- ${render(v)}`);
   lines.push('');
 }
 

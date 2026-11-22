@@ -3,6 +3,7 @@
  * @module tests/tools/ia-get-text.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -500,6 +501,267 @@ describe('iaGetText', () => {
     });
   });
 
+  describe('find (#70)', () => {
+    const FILE = 'prideprejudice00aust_djvu.txt';
+    const TOKEN = '3f2a1b9c-0d4e-4f5a-8b6c-7d8e9f0a1b2c';
+    const noticeOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+    const errorOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (
+        result.structuredContent as {
+          error: { code: number; message: string; data: Record<string, unknown> };
+        }
+      ).error;
+    /** The service's answer to a search whose first match begins at 29,475. */
+    const hit = (extra: Record<string, unknown> = {}) => ({
+      text: 'Pemberley  as  with  it,',
+      hasMore: true,
+      charOffset: 29_475,
+      matchOffset: 29_475,
+      maxChars: 50_000,
+      sourceFile: FILE,
+      sourceFileBytes: 874_482,
+      nextContinuation: TOKEN,
+      ...extra,
+    });
+    /** The service's answer to a search from 29,476 that found nothing. */
+    const miss = (extra: Record<string, unknown> = {}) => ({
+      text: '',
+      hasMore: false,
+      charOffset: 29_476,
+      maxChars: 50_000,
+      sourceFile: FILE,
+      sourceFileBytes: 874_482,
+      ...extra,
+    });
+    const missNotice = (file: string, offset: string) =>
+      `No match for find in "${file}" from char_offset ${offset} to its end. OCR misreads and words hyphenated across line ends break a phrase; a shorter or different phrase may still match.`;
+
+    it('forwards find trimmed and reports a hit as match_offset and char_offset on both surfaces', async () => {
+      mockService.getTextContent.mockResolvedValue(hit());
+
+      const result = await runToolContract(iaGetText, {
+        identifier: 'prideprejudice00aust',
+        find: ' \tPEMBERLEY\n',
+      });
+
+      expect(mockService.getTextContent).toHaveBeenCalledWith(
+        'prideprejudice00aust',
+        50_000,
+        0,
+        expect.anything(),
+        CALL_DEADLINE,
+        { find: 'PEMBERLEY' },
+      );
+      expect(result.structuredContent).toEqual({
+        text: 'Pemberley  as  with  it,',
+        char_offset: 29_475,
+        match_offset: 29_475,
+        max_chars: 50_000,
+        has_more: true,
+        source_file: FILE,
+        source_file_bytes: 874_482,
+        next_continuation: TOKEN,
+      });
+      expect(contentText(result).split('\n')).toContain(
+        '**Max Chars:** 50,000 | **Offset:** 29,475 — more follows (next offset: 79,475) | **Match Offset:** 29,475',
+      );
+      expect(() => iaGetText.output.parse(result.structuredContent)).not.toThrow();
+    });
+
+    it('keeps a hit on the last characters of the file a hit, with no miss notice', async () => {
+      mockService.getTextContent.mockResolvedValue(
+        hit({ text: 'END.', hasMore: false, charOffset: 873_514, matchOffset: 873_514 }),
+      );
+
+      const result = await runToolContract(iaGetText, { identifier: 'pp', find: 'end.' });
+
+      expect(result.structuredContent).toMatchObject({
+        text: 'END.',
+        match_offset: 873_514,
+        has_more: false,
+      });
+      expect(noticeOf(result)).toBeUndefined();
+      expect(contentText(result).split('\n')).toContain(
+        '**Max Chars:** 50,000 | **Offset:** 873,514 — end of document | **Match Offset:** 873,514',
+      );
+    });
+
+    it('accepts find with continuation, and keeps continuation with char_offset ambiguous_pagination', async () => {
+      mockService.getTextContent.mockResolvedValue(hit());
+
+      const resumed = await runToolContract(iaGetText, {
+        identifier: 'pp',
+        continuation: TOKEN,
+        find: 'Pemberley',
+      });
+      const ambiguous = await runToolContract(iaGetText, {
+        identifier: 'pp',
+        continuation: TOKEN,
+        char_offset: 29_475,
+        find: 'Pemberley',
+      });
+
+      expect(resumed.isError).toBeFalsy();
+      expect(mockService.getTextContent).toHaveBeenCalledTimes(1);
+      expect(mockService.getTextContent.mock.calls[0]?.[5]).toEqual({
+        continuation: TOKEN,
+        find: 'Pemberley',
+      });
+      expect(errorOf(ambiguous)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'ambiguous_pagination' },
+      });
+    });
+
+    it('advertises find as optional with a 500-character maximum and rejects a longer one before any request', async () => {
+      const schema = z.toJSONSchema(iaGetText.input, { io: 'input' }) as {
+        properties: Record<string, { type?: string; maxLength?: number }>;
+        required: string[];
+      };
+      expect(schema.properties.find).toMatchObject({ type: 'string', maxLength: 500 });
+      expect(schema.required).toEqual(['identifier']);
+
+      for (const find of ['a'.repeat(501), `${'a'.repeat(499)}  `]) {
+        const result = await runToolContract(iaGetText, { identifier: 'pp', find });
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        expect(contentText(result)).toContain('find');
+      }
+      expect(mockService.getTextContent).not.toHaveBeenCalled();
+
+      mockService.getTextContent.mockResolvedValue(hit());
+      await runToolContract(iaGetText, { identifier: 'pp', find: 'a'.repeat(500) });
+      expect(mockService.getTextContent.mock.calls[0]?.[5]).toEqual({ find: 'a'.repeat(500) });
+    });
+
+    it.each([
+      ['empty', ''],
+      ['spaces', '   '],
+      ['a line break and a tab', '\n\t'],
+      ['U+0085, White_Space that String#trim keeps', '\u0085'],
+      ['U+3000 then U+0085', String.fromCodePoint(0x3000, 0x85)],
+      ['U+FEFF, which String#trim strips', String.fromCodePoint(0xfeff)],
+    ])('answers a find of only %s exactly as the call without find', async (_label, find) => {
+      mockService.getTextContent.mockResolvedValue({
+        text: 'Chapter 1.',
+        hasMore: true,
+        charOffset: 0,
+        maxChars: 50_000,
+        sourceFile: FILE,
+        textFiles: { count: 2, formats: ['DjVuTXT'], unformatted: 0 },
+      });
+
+      const without = await runToolContract(iaGetText, { identifier: 'pp' });
+      const blank = await runToolContract(iaGetText, { identifier: 'pp', find });
+
+      const [plain, withBlank] = mockService.getTextContent.mock.calls;
+      expect(withBlank?.[5]).toEqual(plain?.[5]);
+      expect(withBlank?.[5]).toEqual({});
+      expect(blank.structuredContent).toEqual(without.structuredContent);
+      expect(blank.content).toEqual(without.content);
+      expect(noticeOf(blank)).not.toContain('No match');
+    });
+
+    it('answers a miss with empty text, has_more false, no match_offset or next_continuation, and a notice on both surfaces', async () => {
+      mockService.getTextContent.mockResolvedValue(miss());
+
+      const result = await runToolContract(iaGetText, {
+        identifier: 'pp',
+        char_offset: 29_476,
+        find: 'zzqqxxjj',
+      });
+
+      expect(mockService.getTextContent.mock.calls[0]?.[2]).toBe(29_476);
+      expect(result.structuredContent).toEqual({
+        text: '',
+        char_offset: 29_476,
+        max_chars: 50_000,
+        has_more: false,
+        source_file: FILE,
+        source_file_bytes: 874_482,
+        notice: missNotice(FILE, '29,476'),
+      });
+      const text = contentText(result);
+      expect(text).toContain(missNotice(FILE, '29,476'));
+      expect(text.split('\n')).toContain(
+        '**Max Chars:** 50,000 | **Offset:** 29,476 — end of document',
+      );
+      expect(text).not.toContain('Match Offset');
+      expect(() => iaGetText.output.parse(result.structuredContent)).not.toThrow();
+    });
+
+    it('keeps the readable-file-count notice beside the miss notice on a default-pick read', async () => {
+      const volume = 'Strabo 01 Geography 1-2_djvu.txt';
+      mockService.getTextContent.mockResolvedValue(
+        miss({
+          charOffset: 0,
+          sourceFile: volume,
+          textFiles: { count: 8, formats: ['DjVuTXT'], unformatted: 0 },
+        }),
+      );
+
+      const result = await runToolContract(iaGetText, {
+        identifier: 'Strabo08Geography17AndIndex',
+        find: 'Pemberley',
+      });
+
+      const expected = `${missNotice(volume, '0')} This item has 8 readable text files; this page is from the default one, source_file. ia_get_item with format "DjVuTXT" lists them. Pass another one's name as file to read it.`;
+      expect(noticeOf(result)).toBe(expected);
+      expect(contentText(result)).toContain(expected);
+    });
+
+    it("carries the service's find_incomplete as Timeout with its char_offset, continuation, and hint on both surfaces", async () => {
+      const { timeout } = await import('@cyanheads/mcp-ts-core/errors');
+      const message = `The search of "${FILE}" stopped before the download's request timeout or the call deadline could cut it off. No match begins from char_offset 0 up to char_offset 412000, where the search resumes.`;
+      const resume = `Call again with the same find and continuation ${TOKEN}.`;
+      mockService.getTextContent.mockRejectedValue(
+        timeout(message, {
+          reason: 'find_incomplete',
+          char_offset: 412_000,
+          next_continuation: TOKEN,
+          recovery: { hint: resume },
+        }),
+      );
+
+      const result = await runToolContract(iaGetText, { identifier: 'pp', find: 'Pemberley' });
+
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        message,
+        data: {
+          reason: 'find_incomplete',
+          char_offset: 412_000,
+          next_continuation: TOKEN,
+          recovery: { hint: resume },
+        },
+      });
+      expect(errorOf(result).data).not.toHaveProperty('retryable');
+      const text = contentText(result);
+      expect(text).toContain(`Recovery: ${resume}`);
+      expect(text).toContain('(reason find_incomplete');
+    });
+
+    it('declares find_incomplete as Timeout, whose recovery reaches a failure the service sends without a hint', async () => {
+      const entry = iaGetText.errors?.find((e) => e.reason === 'find_incomplete');
+      expect(entry?.code).toBe(JsonRpcErrorCode.Timeout);
+      const { timeout } = await import('@cyanheads/mcp-ts-core/errors');
+      mockService.getTextContent.mockRejectedValue(
+        timeout('The search stopped.', { reason: 'find_incomplete', char_offset: 0 }),
+      );
+
+      const result = await runToolContract(iaGetText, { identifier: 'pp', find: 'Pemberley' });
+
+      expect(errorOf(result).data).toMatchObject({
+        reason: 'find_incomplete',
+        recovery: { hint: entry?.recovery },
+      });
+      expect(contentText(result)).toContain(`Recovery: ${entry?.recovery}`);
+    });
+  });
+
   it('throws item_not_found when identifier does not exist (empty {} from API)', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
     mockService.getTextContent.mockRejectedValue(
@@ -667,6 +929,43 @@ describe('iaGetText', () => {
       const blocks = iaGetText.format!(output);
       const text = blocks.map((b) => (b as { type: string; text: string }).text).join('');
       expect(text).toContain('end of document');
+    });
+
+    it.each([
+      [
+        'a page that has more',
+        true,
+        '**Max Chars:** 50,000 | **Offset:** 29,475 — more follows (next offset: 79,475) | **Match Offset:** 29,475',
+      ],
+      [
+        'the last page',
+        false,
+        '**Max Chars:** 50,000 | **Offset:** 29,475 — end of document | **Match Offset:** 29,475',
+      ],
+    ])('appends the match offset to the offset line of %s', (_label, hasMore, line) => {
+      const [block] = iaGetText.format!({
+        text: 'Pemberley',
+        char_offset: 29_475,
+        match_offset: 29_475,
+        max_chars: 50_000,
+        has_more: hasMore,
+        source_file: 'pp_djvu.txt',
+      }) as [{ text: string }];
+      expect(block.text.split('\n')).toContain(line);
+    });
+
+    it('renders no match offset without match_offset', () => {
+      const [block] = iaGetText.format!({
+        text: '',
+        char_offset: 29_476,
+        max_chars: 50_000,
+        has_more: false,
+        source_file: 'pp_djvu.txt',
+      }) as [{ text: string }];
+      expect(block.text.split('\n')).toContain(
+        '**Max Chars:** 50,000 | **Offset:** 29,476 — end of document',
+      );
+      expect(block.text).not.toContain('Match Offset');
     });
   });
 });

@@ -138,8 +138,167 @@ const CATALOG_RECORDS = {
   },
 } as const;
 
+/**
+ * A record whose every relayed field is a string, its keys in an order unlike the output's, with
+ * a non-URL rights statement and markup to escape: the shape 0.6.1 answered correctly.
+ */
+const ALL_STRING_RECORD = {
+  metadata: {
+    identifier: 'all-string-record',
+    'access-restricted-item': 'true',
+    imagecount: '518',
+    openlibrary_work: 'OL66554W',
+    openlibrary_edition: 'OL7173379M',
+    lccn: '35008545',
+    'oclc-id': '85792390',
+    isbn: '0313328773',
+    volume: 'v.6',
+    publisher: 'London : George Allen',
+    language: 'eng',
+    rights: 'Public domain <b>in the US</b>.',
+    licenseurl: 'http://creativecommons.org/publicdomain/mark/1.0/',
+    collection: 'americana',
+    subject: 'Fiction',
+    date: '1894',
+    mediatype: 'texts',
+    description: '<p>A *novel*.</p>',
+    creator: 'Austen, Jane, 1775-1817',
+    title: 'Pride and prejudice',
+  },
+  files: [{ name: 'all-string-record_djvu.txt', format: 'DjVuTXT', size: '874482', md5: 'abc' }],
+} as const;
+
+/** Records with a list where 0.6.1 declared a string, as the Metadata API returns them (2026-11-22). */
+const LIST_RECORDS = {
+  'ArchiveIt-Collection-4450': {
+    title: '10 years on Mars',
+    mediatype: 'collection',
+    date: 'April 2014',
+    rights: [
+      'This collection is made accessible to the public without restriction. The University of Michigan School of Information and Archive-It do not own copyright to these materials; contact the copyright holders for further information.',
+      "All materials in this collection are either government-created or have been archived under a claim of fair use for educational and research purposes. If you are the copyright holder to any of these materials and have comments or objections as to its use here, please contact any of the collectors and we'll be happy to discuss your concerns.",
+    ],
+  },
+  'TantaresIVAExpansion-v1.0.1': {
+    title: 'Tantares IVA Expansion - v1.0.1',
+    mediatype: 'software',
+    licenseurl: [
+      'https://opensource.org/licenses/MIT',
+      'http://creativecommons.org/licenses/by-nc-sa/3.0',
+    ],
+  },
+  kinematographyea1931kine: {
+    title: 'Kinematograph Year Book 1931',
+    mediatype: 'texts',
+    date: '1931',
+    volume: ['1931', '18'],
+    imagecount: '540',
+  },
+} as const;
+
+/** An item with no publication date but both upload dates, as the Metadata API returns it (2026-11-22). */
+const UNDATED_RECORD = {
+  identifier: 'achristmascarol19505gut',
+  title: 'A Christmas Carol',
+  creator: 'Dickens, Charles, 1812-1870',
+  mediatype: 'audio',
+  publicdate: '2014-10-24 16:15:43',
+  addeddate: '2006-12-06',
+  language: 'eng',
+  collection: 'gutenberg',
+} as const;
+
+/** Audio items with part of each manifest, as the Metadata API returns them (2026-11-22). */
+const AUDIO_RECORDS = {
+  'gd77-05-08.sbd.hicks.4982.sbeok.shnf': {
+    metadata: {
+      title: 'Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08',
+      mediatype: 'etree',
+    },
+    files: [
+      {
+        name: 'gd77-05-08eaton-d1t01.mp3',
+        source: 'derivative',
+        creator: 'Grateful Dead',
+        title: 'Minglewood Blues',
+        track: '1',
+        album: '1977-05-08 - Barton Hall, Cornell University',
+        bitrate: '185',
+        length: '06:21',
+        format: 'VBR MP3',
+        original: 'gd77-05-08eaton-d1t01.shn',
+        mtime: '1417376261',
+        size: '8838656',
+        md5: '96d1fc48cae5e3bdd62c383d5b458a43',
+        height: '0',
+        width: '0',
+      },
+      {
+        name: 'gd77-05-08eaton-d1t01.ogg',
+        source: 'derivative',
+        format: 'Ogg Vorbis',
+        original: 'gd77-05-08eaton-d1t01.shn',
+        size: '4267995',
+        md5: 'a0de3951d73f67c0e3fb6d7384592ac1',
+        length: '381.1',
+      },
+      {
+        name: 'gd77-05-08eaton-d1t01.png',
+        source: 'derivative',
+        format: 'PNG',
+        original: 'gd77-05-08eaton-d1t01.shn',
+        size: '9430',
+        md5: 'd105252abdee7b86d91d5d55631c8811',
+      },
+    ],
+  },
+  pride_and_prejudice_librivox: {
+    metadata: { title: 'Pride and Prejudice', mediatype: 'audio', runtime: '13:06:44' },
+    files: [
+      {
+        name: 'prideandprejudice_01-03_austen.mp3',
+        source: 'original',
+        size: '18129230',
+        format: 'VBR MP3',
+        creator: 'Jane Austen',
+        album: 'Pride and Prejudice',
+        title: 'Chapters 1-3',
+        track: '1/37',
+        md5: 'e6cff6db8fc50a802a28a07772e94888',
+        length: '1133.07',
+        genre: 'Speech',
+      },
+      {
+        name: 'prideandprejudice_01-03_austen_64kb.mp3',
+        source: 'derivative',
+        size: '9064064',
+        title: 'Chapters 1-3',
+        length: '18:52',
+        format: '64Kbps MP3',
+        md5: '5ffa934b41c9c7b3d611cf3e5adaea35',
+      },
+    ],
+  },
+} as const;
+
 /** Unmatched requests throw — no test in this file reaches the network. */
 const http = createFetchMock([
+  ...Object.entries(AUDIO_RECORDS).map(([identifier, { metadata, files }]) => ({
+    match: `${METADATA}/${identifier}`,
+    respond: Response.json({ metadata: { identifier, ...metadata }, files }),
+  })),
+  {
+    match: `${METADATA}/all-string-record`,
+    respond: Response.json(ALL_STRING_RECORD),
+  },
+  ...Object.entries(LIST_RECORDS).map(([identifier, metadata]) => ({
+    match: `${METADATA}/${identifier}`,
+    respond: Response.json({ metadata: { identifier, ...metadata }, files: [] }),
+  })),
+  {
+    match: `${METADATA}/achristmascarol19505gut`,
+    respond: Response.json({ metadata: UNDATED_RECORD, files: [] }),
+  },
   { match: `${METADATA}/missing-item-xyz`, respond: Response.json({}) },
   {
     match: `${METADATA}/protestant-review_1938-01_15_1`,
@@ -294,6 +453,115 @@ toolContractSuite(iaGetItem, {
       reason: 'item_not_found',
     },
   ],
+});
+
+describe('ia_get_item on a record whose every field is a string', () => {
+  it('returns the same structuredContent, key order included, and content[] as 0.6.1', async () => {
+    const result = await runToolContract(iaGetItem, { identifier: 'all-string-record' });
+
+    expect(result.isError).toBeFalsy();
+    expect(JSON.stringify(result.structuredContent)).toBe(
+      '{"identifier":"all-string-record","title":"Pride and prejudice","creator":"Austen, Jane, 1775-1817","description":"A *novel*.","mediatype":"texts","date":"1894","subject":"Fiction","collection":"americana","licenseurl":"http://creativecommons.org/publicdomain/mark/1.0/","rights":"Public domain <b>in the US</b>.","language":"eng","publisher":"London : George Allen","volume":"v.6","isbn":"0313328773","oclc_id":"85792390","lccn":"35008545","openlibrary_edition":"OL7173379M","openlibrary_work":"OL66554W","image_count":518,"access_restricted":true,"file_count":1,"files":[{"name":"all-string-record_djvu.txt","format":"DjVuTXT","size":"874482","md5":"abc","download_url":"https://archive.org/download/all-string-record/all-string-record_djvu.txt"}]}',
+    );
+    expect(contentText(result)).toBe(
+      '# Pride and prejudice\n**Identifier:** all-string-record\n**Media Type:** texts\n**Creator:** Austen, Jane, 1775-1817\n**Date:** 1894\n**Publisher:** London : George Allen\n**Volume:** v.6\n**Language:** eng\n**Subjects:** Fiction\n**Collection:** americana\n**ISBN:** 0313328773\n**OCLC ID:** 85792390\n**LCCN:** 35008545\n**Open Library Edition:** OL7173379M\n**Open Library Work:** OL66554W\n**Page Images:** 518\n**License:** [http://creativecommons.org/publicdomain/mark/1.0/](<http://creativecommons.org/publicdomain/mark/1.0/>)\n**Rights:** Public domain \\<b>in the US\\</b>.\n**Access Restricted:** true\n\n**Description:** A \\*novel\\*.\n\n**Files (1):**\n- **all-string-record_djvu.txt** (DjVuTXT, 874482 bytes, md5:abc): [https://archive.org/download/all-string-record/all-string-record_djvu.txt](<https://archive.org/download/all-string-record/all-string-record_djvu.txt>)',
+    );
+  });
+});
+
+describe('ia_get_item list-valued rights, licenseurl, and volume', () => {
+  const getItem = async (identifier: keyof typeof LIST_RECORDS) => {
+    const result = await runToolContract(iaGetItem, { identifier });
+    expect(result.isError).toBeFalsy();
+    return { sc: result.structuredContent as Record<string, unknown>, text: contentText(result) };
+  };
+
+  it('returns ArchiveIt-Collection-4450’s two rights statements, one item each', async () => {
+    const { sc, text } = await getItem('ArchiveIt-Collection-4450');
+
+    expect(sc.rights).toEqual(LIST_RECORDS['ArchiveIt-Collection-4450'].rights);
+    expect(text).toBe(
+      "# 10 years on Mars\n**Identifier:** ArchiveIt-Collection-4450\n**Media Type:** collection\n**Date:** April 2014\n**Rights:**\n\n- This collection is made accessible to the public without restriction. The University of Michigan School of Information and Archive-It do not own copyright to these materials; contact the copyright holders for further information.\n- All materials in this collection are either government-created or have been archived under a claim of fair use for educational and research purposes. If you are the copyright holder to any of these materials and have comments or objections as to its use here, please contact any of the collectors and we'll be happy to discuss your concerns.\n\n**Files (0):**",
+    );
+  });
+
+  it('returns TantaresIVAExpansion-v1.0.1’s two license URLs, each a link', async () => {
+    const { sc, text } = await getItem('TantaresIVAExpansion-v1.0.1');
+
+    expect(sc.licenseurl).toEqual([
+      'https://opensource.org/licenses/MIT',
+      'http://creativecommons.org/licenses/by-nc-sa/3.0',
+    ]);
+    expect(text).toBe(
+      '# Tantares IVA Expansion - v1.0.1\n**Identifier:** TantaresIVAExpansion-v1.0.1\n**Media Type:** software\n**License:**\n\n- [https://opensource.org/licenses/MIT](<https://opensource.org/licenses/MIT>)\n- [http://creativecommons.org/licenses/by-nc-sa/3.0](<http://creativecommons.org/licenses/by-nc-sa/3.0>)\n\n**Files (0):**',
+    );
+  });
+
+  it('returns kinematographyea1931kine’s two volume values and its page-image count', async () => {
+    const { sc, text } = await getItem('kinematographyea1931kine');
+
+    expect(sc).toMatchObject({ volume: ['1931', '18'], mediatype: 'texts', image_count: 540 });
+    expect(text).toBe(
+      '# Kinematograph Year Book 1931\n**Identifier:** kinematographyea1931kine\n**Media Type:** texts\n**Date:** 1931\n**Volume:**\n\n- 1931\n- 18\n\n**Page Images:** 540\n\n**Files (0):**',
+    );
+  });
+});
+
+describe('ia_get_item upload dates', () => {
+  it('returns achristmascarol19505gut’s publicdate and addeddate as stored, with no date, on both surfaces', async () => {
+    const result = await runToolContract(iaGetItem, { identifier: 'achristmascarol19505gut' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      publicdate: '2014-10-24 16:15:43',
+      addeddate: '2006-12-06',
+    });
+    expect(result.structuredContent).not.toHaveProperty('date');
+    expect(contentText(result)).toBe(
+      '# A Christmas Carol\n**Identifier:** achristmascarol19505gut\n**Media Type:** audio\n**Creator:** Dickens, Charles, 1812-1870\n**Public Date:** 2014-10-24 16:15:43\n**Added Date:** 2006-12-06\n**Language:** eng\n**Collection:** gutenberg\n\n**Files (0):**',
+    );
+  });
+});
+
+describe('ia_get_item track details and runtime', () => {
+  const download = (identifier: string, name: string) =>
+    `https://archive.org/download/${identifier}/${name}`;
+  const link = (identifier: string, name: string) =>
+    `[${download(identifier, name)}](<${download(identifier, name)}>)`;
+
+  it('returns Minglewood Blues’ title, track, and length on its MP3, and only a length on its Ogg', async () => {
+    const id = 'gd77-05-08.sbd.hicks.4982.sbeok.shnf';
+    const result = await runToolContract(iaGetItem, { identifier: id });
+
+    expect(result.isError).toBeFalsy();
+    expect(JSON.stringify(result.structuredContent)).toBe(
+      `{"identifier":"${id}","title":"Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08","mediatype":"etree","file_count":3,"files":[{"name":"gd77-05-08eaton-d1t01.mp3","title":"Minglewood Blues","track":"1","length":"06:21","format":"VBR MP3","size":"8838656","md5":"96d1fc48cae5e3bdd62c383d5b458a43","download_url":"${download(id, 'gd77-05-08eaton-d1t01.mp3')}"},{"name":"gd77-05-08eaton-d1t01.ogg","length":"381.1","format":"Ogg Vorbis","size":"4267995","md5":"a0de3951d73f67c0e3fb6d7384592ac1","download_url":"${download(id, 'gd77-05-08eaton-d1t01.ogg')}"},{"name":"gd77-05-08eaton-d1t01.png","format":"PNG","size":"9430","md5":"d105252abdee7b86d91d5d55631c8811","download_url":"${download(id, 'gd77-05-08eaton-d1t01.png')}"}]}`,
+    );
+    expect(contentText(result)).toBe(
+      `# Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08\n**Identifier:** ${id}\n**Media Type:** etree\n\n**Files (3):**\n- **gd77-05-08eaton-d1t01.mp3** (VBR MP3, 8838656 bytes, md5:96d1fc48cae5e3bdd62c383d5b458a43): ${link(id, 'gd77-05-08eaton-d1t01.mp3')}\n  - **Title:** Minglewood Blues\n  - **Track:** 1\n  - **Length:** 06:21\n- **gd77-05-08eaton-d1t01.ogg** (Ogg Vorbis, 4267995 bytes, md5:a0de3951d73f67c0e3fb6d7384592ac1): ${link(id, 'gd77-05-08eaton-d1t01.ogg')}\n  - **Length:** 381.1\n- **gd77-05-08eaton-d1t01.png** (PNG, 9430 bytes, md5:d105252abdee7b86d91d5d55631c8811): ${link(id, 'gd77-05-08eaton-d1t01.png')}`,
+    );
+  });
+
+  it('returns a LibriVox chapter’s title, track of total, and length, and the item’s runtime', async () => {
+    const id = 'pride_and_prejudice_librivox';
+    const result = await runToolContract(iaGetItem, { identifier: id, format: 'vbr mp3' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      runtime: '13:06:44',
+      files: [
+        {
+          name: 'prideandprejudice_01-03_austen.mp3',
+          title: 'Chapters 1-3',
+          track: '1/37',
+          length: '1133.07',
+        },
+      ],
+    });
+    expect(contentText(result)).toContain(
+      `**Media Type:** audio\n**Runtime:** 13:06:44\n\n**Files (showing 1 of 2 in the manifest):**\n- **prideandprejudice_01-03_austen.mp3** (VBR MP3, 18129230 bytes, md5:e6cff6db8fc50a802a28a07772e94888): ${link(id, 'prideandprejudice_01-03_austen.mp3')}\n  - **Title:** Chapters 1-3\n  - **Track:** 1/37\n  - **Length:** 1133.07\n`,
+    );
+  });
 });
 
 describe('ia_get_item service-thrown error envelope', () => {

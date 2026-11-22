@@ -50,7 +50,11 @@ import { getServerConfig } from '@/config/server-config.js';
 import { iaFindSnapshots } from '@/mcp-server/tools/definitions/ia-find-snapshots.tool.js';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import { startCallDeadline } from '@/services/call-deadline.js';
-import { type FetchHistoryParams, WaybackService } from '@/services/wayback/wayback-service.js';
+import {
+  cdxMatchType,
+  type FetchHistoryParams,
+  WaybackService,
+} from '@/services/wayback/wayback-service.js';
 
 const CDX_HEADER = ['timestamp', 'statuscode', 'mimetype', 'original', 'digest', 'length'];
 
@@ -403,9 +407,18 @@ describe('WaybackService exact collapsed continuation', () => {
     expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
   });
 
-  it.each(Array.from({ length: 14 }, (_, i) => i + 1))(
-    'uses lookahead for precision %i, without leaking equal-timestamp/trailer rows',
-    async (precision) => {
+  it.each([
+    ...Array.from({ length: 14 }, (_, i) => `timestamp:${i + 1}`),
+    // CDX lists only the first capture in range under timestamp:0 and reads an N above 14 as 14.
+    'timestamp:0',
+    'timestamp:15',
+    'timestamp:20',
+    'timestamp:99',
+    'digest',
+    'urlkey',
+  ])(
+    'uses lookahead for collapse %s, without leaking equal-timestamp/trailer rows',
+    async (collapse) => {
       const ctx = createMockContext({ errors: iaFindSnapshots.errors });
       fetchWithTimeout.mockResolvedValueOnce(
         cdxResponse([
@@ -417,26 +430,46 @@ describe('WaybackService exact collapsed continuation', () => {
         ]),
       );
       const result = await buildService().fetchHistory(
-        { url: 'example.com?q=x', limit: 1, collapse: `timestamp:${precision}` },
+        { url: 'example.com?q=x', limit: 1, collapse },
         ctx,
       );
       expect(result.records).toHaveLength(1);
       expect(result.resumeKey).toMatch(/^ia-history-v1\//);
-      const stored = await ctx.state.get(result.resumeKey!);
-      expect(stored).toMatchObject({
-        nextTimestamp: '20000101000000',
-        collapse: `timestamp:${precision}`,
+      expect(result.notice).toBeUndefined();
+      expect(Object.fromEntries(requestedUrl(0).searchParams)).toMatchObject({
+        collapse,
+        limit: '2',
       });
+      const stored = await ctx.state.get(result.resumeKey!);
+      expect(stored).toMatchObject({ nextTimestamp: '20000101000000', collapse });
     },
   );
 
+  it('reads a * inside the url as part of one exact URL, paging it through a server cursor', async () => {
+    const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+    fetchWithTimeout.mockResolvedValueOnce(
+      cdxResponse([CDX_HEADER, capture('20000101000000'), capture('20000201000000')]),
+    );
+
+    const result = await buildService().fetchHistory({ url: 'example.com/a*b', limit: 1 }, ctx);
+
+    expect(result.resumeKey).toMatch(/^ia-history-v1\//);
+    expect(result.notice).toBeUndefined();
+    expect(requestedUrl(0).searchParams.get('limit')).toBe('2');
+  });
+
+  const WILDCARD_NOTICE =
+    'CDX raw continuation pages a wildcard url and can omit the row at each page boundary or return it as a later capture of the same URL; a limit that holds the whole listing (up to 10,000 rows) avoids both.';
+  const LEGACY_NOTICE =
+    'CDX raw continuation can omit captures at page boundaries. Restarting without resume_key pages an exact URL through server resume keys, which omit none on a stable index.';
+
   it.each([
-    { collapse: 'digest' },
-    { collapse: 'timestamp:0' },
-    { url: '*.example.com' },
-    { url: 'example.com/*' },
-    { resumeKey: RESUME_KEY },
-  ])('preserves noneligible/raw continuation %j with notice', async (options) => {
+    ['a domain wildcard', { url: '*.example.com' }, WILDCARD_NOTICE],
+    ['a prefix', { url: 'example.com/*' }, WILDCARD_NOTICE],
+    ['a prefix under digest', { url: 'example.com/*', collapse: 'digest' }, WILDCARD_NOTICE],
+    ['a prefix under urlkey', { url: 'example.com/*', collapse: 'urlkey' }, WILDCARD_NOTICE],
+    ['a raw CDX key on an exact URL', { resumeKey: RESUME_KEY }, LEGACY_NOTICE],
+  ])('pages %s by CDX’s own key with its notice', async (_label, options, notice) => {
     fetchWithTimeout.mockResolvedValueOnce(
       cdxResponse([CDX_HEADER, capture('20000101000000'), [], [RESUME_KEY]]),
     );
@@ -445,15 +478,27 @@ describe('WaybackService exact collapsed continuation', () => {
       createMockContext(),
     );
     expect(first.resumeKey).toBe(RESUME_KEY);
-    expect(first.notice).toContain('can omit captures');
+    expect(first.notice).toBe(notice);
     expect(requestedUrl(0).searchParams.get('limit')).toBe('1');
     fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, capture('20000201000000')]));
     const final = await buildService().fetchHistory(
       { url: 'example.com', limit: 5, ...options, resumeKey: first.resumeKey },
       createMockContext(),
     );
-    expect(final.notice).toContain('can omit captures');
+    expect(final.notice).toBe(notice);
     expect(final.resumeKey).toBeUndefined();
+    expect(requestedUrl(1).searchParams.get('resumeKey')).toBe(RESUME_KEY);
+  });
+
+  it('adds no notice to a wildcard page CDX closed without a key', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, capture('20000101000000')]));
+
+    const result = await buildService().fetchHistory(
+      { url: 'example.com/*', collapse: 'urlkey', limit: 5 },
+      createMockContext(),
+    );
+
+    expect(result).toEqual({ records: [expect.objectContaining({ timestamp: '20000101000000' })] });
   });
 
   it('expires tenant-scoped cursors after one hour through the real serialized store', async () => {
@@ -587,6 +632,370 @@ describe('WaybackService exact collapsed continuation', () => {
       limit: '6',
     });
     expect(requestedUrl(1).searchParams.has('resumeKey')).toBe(false);
+  });
+
+  describe('a digest cursor (#69)', () => {
+    /** The second the resumed pages below resume at. */
+    const SECOND = '20150716092504';
+
+    /** A CDX row at `timestamp` whose content has `digest`. */
+    const version = (timestamp: string, digest: string): string[] => [
+      timestamp,
+      '200',
+      'text/html',
+      'http://example.com/',
+      digest,
+      '1',
+    ];
+
+    /** A server cursor resuming a 2015 digest listing at `SECOND`, stored as the service stores one. */
+    const storeCursor = async (
+      ctx: Context,
+      digestResume: { digest: string; returned: number },
+    ): Promise<string> => {
+      const key = `ia-history-v1/${crypto.randomUUID()}`;
+      await ctx.state.set(key, {
+        url: 'example.com',
+        collapse: 'digest',
+        from: '2015',
+        nextTimestamp: SECOND,
+        digestResume,
+      });
+      return key;
+    };
+
+    it('stores the lookahead’s digest and the rows at its second the page returned', async () => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([
+          CDX_HEADER,
+          version('20150101000000', 'A'),
+          version(SECOND, 'B'),
+          version(SECOND, 'C'),
+          version('20150801000000', 'D'),
+        ]),
+      );
+
+      const result = await buildService().fetchHistory(
+        { url: 'example.com', collapse: 'digest', from: '2015', limit: 2 },
+        ctx,
+      );
+
+      expect(result.records.map((r) => r.digest)).toEqual(['A', 'B']);
+      expect(await ctx.state.get(result.resumeKey!)).toEqual({
+        url: 'example.com',
+        collapse: 'digest',
+        from: '2015',
+        nextTimestamp: SECOND,
+        digestResume: { digest: 'C', returned: 1 },
+      });
+      expect(requestedUrl(0).searchParams.get('limit')).toBe('3');
+    });
+
+    it.each([
+      ['the lookahead first', 0, [['L', SECOND], ['M'], ['N']], ['L', 'M']],
+      [
+        'a capture the unpaged listing collapsed, ahead of the lookahead in its second',
+        0,
+        [['P', SECOND], ['L', SECOND], ['M'], ['N']],
+        ['L', 'M'],
+      ],
+      [
+        'rows earlier pages returned at the second, behind a collapsed capture',
+        2,
+        [['P', SECOND], ['Q', SECOND], ['R', SECOND], ['L', SECOND], ['M']],
+        ['L', 'M'],
+      ],
+      [
+        'rows earlier pages returned at the second, with no collapsed capture',
+        2,
+        [['Q', SECOND], ['R', SECOND], ['L', SECOND], ['M']],
+        ['L', 'M'],
+      ],
+      [
+        'a second whose digests run L, Q, L, resuming on the second L',
+        1,
+        [['L', SECOND], ['Q', SECOND], ['L', SECOND], ['M']],
+        ['L', 'M'],
+      ],
+      [
+        'rows at the second that carry neither digest, kept',
+        0,
+        [['Y', SECOND], ['Z', SECOND], ['M']],
+        ['Y', 'Z'],
+      ],
+      ['a range CDX now lists nothing for', 0, [], []],
+    ] as const)(
+      'resumes past what CDX re-lists ahead of the lookahead: %s',
+      async (_label, returned, listed, expected) => {
+        const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+        const key = await storeCursor(ctx, { digest: 'L', returned });
+        fetchWithTimeout.mockResolvedValueOnce(
+          cdxResponse([
+            CDX_HEADER,
+            ...listed.map(([digest, at], i) => version(at ?? `2015080${i}000000`, digest)),
+          ]),
+        );
+
+        const result = await buildService().fetchHistory(
+          { url: 'example.com', limit: 2, resumeKey: key },
+          ctx,
+        );
+
+        expect(result.records.map((r) => r.digest)).toEqual(expected);
+        expect(Object.fromEntries(requestedUrl(0).searchParams)).toMatchObject({
+          collapse: 'digest',
+          from: SECOND,
+          limit: String(2 + 1 + returned + 1),
+        });
+        expect(requestedUrl(0).searchParams.has('resumeKey')).toBe(false);
+      },
+    );
+
+    it('drops only the rows CDX still lists at the second when it lists fewer than earlier pages returned there', async () => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const key = await storeCursor(ctx, { digest: 'L', returned: 2 });
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([
+          CDX_HEADER,
+          version(SECOND, 'Q'),
+          version('20150801000000', 'M'),
+          version('20150802000000', 'N'),
+          version('20150803000000', 'O'),
+        ]),
+      );
+
+      const result = await buildService().fetchHistory(
+        { url: 'example.com', limit: 2, resumeKey: key },
+        ctx,
+      );
+
+      expect(result.records.map((r) => r.digest)).toEqual(['M', 'N']);
+      expect(requestedUrl(0).searchParams.get('limit')).toBe('6');
+    });
+
+    it('counts the rows returned at one second across the pages resumed at it', async () => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const svc = buildService();
+      // The unpaged listing at SECOND is Q, R, S, after a capture P it collapsed; Q was returned.
+      const atSecond = [
+        version(SECOND, 'P'),
+        version(SECOND, 'Q'),
+        version(SECOND, 'R'),
+        version(SECOND, 'S'),
+        version('20150801000000', 'U'),
+      ];
+      fetchWithTimeout.mockResolvedValue(cdxResponse([CDX_HEADER, ...atSecond]));
+      let key = await storeCursor(ctx, { digest: 'R', returned: 1 });
+      const pages: string[] = [];
+      for (const expected of [
+        { digest: 'S', returned: 2 },
+        { digest: 'U', returned: 0 },
+      ]) {
+        const page = await svc.fetchHistory({ url: 'example.com', limit: 1, resumeKey: key }, ctx);
+        pages.push(...page.records.map((r) => r.digest));
+        expect(await ctx.state.get(page.resumeKey!)).toMatchObject({ digestResume: expected });
+        key = page.resumeKey!;
+      }
+
+      expect(pages).toEqual(['R', 'S']);
+    });
+
+    it('falls back after a storage error at the original limit plus the rows the page dropped', async () => {
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const key = await storeCursor(ctx, { digest: 'L', returned: 0 });
+      vi.spyOn(ctx.state, 'set').mockRejectedValueOnce(
+        new McpError(JsonRpcErrorCode.ServiceUnavailable, 'store unavailable'),
+      );
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([
+          CDX_HEADER,
+          version(SECOND, 'P'),
+          version(SECOND, 'L'),
+          version('20150801000000', 'M'),
+          version('20150802000000', 'N'),
+        ]),
+      );
+      fetchWithTimeout.mockResolvedValueOnce(
+        cdxResponse([
+          CDX_HEADER,
+          version(SECOND, 'P'),
+          version(SECOND, 'L'),
+          version('20150801000000', 'M'),
+          [],
+          [RESUME_KEY],
+        ]),
+      );
+
+      const result = await buildService().fetchHistory(
+        { url: 'example.com', limit: 2, resumeKey: key },
+        ctx,
+      );
+
+      expect(result.records.map((r) => r.digest)).toEqual(['L', 'M']);
+      expect(result.resumeKey).toBe(RESUME_KEY);
+      expect(result.notice).toBe(`History cursor storage is unavailable. ${LEGACY_NOTICE}`);
+      expect([
+        requestedUrl(0).searchParams.get('limit'),
+        requestedUrl(1).searchParams.get('limit'),
+      ]).toEqual(['4', '3']);
+    });
+
+    it('binds collapse and expires after one hour through the real serialized store', async () => {
+      vi.useFakeTimers();
+      const ctx = createMockContext({ errors: iaFindSnapshots.errors });
+      const storage = createInMemoryStorage();
+      vi.spyOn(ctx.state, 'set').mockImplementation((k, value, options) =>
+        storage.set(k, value, ctx, options),
+      );
+      vi.spyOn(ctx.state, 'get').mockImplementation(
+        async <T>(k: string, schema?: z.ZodType<T>): Promise<T | null> => {
+          const value = await storage.get<T>(k, ctx);
+          return value === null || !schema ? value : schema.parse(value);
+        },
+      );
+      const svc = buildService();
+      fetchWithTimeout.mockResolvedValue(
+        cdxResponse([CDX_HEADER, version(SECOND, 'P'), version(SECOND, 'L')]),
+      );
+      const first = await svc.fetchHistory(
+        { url: 'example.com', collapse: 'digest', limit: 1 },
+        ctx,
+      );
+
+      await expect(
+        svc.fetchHistory(
+          { url: 'example.com', collapse: 'timestamp:8', resumeKey: first.resumeKey },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'resume_key_conflict' },
+      });
+      const next = await svc.fetchHistory(
+        { url: 'example.com', collapse: 'digest', resumeKey: first.resumeKey },
+        ctx,
+      );
+      expect(next.records.map((r) => r.digest)).toEqual(['L']);
+      await vi.advanceTimersByTimeAsync(3_600_001);
+      await expect(
+        svc.fetchHistory({ url: 'example.com', resumeKey: first.resumeKey }, ctx),
+      ).rejects.toMatchObject({ data: { reason: 'invalid_resume_key' } });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('WaybackService reads no rows only from a CDX list of rows (#72)', () => {
+  it.each([
+    ['an empty list', '[]\n'],
+    ['a header row alone', JSON.stringify([CDX_HEADER])],
+  ])('fetchHistory reads %s as no rows on a complete page', async (_label, body) => {
+    fetchWithTimeout.mockResolvedValueOnce(cdxText(body));
+
+    await expect(fetchHistory(10)).resolves.toEqual({ records: [], complete: true });
+  });
+
+  it('fetchHistory keeps the resume key of a page that holds no rows', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(cdxResponse([CDX_HEADER, [], [RESUME_KEY]]));
+
+    const result = await fetchHistory(10);
+
+    expect(result.records).toEqual([]);
+    expect(result.resumeKey).toBe(RESUME_KEY);
+    expect(result.notice).toContain('can omit captures');
+  });
+
+  it.each([
+    ['an object', '{}'],
+    ['null', 'null'],
+    ['a string', '"rows"'],
+    ['a number', '5'],
+    ['a list holding something other than a row', '[null]'],
+    [
+      'rows followed by something other than a row',
+      JSON.stringify([CDX_HEADER, capture('20020524041628'), 'x']),
+    ],
+    [
+      'a row holding a cell that is not a string',
+      JSON.stringify([CDX_HEADER, [20020524041628, ...capture('20020524041628').slice(1)]]),
+    ],
+    ['a header holding a null', JSON.stringify([[...CDX_HEADER.slice(0, 5), null]])],
+  ])(
+    'fetchHistory fails a body that is %s as cdx_unavailable with the ia_find_snapshots hint',
+    async (_label, body) => {
+      fetchWithTimeout.mockResolvedValueOnce(cdxText(body));
+
+      await expect(fetchHistory(10)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: 'CDX API returned JSON that is not a list of rows.',
+        data: {
+          reason: 'cdx_unavailable',
+          recovery: { hint: declaredRecovery(iaFindSnapshots.errors, 'cdx_unavailable') },
+        },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  describe('the closest-capture CDX fallback', () => {
+    const lookup = (errors: typeof iaFindSnapshots.errors) =>
+      buildService().findClosest('example.com', '20200101', createMockContext({ errors }));
+
+    it.each([
+      ['ia_find_snapshots', iaFindSnapshots.errors],
+      ['ia_get_snapshot', iaGetSnapshot.errors],
+    ] as const)(
+      'fails a body that is not a list of rows after an empty Availability answer as cdx_unavailable, never a miss, under %s',
+      async (_name, errors) => {
+        fetchWithTimeout
+          .mockResolvedValueOnce(availability({ archived_snapshots: {} }))
+          .mockResolvedValueOnce(cdxText('{}'));
+
+        await expect(lookup(errors)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message:
+            'The Availability API found no capture of example.com near 20200101, and the CDX closest-capture check did not complete: CDX API returned JSON that is not a list of rows.',
+          data: { reason: 'cdx_unavailable', recovery: { hint: FALLBACK_INCOMPLETE.hint } },
+        });
+        expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it('keeps availability_unavailable when the Availability API failed and the fallback body is not a list of rows', async () => {
+      fetchWithTimeout
+        .mockRejectedValueOnce(await upstreamError(503))
+        .mockResolvedValueOnce(cdxText('{}'));
+
+      await expect(lookup(iaFindSnapshots.errors)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: LOOKUP_FAILED.message,
+        data: {
+          reason: 'availability_unavailable',
+          status: 503,
+          recovery: { hint: LOOKUP_FAILED.hint },
+        },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('cdxMatchType reads a url as CDX does (#69)', () => {
+  it.each([
+    ['an exact URL', 'example.com/docs/', 'exact'],
+    ['a * inside the URL, which CDX matches literally', 'iana.org/domains/res*rved', 'exact'],
+    [
+      'a calendar URL read as itself',
+      'https://web.archive.org/web/2*/http://example.com/',
+      'exact',
+    ],
+    ['a trailing *', 'info.cern.ch/hypertext/WWW/Summary*', 'prefix'],
+    ['a trailing /*', 'example.com/*', 'prefix'],
+    ['a leading *.', '*.example.com', 'domain'],
+    ['a leading *. and a trailing *', '*.example.com/*', 'domain'],
+  ] as const)('%s: %s is %s', (_label, url, matchType) => {
+    expect(cdxMatchType(url)).toBe(matchType);
   });
 });
 

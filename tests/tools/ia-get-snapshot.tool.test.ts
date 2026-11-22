@@ -9,7 +9,7 @@ import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import type { CallDeadline } from '@/services/call-deadline.js';
-import { cpuMsPerCall } from '../helpers/cpu-time.js';
+import { expectLinearDoubling } from '../helpers/cpu-time.js';
 
 vi.mock('@/services/wayback/wayback-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/wayback/wayback-service.js')>()),
@@ -1546,6 +1546,276 @@ describe('iaGetSnapshot', () => {
     );
   });
 
+  describe('links (#67)', () => {
+    const PAGE_URL = 'http://info.cern.ch/hypertext/WWW/TheProject.html';
+    const TIMESTAMP = '20151231164925';
+    const REPLAY = `https://web.archive.org/web/${TIMESTAMP}/${PAGE_URL}`;
+    const TEXT =
+      'The World Wide Web project\nThe WorldWideWeb (W3) is a wide-area hypermedia information retrieval initiative. Everything there is online about W3 is linked directly or indirectly to this document, including an executive summary of the project.';
+
+    type ServiceLink = { offset: number; text: string; url: string };
+    type Page = {
+      text: string;
+      char_offset: number;
+      max_chars: number;
+      has_more: boolean;
+      total_chars: number;
+      links?: { text: string; url: string }[];
+      total_links?: number;
+      notice?: string;
+    };
+
+    const link = (label: string, url: string): ServiceLink => ({
+      offset: TEXT.indexOf(label),
+      text: label,
+      url,
+    });
+    const LINKS = [
+      link('hypermedia', 'http://info.cern.ch/hypertext/WWW/WhatIs.html'),
+      link('executive summary', 'http://info.cern.ch/hypertext/WWW/Summary.html'),
+    ];
+    const NEXT_PAGE = (charOffset: number, links: boolean) =>
+      `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp ${TIMESTAMP} (resolved_timestamp), ${links ? `char_offset ${charOffset}, and include_links true` : `and char_offset ${charOffset}`} for the next page.`;
+
+    /** Serves `text` as the capture, with `links` only when the fetch asks for them, as the service does. */
+    const serve = (text = TEXT, links: ServiceLink[] = LINKS) => {
+      mockService.buildReplayUrl.mockReturnValue(REPLAY);
+      mockService.fetchContent.mockImplementation(
+        async (_url: string, _ctx: unknown, _deadline: unknown, options?: { links?: boolean }) => ({
+          text,
+          replayUrl: REPLAY,
+          timestamp: TIMESTAMP,
+          status: '200',
+          ...(options?.links && { links }),
+        }),
+      );
+    };
+    const read = async (input: Record<string, unknown> = {}) => {
+      const result = await runToolContract(iaGetSnapshot, {
+        url: PAGE_URL,
+        timestamp: TIMESTAMP,
+        ...input,
+      });
+      expect(result.isError).toBeFalsy();
+      const content = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { page: result.structuredContent as Page, content };
+    };
+
+    it('without include_links, fetches the page as before and returns neither links nor total_links, on both surfaces', async () => {
+      serve();
+
+      const { page, content } = await read({ max_chars: 100 });
+
+      expect(mockService.fetchContent.mock.calls[0]).toHaveLength(3);
+      expect(page).toStrictEqual({
+        text: TEXT.slice(0, 100),
+        replay_url: REPLAY,
+        resolved_timestamp: TIMESTAMP,
+        resolved_status: '200',
+        char_offset: 0,
+        max_chars: 100,
+        has_more: true,
+        total_chars: 242,
+        notice: NEXT_PAGE(100, false),
+      });
+      expect(content).toBe(
+        `**Replay URL:** [https://web.archive.org/web/20151231164925/http://info.cern.ch/hypertext/WWW/TheProject.html](<${REPLAY}>)\n**Resolved Timestamp:** 20151231164925 | **Status:** 200\n**Offset:** 0 | **Max Chars:** 100 | **Total Chars:** 242 — more follows (next offset: 100)\n\n---\n\nThe World Wide Web project\\\nThe WorldWideWeb (W3) is a wide-area hypermedia information retrieval ini\n\n\n> ${NEXT_PAGE(100, false)}`,
+      );
+    });
+
+    it('with include_links, asks the service for links and returns the page’s as { text, url } with the total, on both surfaces', async () => {
+      serve();
+
+      const { page, content } = await read({ include_links: true });
+
+      expect(mockService.fetchContent).toHaveBeenCalledWith(
+        REPLAY,
+        expect.anything(),
+        CALL_DEADLINE,
+        { links: true },
+      );
+      expect(page.links).toStrictEqual([
+        { text: 'hypermedia', url: 'http://info.cern.ch/hypertext/WWW/WhatIs.html' },
+        { text: 'executive summary', url: 'http://info.cern.ch/hypertext/WWW/Summary.html' },
+      ]);
+      expect(page.total_links).toBe(2);
+      expect(page.notice).toBeUndefined();
+      expect(content).toBe(
+        `**Replay URL:** [https://web.archive.org/web/20151231164925/http://info.cern.ch/hypertext/WWW/TheProject.html](<${REPLAY}>)\n**Resolved Timestamp:** 20151231164925 | **Status:** 200\n**Offset:** 0 | **Max Chars:** 50,000 | **Total Chars:** 242 — end of text\n\n---\n\nThe World Wide Web project\\\n${TEXT.split('\n')[1]}\n\n**Links on this page:** 2 of 2\n\n- [hypermedia](<http://info.cern.ch/hypertext/WWW/WhatIs.html>)\n- [executive summary](<http://info.cern.ch/hypertext/WWW/Summary.html>)`,
+      );
+    });
+
+    it('names include_links in the next-page notice, so the next call keeps listing links, on both surfaces', async () => {
+      serve();
+
+      const { page, content } = await read({ include_links: true, max_chars: 100 });
+
+      expect(page.notice).toBe(NEXT_PAGE(100, true));
+      expect(content).toContain(`> ${NEXT_PAGE(100, true)}`);
+      expect(page.links).toStrictEqual([
+        { text: 'hypermedia', url: 'http://info.cern.ch/hypertext/WWW/WhatIs.html' },
+      ]);
+      expect(page.total_links).toBe(2);
+      expect(content).toContain(
+        '**Links on this page:** 1 of 2\n\n- [hypermedia](<http://info.cern.ch/hypertext/WWW/WhatIs.html>)',
+      );
+    });
+
+    describe('which links a page holds', () => {
+      const AT = [0, 9, 10, 55, 99, 100];
+      const label = (offset: number) => `at ${offset}`;
+      const serve100 = () =>
+        serve(
+          'abcdefghij'.repeat(10),
+          AT.map((offset) => ({
+            offset,
+            text: label(offset),
+            url: `https://example.com/${offset}`,
+          })),
+        );
+
+      it.each<[charOffset: number, maxChars: number, at: number[], hasMore: boolean]>([
+        [0, 10, [0, 9], true],
+        [10, 10, [10], true],
+        [50, 10, [55], true],
+        [60, 30, [], true],
+        // The last page, ending exactly at the end of the text, also takes the link there.
+        [90, 10, [99, 100], false],
+        [95, 10, [99, 100], false],
+        [0, 200, AT, false],
+        // At or past the end: no page of the text, so no link.
+        [100, 10, [], false],
+        [150, 10, [], false],
+      ])(
+        'lists the links starting in the page at %i of %i characters',
+        async (char_offset, max_chars, at, hasMore) => {
+          serve100();
+
+          const { page } = await read({ include_links: true, char_offset, max_chars });
+
+          expect(page.has_more).toBe(hasMore);
+          expect(page.links).toStrictEqual(
+            at.map((offset) => ({ text: label(offset), url: `https://example.com/${offset}` })),
+          );
+          expect(page.total_links).toBe(6);
+        },
+      );
+
+      it('selects by the page served when max_chars is above the maximum', async () => {
+        serve('x'.repeat(60_000), [
+          { offset: 49_999, text: 'last on the page', url: 'https://example.com/a' },
+          { offset: 50_000, text: 'first after it', url: 'https://example.com/b' },
+        ]);
+
+        const { page } = await read({ include_links: true, max_chars: 100_000 });
+
+        expect(page.max_chars).toBe(50_000);
+        expect(page.links).toStrictEqual([
+          { text: 'last on the page', url: 'https://example.com/a' },
+        ]);
+        expect(page.total_links).toBe(2);
+      });
+
+      it('lists an empty capture’s image-only link on its one page, and none past it', async () => {
+        serve('', [{ offset: 0, text: '', url: 'https://example.com/logo' }]);
+
+        const first = await read({ include_links: true });
+        const past = await read({ include_links: true, char_offset: 1 });
+
+        expect(first.page).toMatchObject({ text: '', has_more: false, total_links: 1 });
+        expect(first.page.links).toStrictEqual([{ text: '', url: 'https://example.com/logo' }]);
+        expect(first.content).toContain(
+          '**Links on this page:** 1 of 1\n\n- [](<https://example.com/logo>)',
+        );
+        expect(past.page.links).toStrictEqual([]);
+        expect(past.page.total_links).toBe(1);
+      });
+
+      it('gives every link to exactly one page of a read that follows has_more, at every page size', async () => {
+        /** Deterministic PRNG (mulberry32), so a failure reproduces. */
+        let seed = 67;
+        const random = () => {
+          seed = (seed + 0x6d2b79f5) | 0;
+          let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+        };
+        const ctx = () => createMockContext({ errors: iaGetSnapshot.errors });
+        const page = (char_offset: number, max_chars: number) =>
+          iaGetSnapshot.handler(
+            iaGetSnapshot.input.parse({
+              url: PAGE_URL,
+              timestamp: TIMESTAMP,
+              include_links: true,
+              char_offset,
+              max_chars,
+            }),
+            ctx(),
+          );
+
+        for (let trial = 0; trial < 40; trial++) {
+          // The first trials are the edges: an empty text, and one or two characters.
+          const total = trial < 3 ? trial : Math.floor(random() * 40);
+          const count = trial < 3 ? 2 : Math.floor(random() * 12);
+          // Offsets run from 0 to the end of the text inclusive, ties included (an image-only link
+          // starts where the next link does).
+          const offsets = Array.from({ length: count }, () =>
+            Math.floor(random() * (total + 1)),
+          ).sort((a, b) => a - b);
+          const links = offsets.map((offset, i) => ({
+            offset,
+            text: `link ${i}`,
+            url: `https://example.com/${i}`,
+          }));
+          serve('t'.repeat(total), links);
+          const whole = links.map(({ text, url }) => ({ text, url }));
+
+          for (let maxChars = 1; maxChars <= total + 2; maxChars++) {
+            const seen: { text: string; url: string }[] = [];
+            for (let charOffset = 0; ; charOffset += maxChars) {
+              const result = await page(charOffset, maxChars);
+              expect(result.total_links).toBe(count);
+              seen.push(...(result.links ?? []));
+              if (!result.has_more) break;
+            }
+            expect(seen, `${count} links over ${total} characters, pages of ${maxChars}`).toEqual(
+              whole,
+            );
+            if (total > 0) expect((await page(total, maxChars)).links).toEqual([]);
+          }
+        }
+      });
+    });
+
+    it('returns no links for a capture that is not HTML, on both surfaces', async () => {
+      serve('{"links": ["https://example.com/"]}', []);
+
+      const { page, content } = await read({ include_links: true });
+
+      expect(page.links).toStrictEqual([]);
+      expect(page.total_links).toBe(0);
+      expect(content).toMatch(/\*\*Links on this page:\*\* 0 of 0$/);
+    });
+
+    it('rejects an include_links that is not a boolean by its type, without a Wayback call', async () => {
+      const result = await runToolContract(iaGetSnapshot, {
+        url: PAGE_URL,
+        timestamp: TIMESTAMP,
+        include_links: 'yes',
+      });
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'invalid_arguments' },
+      });
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain('include_links:');
+      expect(text).not.toContain('Unrecognized key');
+      expect(mockService.fetchContent).not.toHaveBeenCalled();
+    });
+  });
+
   describe('format', () => {
     it('renders replay URL, resolved timestamp, status, paging, and text', () => {
       const output = {
@@ -1569,6 +1839,84 @@ describe('iaGetSnapshot', () => {
       );
       expect(text).toContain(output.text);
     });
+
+    it('keeps a page’s leading tab and spaces, cell tabs, and blank line, so the text reads back exactly (#66)', () => {
+      const replay =
+        'https://web.archive.org/web/20150103131822/http://www.iana.org/domains/reserved';
+      const text =
+        '\tTitle\t\tReserved Top Level DNS Names\n   1. Introduction....1\nDomain\tLanguage\n\nEnd of text';
+      const [block] = iaGetSnapshot.format!({
+        text,
+        replay_url: replay,
+        resolved_timestamp: '20150103131822',
+        resolved_status: '200',
+        char_offset: 0,
+        max_chars: 50_000,
+        has_more: false,
+        total_chars: text.length,
+      }) as [{ text: string }];
+
+      // A CommonMark parse reads the text back exactly: edge whitespace as character
+      // references, each line break as a hard break, the blank line as one standing alone.
+      expect(block.text).toBe(
+        `**Replay URL:** [${replay}](<${replay}>)\n**Resolved Timestamp:** 20150103131822 | **Status:** 200\n**Offset:** 0 | **Max Chars:** 50,000 | **Total Chars:** 89 — end of text\n\n---\n\n&#9;Title\t\tReserved Top Level DNS Names\\\n&#32;&#32;&#32;1. Introduction....1\\\nDomain\tLanguage\\\n\\\nEnd of text`,
+      );
+    });
+  });
+
+  describe('links list in format() in linear time (#67)', () => {
+    const fill = (unit: string, n: number): string =>
+      unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+    const url = 'https://example.com/';
+
+    /** Worst cases for the list: label escaping, a URL's destination escaping, and the link count. */
+    const WORST_CASES: [name: string, build: (n: number) => { text: string; url: string }[]][] = [
+      ['a label of brackets and backslashes', (n) => [{ text: fill('\\]', n), url }]],
+      ['a label of backtick runs', (n) => [{ text: fill('``a', n), url }]],
+      [
+        'a label on one long line ending in a break',
+        (n) => [{ text: `${fill('§1 x', n - 2)}\ny`, url }],
+      ],
+      ['a label of breaks throughout', (n) => [{ text: fill('  \r\n', n), url }]],
+      [
+        'a URL of near-entity ampersands',
+        (n) => [{ text: 'a', url: `${url}?${fill('&#1234567', n)}` }],
+      ],
+      [
+        'a URL of angle brackets and backslashes',
+        (n) => [{ text: 'a', url: `${url}${fill('<\\>', n)}` }],
+      ],
+      [
+        'many short links',
+        (n) => Array.from({ length: n / 25 }, (_, i) => ({ text: `l${i}`, url: `${url}${i}` })),
+      ],
+    ];
+
+    /** CPU ceiling per call: 1 µs per character, about 12× the slowest shape measured (a label of breaks throughout: 23 ms at 320k on Bun, 27 ms on Node). */
+    const MAX_CPU_MS_PER_CHAR = 0.001;
+
+    it.each(WORST_CASES)(
+      'renders %s in linear time',
+      async (_name, build) => {
+        await expectLinearDoubling((n) => {
+          const links = build(n);
+          const result = {
+            text: '',
+            replay_url: 'https://web.archive.org/web/20200101000000/https://example.com/',
+            resolved_timestamp: '20200101000000',
+            resolved_status: '200',
+            char_offset: 0,
+            max_chars: 50_000,
+            has_more: false,
+            total_chars: 0,
+            links,
+            total_links: links.length,
+          };
+          return () => iaGetSnapshot.format!(result);
+        }, MAX_CPU_MS_PER_CHAR);
+      },
+      0,
+    );
   });
 
   describe('next-page notice url code span in linear time', () => {
@@ -1585,34 +1933,16 @@ describe('iaGetSnapshot', () => {
       ['breaks throughout', (n) => fill('  \r\n', n)],
     ];
 
-    /** Smallest input; each larger size doubles it, up to 64× at 320k. */
-    const BASE = 5_000;
-    const LARGEST = 320_000;
-
     /** CPU ceiling per call: 0.5 µs per character, about 35× the slowest shape measured (4.5 ms at 320k). */
     const MAX_CPU_MS_PER_CHAR = 0.0005;
 
     it.each(WORST_CASES)(
       'wraps %s in linear time',
       async (_name, build) => {
-        const span = (url: string) => () => markdown().inlineCode(url).build();
-        const base = span(build(BASE));
-        for (let n = BASE * 2; n <= LARGEST; n *= 2) {
-          const large = span(build(n));
-          let growth = Number.POSITIVE_INFINITY;
-          for (let round = 0; round < 3; round++) {
-            const tBase = await cpuMsPerCall(base);
-            const tLarge = await cpuMsPerCall(large);
-            expect(tLarge, `${tLarge.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(
-              n * MAX_CPU_MS_PER_CHAR,
-            );
-            growth = Math.min(growth, tLarge / tBase);
-          }
-          // Linear work grows ×(n / BASE); the bound leaves it 4× headroom, 256 at the full span.
-          expect(growth, `×${growth.toFixed(1)} from ${BASE} to ${n} characters`).toBeLessThan(
-            4 * (n / BASE),
-          );
-        }
+        await expectLinearDoubling((n) => {
+          const url = build(n);
+          return () => markdown().inlineCode(url).build();
+        }, MAX_CPU_MS_PER_CHAR);
       },
       0,
     );

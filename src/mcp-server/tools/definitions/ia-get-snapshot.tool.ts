@@ -8,7 +8,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { startCallDeadline } from '@/services/call-deadline.js';
-import type { ArchivedRedirect, RedirectDeadEnd } from '@/services/wayback/types.js';
+import type { ArchivedRedirect, PageLink, RedirectDeadEnd } from '@/services/wayback/types.js';
 import { captureOf, readCaptureTarget } from '@/services/wayback/wayback-capture-url.js';
 import {
   getWaybackService,
@@ -90,10 +90,30 @@ function deadEndMessage(
     : `No readable capture of ${url} at ${timestamp}: ${deadEndClause(end, false)}.`;
 }
 
+/**
+ * The links whose first occurrence starts in the page of text from `charOffset` up to
+ * `nextOffset`, as `{ text, url }`. The last page, the one reaching the end of the text, also
+ * takes a link starting at the end itself (an image-only link after the last text), so a read
+ * that follows has_more meets each link once. A page at or past the end of the text holds
+ * none, except the one page of an empty text.
+ */
+function linksOnPage(
+  links: readonly PageLink[],
+  charOffset: number,
+  nextOffset: number,
+  totalChars: number,
+): { text: string; url: string }[] {
+  if (charOffset > 0 && charOffset >= totalChars) return [];
+  const end = nextOffset < totalChars ? nextOffset : Number.POSITIVE_INFINITY;
+  return links
+    .filter(({ offset }) => charOffset <= offset && offset < end)
+    .map(({ text, url }) => ({ text, url }));
+}
+
 export const iaGetSnapshot = tool('ia_get_snapshot', {
   title: 'Get Wayback Machine Snapshot Content',
   description:
-    'Fetch the archived content of a URL at a specific Wayback Machine timestamp, or of the capture a Wayback capture URL such as a replay_url names. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text with its markup stripped, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass it with the url and timestamp the notice names, so every page comes from the same capture; after an archived redirect that url differs from the one sent. Use ia_find_snapshots first to discover valid timestamps for a URL.',
+    'Fetch the archived content of a URL at a specific Wayback Machine timestamp, or of the capture a Wayback capture URL such as a replay_url names. Resolves to the nearest available capture when the exact timestamp has no snapshot. Returns the capture as text — an HTML page as readable plain text in lines, its markup stripped and its table cells separated by tabs, another text type (plain text, JSON, XML, JavaScript) as stored — and the replay URL of the capture Wayback served, for browser access. With include_links, it also returns the links on the page as text and URL, so a linked page can be read next. A capture of a PDF, image, or other non-text file fails as non_text_capture. Long text comes one page at a time: has_more and total_chars say what remains, and char_offset reads further — pass it with the url and timestamp the notice names, so every page comes from the same capture; after an archived redirect that url differs from the one sent. Use ia_find_snapshots first to discover valid timestamps for a URL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -125,13 +145,19 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .describe(
         'Maximum characters this page holds. Defaults to the server-configured maximum (IA_MAX_SNAPSHOT_CHARS, typically 50 000); a larger value is served at that maximum, with a notice.',
       ),
+    include_links: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Also return the page's links: links holds each http(s) link target whose first occurrence starts in this page of text, as { text, url }, and total_links counts the links in the capture's whole text. It adds no request. Keep it set for the next page, as the next-page notice does, so a read that follows has_more lists each link once.",
+      ),
   }),
 
   output: z.object({
     text: z
       .string()
       .describe(
-        "One page of the capture's text: up to max_chars characters from char_offset. An HTML page is reduced to readable plain text: scripts, styles, comments, and tags removed, character references decoded, whitespace collapsed. Another text type (plain text, JSON, XML, JavaScript) is the body as archived, line breaks and markup kept. Taken from at most the first 4 MiB of the capture; a notice says so when it is longer.",
+        "One page of the capture's text: up to max_chars characters from char_offset. An HTML page is reduced to readable plain text in lines: scripts, styles, comments, and tags removed and character references decoded; each block element (paragraph, heading, list item, table row) and <br> starts a new line; the cells of a table row are separated by tabs, empty cells included; <pre> text keeps its spacing and line breaks, and elsewhere a whitespace run reads as one space and blank lines collapse to one. Another text type (plain text, JSON, XML, JavaScript) is the body as archived, line breaks and markup kept. Taken from at most the first 4 MiB of the capture; a notice says so when it is longer.",
       ),
     char_offset: z.number().describe('Character offset (UTF-16 code units) this page starts at.'),
     max_chars: z
@@ -142,7 +168,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     has_more: z
       .boolean()
       .describe(
-        "True when the capture's text continues past this page; the notice names the url, char_offset, and timestamp that read the next one.",
+        "True when the capture's text continues past this page; the notice names the url, char_offset, and timestamp that read the next one, and include_links when this call set it.",
       ),
     total_chars: z
       .number()
@@ -164,6 +190,33 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .describe(
         'HTTP status Wayback replayed the capture the text came from with — the same capture as resolved_timestamp and replay_url.',
       ),
+    links: z
+      .array(
+        z
+          .object({
+            text: z
+              .string()
+              .describe(
+                "The link's text as it reads in text, on one line; empty for a link holding only an image.",
+              ),
+            url: z
+              .string()
+              .describe(
+                'Where the link points: an absolute http(s) URL, its fragment dropped. Read it with ia_get_snapshot and timestamp resolved_timestamp for its capture nearest this one, or, when it is a Wayback capture URL (a link to an archived copy), with a blank timestamp.',
+              ),
+          })
+          .describe('One link: its text and the URL it points to.'),
+      )
+      .optional()
+      .describe(
+        "Set when include_links is true: the links whose first occurrence starts in this page of text, in document order. Each http(s) target is listed once, with the first non-empty text it is linked by; the page's own URL is left out. The last page also takes the links at the very end of the text, so the pages of a read that follows has_more list each link once. Empty for a capture that is not HTML.",
+      ),
+    total_links: z
+      .number()
+      .optional()
+      .describe(
+        "Set when include_links is true: how many links the capture's whole text holds, counted over the same first 4 MiB the text comes from; 0 for a capture that is not HTML.",
+      ),
   }),
 
   enrichment: {
@@ -171,7 +224,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       .string()
       .optional()
       .describe(
-        "Set when the replay passed through an archived redirect (a capture of the site's own 3xx) — the capture requested is one, or Wayback first redirected the requested timestamp to a nearest capture that is one — naming each archived redirect's capture timestamp, HTTP status, and target, the text then coming from the capture Wayback served for the last target; when the capture is longer than the 4 MiB read limit (the text comes from its first bytes only); when max_chars is above the server maximum; or when more text follows this page — naming the url, char_offset, and timestamp that read the next one.",
+        "Set when the replay passed through an archived redirect (a capture of the site's own 3xx) — the capture requested is one, or Wayback first redirected the requested timestamp to a nearest capture that is one — naming each archived redirect's capture timestamp, HTTP status, and target, the text then coming from the capture Wayback served for the last target; when the capture is longer than the 4 MiB read limit (the text comes from its first bytes only); when max_chars is above the server maximum; or when more text follows this page — naming the url, char_offset, and timestamp that read the next one, and include_links when this call set it.",
       ),
   },
 
@@ -254,7 +307,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         ? { snapshotUrl: svc.buildReplayUrl(exact, url), timestamp: exact }
         : await svc.findClosest(url, timestamp, ctx, deadline);
       fetching = timestamp ?? resolved.timestamp;
-      const content = await svc.fetchContent(resolved.snapshotUrl, ctx, deadline);
+      // Links are asked for only when wanted, so a call without include_links fetches as before.
+      const content = input.include_links
+        ? await svc.fetchContent(resolved.snapshotUrl, ctx, deadline, { links: true })
+        : await svc.fetchContent(resolved.snapshotUrl, ctx, deadline);
       const resolvedTimestamp = content.timestamp ?? resolved.timestamp;
 
       // Pages count UTF-16 code units, as ia_get_text's do, and never exceed the ceiling.
@@ -292,7 +348,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         const lookedUp = (content.redirects && captureOf(content.replayUrl)?.original) ?? url;
         const nextUrl = captureOf(lookedUp) ? content.replayUrl : lookedUp;
         notices.push(
-          `More text follows: call ia_get_snapshot again with url ${code(nextUrl)}, timestamp ${resolvedTimestamp} (resolved_timestamp), and char_offset ${nextOffset} for the next page.`,
+          `More text follows: call ia_get_snapshot again with url ${code(nextUrl)}, timestamp ${resolvedTimestamp} (resolved_timestamp), ${input.include_links ? `char_offset ${nextOffset}, and include_links true` : `and char_offset ${nextOffset}`} for the next page.`,
         );
       }
       if (notices.length) ctx.enrich.notice(notices.join(' '));
@@ -312,6 +368,10 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
         max_chars: maxChars,
         has_more: hasMore,
         total_chars: totalChars,
+        ...(content.links && {
+          links: linksOnPage(content.links, input.char_offset, nextOffset, totalChars),
+          total_links: content.links.length,
+        }),
       };
     } catch (err) {
       if (
@@ -399,6 +459,11 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       '',
       escapeMarkdownInline(result.text),
     ];
+    const { links, total_links } = result;
+    if (links && total_links !== undefined) {
+      lines.push('', `**Links on this page:** ${count(links.length)} of ${count(total_links)}`);
+      if (links.length > 0) lines.push('', ...links.map((l) => `- ${markdownLink(l.text, l.url)}`));
+    }
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

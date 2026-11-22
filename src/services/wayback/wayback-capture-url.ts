@@ -1,8 +1,9 @@
 /**
  * @fileoverview A Wayback Machine capture URL in `url` — `web.archive.org/web/<timestamp>/<original>`,
  * the form of the `replay_url` both Wayback tools return — read as the URL it archives and its
- * timestamp, together with the tool's own `timestamp`, before any request is sent; and the
- * original URL a capture URL names, for a replay redirect's target or the capture served.
+ * timestamp, together with the tool's own `timestamp`, before any request is sent; the
+ * original URL a capture URL names, for a replay redirect's target or the capture served;
+ * and the URL an `href` on a replayed page names, for the page's links.
  * @module services/wayback/wayback-capture-url
  */
 
@@ -64,6 +65,29 @@ export function captureOf(value: string): { digits: string; original: string } |
   const original = match ? path.slice(match[0].length) : '';
   if (!digits || !original) return;
   return { digits, original: ENCODED_SCHEME.test(original) ? decodeOnce(original) : original };
+}
+
+/** The origin replays are served from, which a root-relative `/web/` href on a replay names. */
+const WAYBACK_ORIGIN = 'https://web.archive.org';
+
+/**
+ * The URL an `href` on a replayed page names, as the archived page meant it, any scheme and
+ * its fragment kept; undefined when it does not parse. Tabs and line breaks are removed and
+ * the ends trimmed, as a URL parser does. An href Wayback rewrote — a root-relative
+ * `/web/<timestamp>/…`, or an absolute or protocol-relative URL on a `WAYBACK_HOSTS` host,
+ * that `captureOf` reads — names the original inside it, read once, so a link to an
+ * archived copy keeps that copy's capture URL and a rewritten `mailto:` reads as one again.
+ * Any other href, a `/web/` path naming no capture included, resolves against `base`.
+ */
+export function hrefTarget(href: string, base: URL | undefined): URL | undefined {
+  const value = href.replace(/[\t\n\r]/g, '').trim();
+  const absolute = value.startsWith('/web/')
+    ? `${WAYBACK_ORIGIN}${value}`
+    : value.startsWith('//')
+      ? `https:${value}`
+      : value;
+  const capture = SCHEME.test(absolute) ? captureOf(absolute) : undefined;
+  return (capture ? URL.parse(capture.original) : URL.parse(value, base)) ?? undefined;
 }
 
 /** `text` percent-decoded once, or as given when it holds a `%` that starts no escape. */

@@ -12,6 +12,7 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { httpErrorFromResponse } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchWithTimeout = vi.fn();
@@ -41,6 +42,7 @@ import { WaybackService } from '@/services/wayback/wayback-service.js';
 import {
   CPU_TIMED_TEST_TIMEOUT_MS,
   cpuMsPerCall,
+  expectLinearDoubling,
   expectLinearScaling,
 } from '../helpers/cpu-time.js';
 
@@ -87,11 +89,11 @@ beforeEach(() => {
 });
 
 describe('fetchContent text extraction — existing behavior', () => {
-  it('drops script and style bodies, strips tags, and collapses whitespace', async () => {
+  it('drops script and style bodies, strips tags, and writes block elements as lines (#66)', async () => {
     const html =
       '<html><head><title>T</title><style>p { color: red }</style>' +
       '<script>var x = 1;</script></head>\n<body>  <p>Hello</p>\n\n<p>world</p></body></html>';
-    expect(await textOf(html)).toBe('T Hello world');
+    expect(await textOf(html)).toBe('T\nHello\nworld');
   });
 
   it('decodes the core references', async () => {
@@ -102,8 +104,14 @@ describe('fetchContent text extraction — existing behavior', () => {
     expect(await textOf('a < b and 3<4')).toBe('a < b and 3<4');
   });
 
-  it('separates adjacent cells with a space', async () => {
-    expect(await textOf('<td>Home</td><td>News</td>')).toBe('Home News');
+  it('separates adjacent cells with a tab (#66)', async () => {
+    expect(await textOf('<td>Home</td><td>News</td>')).toBe('Home\tNews');
+  });
+
+  it('keeps the spacing and line breaks of <pre> text (#66)', async () => {
+    expect(
+      await textOf('<p>Contents</p><pre>\n   <a href="#s1">1</a>. Intro....1\n\n x</pre>'),
+    ).toBe('Contents\n   1. Intro....1\n\n x');
   });
 
   it('returns the whole extracted text, with no character cap of its own (#44)', async () => {
@@ -115,6 +123,301 @@ describe('fetchContent text extraction — existing behavior', () => {
   it('decodes an undeclared UTF-8 page as UTF-8', async () => {
     const bytes = new TextEncoder().encode('<p>Actualités — ünïcödé</p>');
     expect((await fetchContent(served(bytes))).text).toBe('Actualités — ünïcödé');
+  });
+});
+
+describe('fetchContent links (#67)', () => {
+  /** fetchContent of `snapshotUrl`, the upstream answering each request in turn with `responses`, with `options`. */
+  const fetchWith = (
+    options: { links?: boolean } | undefined,
+    snapshotUrl: string,
+    ...responses: Response[]
+  ) => {
+    for (const response of responses) fetchWithTimeout.mockResolvedValueOnce(response);
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    return buildService().fetchContent(snapshotUrl, ctx, startCallDeadline(ctx.signal), options);
+  };
+
+  /** The links of `html` served as an HTML replay of `snapshotUrl`. */
+  const linksOf = async (html: string, snapshotUrl = SNAPSHOT) =>
+    (await fetchWith({ links: true }, snapshotUrl, served(html))).links;
+
+  /** Each link's text and URL, without its offset. */
+  const targets = (links: { text: string; url: string }[] | undefined) =>
+    links?.map(({ text, url }) => ({ text, url }));
+
+  it('returns what it returned before without links: true, no links field included', async () => {
+    const html = '<p>See the <a href="Summary.html">executive summary</a>.</p>';
+    const omitted = await fetchContent(served(html));
+    const off = await fetchWith({ links: false }, SNAPSHOT, served(html));
+    const on = await fetchWith({ links: true }, SNAPSHOT, served(html));
+    expect(omitted).toEqual({
+      text: 'See the executive summary .',
+      replayUrl: SNAPSHOT,
+      timestamp: '20120601000000',
+      status: '200',
+    });
+    expect('links' in omitted).toBe(false);
+    expect('links' in off).toBe(false);
+    expect(off).toEqual(omitted);
+    const { links: _links, ...rest } = on;
+    expect(rest).toEqual(omitted);
+  });
+
+  const CERN =
+    'https://web.archive.org/web/20151231164925/http://info.cern.ch/hypertext/WWW/TheProject.html';
+  /** Lines 16–39 of the 20151231164925 replay of the CERN project page, as Wayback serves them. */
+  const CERN_REPLAY = `<body>
+<h1>World Wide Web</h1>The WorldWideWeb (W3) is a wide-area<a name="0" href="WhatIs.html">
+hypermedia</a> information retrieval
+initiative aiming to give universal
+access to a large universe of documents.<p>
+Everything there is online about
+W3 is linked directly or indirectly
+to this document, including an <a name="24" href="Summary.html">executive
+summary</a> of the project, <a name="29" href="Administration/Mailing/Overview.html">Mailing lists</a>
+, <a name="30" href="Policy.html">Policy</a> , November's  <a name="34" href="News/9211.html">W3  news</a> ,
+<a name="41" href="FAQ/List.html">Frequently Asked Questions</a> .
+<dl>
+<dt><a name="44" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/Top.html">What's out there?</a>
+<dd> Pointers to the
+world's online information,<a name="45" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/bySubject/Overview.html"> subjects</a>
+, <a name="z54" href="/web/20151231164925/http://info.cern.ch/hypertext/DataSources/WWW/Servers.html">W3 servers</a>, etc.
+<dt><a name="46" href="Help.html">Help</a>
+<dd> on the browser you are using
+<dt><a name="13" href="Status.html">Software Products</a>
+<dd> A list of W3 project
+components and their current state.
+(e.g. <a name="27" href="LineMode/Browser.html">Line Mode</a> ,X11 <a name="35" href="Status.html#35">Viola</a> ,  <a name="26" href="NeXT/WorldWideWeb.html">NeXTStep</a>
+, <a name="25" href="Daemon/Overview.html">Servers</a> , <a name="51" href="Tools/Overview.html">Tools</a> ,<a name="53" href="MailRobot/Overview.html"> Mail robot</a> ,<a name="52" href="Status.html#57">
+Library</a> )`;
+
+  it('lists the CERN page’s links: relative hrefs against the page URL, rewritten ones read once, Status.html#35 and #57 folded into Status.html', async () => {
+    const result = await fetchWith({ links: true }, CERN, served(CERN_REPLAY));
+    const www = 'http://info.cern.ch/hypertext/WWW/';
+    const sources = 'http://info.cern.ch/hypertext/DataSources/';
+    expect(targets(result.links)).toEqual([
+      { text: 'hypermedia', url: `${www}WhatIs.html` },
+      { text: 'executive summary', url: `${www}Summary.html` },
+      { text: 'Mailing lists', url: `${www}Administration/Mailing/Overview.html` },
+      { text: 'Policy', url: `${www}Policy.html` },
+      { text: 'W3 news', url: `${www}News/9211.html` },
+      { text: 'Frequently Asked Questions', url: `${www}FAQ/List.html` },
+      { text: "What's out there?", url: `${sources}Top.html` },
+      { text: 'subjects', url: `${sources}bySubject/Overview.html` },
+      { text: 'W3 servers', url: `${sources}WWW/Servers.html` },
+      { text: 'Help', url: `${www}Help.html` },
+      { text: 'Software Products', url: `${www}Status.html` },
+      { text: 'Line Mode', url: `${www}LineMode/Browser.html` },
+      { text: 'NeXTStep', url: `${www}NeXT/WorldWideWeb.html` },
+      { text: 'Servers', url: `${www}Daemon/Overview.html` },
+      { text: 'Tools', url: `${www}Tools/Overview.html` },
+      { text: 'Mail robot', url: `${www}MailRobot/Overview.html` },
+    ]);
+    for (const { offset, text } of result.links ?? []) {
+      expect(result.text.slice(offset, offset + text.length)).toBe(text);
+    }
+    expect(result.links?.[0]?.offset).toBe(result.text.indexOf('hypermedia'));
+    expect(fetchWithTimeout.mock.calls.map((call) => String(call[0]))).toEqual([CERN]);
+  });
+
+  const TYPO3 = 'https://web.archive.org/web/20070101025432/http://typo3.org/';
+
+  it('resolves against a rewritten <base href>, leaving out the page itself and javascript: links', async () => {
+    const html = `<head><base href="${TYPO3}"/></head><body><div id="logo"><a href=""><img alt="TYPO3"/></a></div><a href="about/">About</a> Author:&nbsp;<a href="javascript:linkTo_UnCryptMailto('pdlowr-qhwvhuylfhCqlhnrp1gh');">Peter Niederlag</a></body>`;
+    expect(targets(await linksOf(html, TYPO3))).toEqual([
+      { text: 'About', url: 'http://typo3.org/about/' },
+    ]);
+  });
+
+  it.each([
+    [
+      'the first <base href>, read once',
+      `<base target="_top"><base href="${TYPO3}"><base href="http://other.example/">`,
+      'http://typo3.org/about/',
+    ],
+    [
+      'a <base href> Wayback did not rewrite',
+      '<base href="http://typo3.org/">',
+      'http://typo3.org/about/',
+    ],
+    [
+      'the page URL, when <base href> does not parse',
+      '<base href="http://[">',
+      'https://www.nasa.gov/about/',
+    ],
+    [
+      'the page URL, when no <base> has an href',
+      '<base target="_top">',
+      'https://www.nasa.gov/about/',
+    ],
+  ])('resolves a relative href against %s', async (_name, head, url) => {
+    expect(targets(await linksOf(`${head}<a href="about/">About</a>`))).toEqual([
+      { text: 'About', url },
+    ]);
+  });
+
+  it('resolves against a relative <base href> Wayback did not rewrite, read against the page URL', async () => {
+    const page = 'https://web.archive.org/web/20120601000000/http://example.com/x/y.html';
+    expect(await linksOf('<base href="/docs/"><a href="a.html">A</a>', page)).toEqual([
+      { offset: 0, text: 'A', url: 'http://example.com/docs/a.html' },
+    ]);
+  });
+
+  it('resolves relative hrefs against the page an archived redirect led to, leaving that page out', async () => {
+    const asked = 'https://web.archive.org/web/20240515003448/http://example.com/';
+    const target = 'https://web.archive.org/web/20240515003448/http://example.com/home/index.html';
+    // The 302 the replay answers with, rejected as fetchWithTimeout rejects a 3xx under redirect: 'manual'.
+    fetchWithTimeout.mockRejectedValueOnce(
+      await httpErrorFromResponse(
+        new Response(null, {
+          status: 302,
+          headers: {
+            location: '/web/20240515003448/http://example.com/home/index.html',
+            'memento-datetime': 'Wed, 15 May 2024 00:34:48 GMT',
+          },
+        }),
+        { errorHeaders: ['memento-datetime', 'location'] },
+      ),
+    );
+
+    const result = await fetchWith(
+      { links: true },
+      asked,
+      served('<a href="about.html">About</a> <a href="index.html">Home</a>'),
+    );
+
+    expect(result.links).toEqual([
+      { offset: 0, text: 'About', url: 'http://example.com/home/about.html' },
+    ]);
+    expect(result.replayUrl).toBe(target);
+    expect(fetchWithTimeout.mock.calls.map((call) => String(call[0]))).toEqual([asked, target]);
+  });
+
+  it('leaves out rewritten mailto: and ftp:, other schemes, fragments, and the page itself', async () => {
+    const page =
+      'https://web.archive.org/web/20221231052306/https://datatracker.ietf.org/doc/html/rfc2606';
+    const html = `<a href="#section-1">1</a> <a href="https://web.archive.org/web/20221231052306/mailto:d3e3e3%40gmail.com">mail</a> <a href="https://web.archive.org/web/20221231052306/ftp://rs.internic.net/archives/namedroppers">ftp</a> <a href="javascript:void(0)">js</a> <a href="tel:+1">tel</a> <a href="/web/20221231052306/https://datatracker.ietf.org/doc/html/rfc2606">self</a> <a href="https://datatracker.ietf.org/doc/html/rfc2606#page-2">page 2</a> <a href="/web/20221231052306/https://www.rfc-editor.org/info/rfc2606">RFC Editor</a>`;
+    expect(targets(await linksOf(html, page))).toEqual([
+      { text: 'RFC Editor', url: 'https://www.rfc-editor.org/info/rfc2606' },
+    ]);
+  });
+
+  it('keeps a link to an archived copy as its capture URL, and reads a protocol-relative capture URL', async () => {
+    const wwii =
+      'https://web.archive.org/web/20200101030920/https://en.wikipedia.org/wiki/World_War_II';
+    const archived =
+      'https://web.archive.org/web/20180325210216/http://ibiblio.org/pha/policy/1941/411209b.html';
+    const html = `<a href="/web/20200101030920/${archived}">Proclamation</a> <a href="//web.archive.org/web/20200101030920/https://en.wikipedia.org/wiki/Axis_powers">Axis</a>`;
+    expect(targets(await linksOf(html, wwii))).toEqual([
+      { text: 'Proclamation', url: archived },
+      { text: 'Axis', url: 'https://en.wikipedia.org/wiki/Axis_powers' },
+    ]);
+  });
+
+  it('lists a repeated target once, at its first anchor, with the first non-empty text', async () => {
+    const html =
+      '<a href="a.html"><img alt="logo"></a> x <a href="a.html#top">Home</a> <a href="a.html">Again</a> <a href="b.html">First</a> <a href="b.html">Second</a>';
+    expect(await linksOf(html)).toEqual([
+      { offset: 0, text: 'Home', url: 'https://www.nasa.gov/a.html' },
+      { offset: 13, text: 'First', url: 'https://www.nasa.gov/b.html' },
+    ]);
+  });
+
+  it('reads a link’s text on one line, and an href’s character references decoded', async () => {
+    const html = '<table><tr><td><a href="q?x=1&amp;y=2">a<br>b</td><td>c</a></td></tr></table>';
+    const result = await fetchWith({ links: true }, SNAPSHOT, served(html));
+    expect(result.text).toBe('a\nb\tc');
+    expect(result.links).toEqual([
+      { offset: 0, text: 'a b c', url: 'https://www.nasa.gov/q?x=1&y=2' },
+    ]);
+  });
+
+  it('returns no links for an HTML page without anchors', async () => {
+    expect(await linksOf('<p>no links here</p>')).toEqual([]);
+  });
+
+  it('returns no links for a capture read as another text type', async () => {
+    const utf8 = (text: string) => new TextEncoder().encode(text);
+    const result = await fetchWith(
+      { links: true },
+      SNAPSHOT,
+      served(utf8('<a href="/web/2012/http://a.example/">rewritten</a>'), {
+        contentType: 'text/plain',
+      }),
+      served(utf8('<a href="http://a.example/">raw</a>'), { contentType: 'text/plain' }),
+    );
+    expect(result.text).toBe('<a href="http://a.example/">raw</a>');
+    expect(result.links).toEqual([]);
+  });
+
+  it('reads links from the bytes its text comes from: none past the 4 MiB read', async () => {
+    const html = `<a href="a.html">a</a>${'x'.repeat(4 * 1024 * 1024)}<a href="b.html">b</a>`;
+    const result = await fetchWith({ links: true }, SNAPSHOT, served(html));
+    expect(result.truncatedAtBytes).toBe(4 * 1024 * 1024);
+    expect(targets(result.links)).toEqual([{ text: 'a', url: 'https://www.nasa.gov/a.html' }]);
+  });
+
+  describe('in linear time', () => {
+    /** `n` characters of `unit(i)` for i = 0, 1, 2, …, so each repeat can name a different target. */
+    const fill = (unit: (i: number) => string, n: number): string => {
+      let html = '';
+      for (let i = 0; html.length < n; i++) html += unit(i);
+      return html.slice(0, n);
+    };
+
+    /** Link lists of every shape: distinct targets with and without text, one target repeated, targets left out, `<base>` runs, an unclosed anchor. */
+    const WORST_CASES: readonly [string, (n: number) => string][] = [
+      [
+        'distinct label-less links',
+        (n) => fill((i) => `<a href="/web/2012/http://e.com/${i}"></a>`, n),
+      ],
+      ['distinct labelled links', (n) => fill((i) => `<a href="p${i}.html">p${i}</a> `, n)],
+      ['one target repeated', (n) => fill(() => '<a href="x.html">x</a> ', n)],
+      [
+        'one target repeated without text, then with',
+        (n) => `${fill(() => '<a href="x.html"></a>', n - 22)}<a href="x.html">x</a>`,
+      ],
+      ['self and fragment links', (n) => fill((i) => `<a href="#s${i}">s</a> `, n)],
+      [
+        'rewritten mailto: links',
+        (n) => fill((i) => `<a href="/web/2012/mailto:a${i}@e.com">m</a> `, n),
+      ],
+      [
+        'runs of <base href>',
+        (n) => `${fill(() => '<base href="/web/2012/http://b.example/">', n - 20)}<a href=x>x</a>`,
+      ],
+      [
+        'an unclosed <a> before long text',
+        (n) => `<a href="x.html">${fill(() => 'word ', n - 17)}`,
+      ],
+      [
+        'one long line ending in a break inside an anchor',
+        (n) => `<a href=x>${fill(() => '§1 x', n - 12)}\ny`,
+      ],
+      ['breaks throughout an anchor', (n) => `<a href=x>${fill(() => '  \r\n', n - 10)}`],
+    ];
+
+    /** CPU ceiling per call: 0.5 µs per character, about 10× the slowest shape measured (16 ms at 320k). */
+    const MAX_CPU_MS_PER_CHAR = 0.0005;
+
+    /** One fetchContent call with links over `html`, as a thunk to time. */
+    const fetchOver = (html: string) => {
+      const svc = buildService();
+      const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+      return () => {
+        fetchWithTimeout.mockResolvedValueOnce(served(html));
+        return svc.fetchContent(SNAPSHOT, ctx, startCallDeadline(ctx.signal), { links: true });
+      };
+    };
+
+    it.each(WORST_CASES)(
+      'reads the links of %s in linear time',
+      async (_name, build) => {
+        await expectLinearDoubling((n) => fetchOver(build(n)), MAX_CPU_MS_PER_CHAR);
+      },
+      0,
+    );
   });
 });
 
@@ -177,7 +480,7 @@ describe('fetchContent character references (#8)', () => {
       '<a href="/audience/foreducators/">For Educators</a></div>' +
       '<p class="more"><a href="/about/">&rsaquo; Learn How</a></p>';
     const text = await textOf(html);
-    expect(text).toBe('For Public | For Educators › Learn How');
+    expect(text).toBe('For Public | For Educators\n› Learn How');
     expect(text).not.toMatch(/&#?\w+;/);
   });
 });
@@ -337,13 +640,13 @@ describe('fetchContent charset (#25)', () => {
       `</head><body>${PAGE}</body></html>`;
     expect(html.indexOf('<meta')).toBeGreaterThan(1024);
     const result = await fetchContent(served(latin1(html)));
-    expect(result.text).toBe(`Le Monde.fr : A la Une ${WANT}`);
+    expect(result.text).toBe(`Le Monde.fr : A la Une\n${WANT}`);
     expect(result.text).not.toContain('�');
   });
 
   it('decodes with a meta charset attribute', async () => {
     const html = `<meta charset="windows-1252">${PAGE} &#8212; \x93quoted\x94`;
-    expect((await fetchContent(served(latin1(html)))).text).toBe(`${WANT} — “quoted”`);
+    expect((await fetchContent(served(latin1(html)))).text).toBe(`${WANT}\n— “quoted”`);
   });
 
   it('prefers the Content-Type charset over the document declaration', async () => {
@@ -519,7 +822,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
     expect(stats.cancelled).toBe(true);
     expect(stats.pulled).toBeLessThan(200);
     expect(stats.pulled * CHUNK).toBeLessThanOrEqual(CEILING + 2 * CHUNK);
-    expect(result.text.startsWith('word word')).toBe(true);
+    expect(result.text.startsWith('word\nword')).toBe(true);
   });
 
   it('extracts no markup from a tag the cut splits', async () => {
@@ -574,7 +877,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
     );
 
     expect(result.truncatedAtBytes).toBe(CEILING);
-    expect(result.text.startsWith('é é')).toBe(true);
+    expect(result.text.startsWith('é\né')).toBe(true);
     expect(result.text.endsWith('xé')).toBe(true);
   });
 
@@ -606,7 +909,7 @@ describe('fetchContent byte ceiling (#28)', { timeout: 60_000 }, () => {
     const result = await fetchContent(served(body));
 
     expect(result.truncatedAtBytes).toBe(CEILING);
-    expect(result.text.slice(0, 20)).toBe('Actualités x x x x x');
+    expect(result.text.slice(0, 20)).toBe('Actualités\nx\nx\nx\nx\nx');
   });
 });
 
@@ -665,7 +968,7 @@ describe('fetchContent media-type routing (#49)', () => {
       SNAPSHOT,
       served(utf8('<p>a</p>\n<p>b &amp; c</p>'), { contentType }),
     );
-    expect(result.text).toBe('a b & c');
+    expect(result.text).toBe('a\nb & c');
     expect(requestedUrls()).toEqual([SNAPSHOT]);
   });
 

@@ -17,10 +17,22 @@ const MAX_FILES_CAP = 500;
 /** The largest `max_files` accepted: above the largest manifest measured (288,113 files). */
 const MAX_FILES_CEILING = 300_000;
 
+/**
+ * A license value as a link labelled with itself when it is an absolute http(s) URL, the one
+ * form `markdownLink` links; any other value once as literal text, where `markdownLink` would
+ * write it twice as `value (value)`.
+ */
+const urlLink = (url: string): string => {
+  const protocol = /[\r\n]/.test(url) ? undefined : URL.parse(url)?.protocol;
+  return protocol === 'http:' || protocol === 'https:'
+    ? markdownLink(url, url)
+    : escapeMarkdownInline(url);
+};
+
 export const iaGetItem = tool('ia_get_item', {
   title: 'Get Internet Archive Item',
   description:
-    'Retrieve metadata and the file manifest for an Internet Archive item by identifier. Returns title, creator, description (as plain text), subjects, collections, license, language, publisher, ISBN, OCLC and LCCN numbers, Open Library edition and work IDs, volume, the page-image count of a text item, whether the item is access-restricted, the total file count, and a page of files, each with its format, size, and direct download URL; a file marked private cannot be downloaded. Pages hold up to max_files files (default 50, at most 500 per call) starting at file_offset; set format to keep a single file type (e.g. "DjVuTXT", "Text PDF", "VBR MP3"). The primary tool to act on a search result from ia_search_items. Use ia_get_text to retrieve the readable text of a text item.',
+    'Retrieve metadata and the file manifest for an Internet Archive item by identifier. Returns title, creator, description (as plain text), the publication date, when the item was made public and when it was added to the Archive, subjects, collections, license, language, publisher, ISBN, OCLC and LCCN numbers, Open Library edition and work IDs, volume, the running time of an audio or video item, the page-image count of a text item, whether the item is access-restricted, the total file count, and a page of files, each with its format, size, and direct download URL, and for an audio or video file the track title, track number, and duration it is catalogued with; a file marked private cannot be downloaded. Pages hold up to max_files files (default 50, at most 500 per call) starting at file_offset; set format to keep a single file type (e.g. "DjVuTXT", "Text PDF", "VBR MP3"). The primary tool to act on a search result from ia_search_items. Use ia_get_text to retrieve the readable text of a text item.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   input: z.object({
@@ -83,7 +95,13 @@ export const iaGetItem = tool('ia_get_item', {
       .describe(
         'Item description when provided, converted from the HTML the Archive stores to plain text: <br> and each paragraph, div, or list item start a new line, existing line breaks are kept, and a link reads as its label followed by its URL in parentheses.',
       ),
-    mediatype: z.string().optional().describe('Media type (texts, audio, movies, etc.).'),
+    mediatype: z
+      .union([
+        z.string().describe('Single media type.'),
+        z.array(z.string().describe('Media type.')).describe('Multiple media types.'),
+      ])
+      .optional()
+      .describe('Media type (texts, audio, movies, etc.); a list is relayed as received.'),
     date: z
       .union([
         z.string().describe('Single date.'),
@@ -91,7 +109,25 @@ export const iaGetItem = tool('ia_get_item', {
       ])
       .optional()
       .describe(
-        'Publication or upload date when provided; a few records carry a list, relayed as received.',
+        'Publication date when provided; a few records carry a list, relayed as received. For when the item reached the Archive, see publicdate and addeddate.',
+      ),
+    publicdate: z
+      .union([
+        z.string().describe('Single public date.'),
+        z.array(z.string().describe('Public date.')).describe('Multiple public dates.'),
+      ])
+      .optional()
+      .describe(
+        'When the item was made public on the Archive, as the Metadata API stores it: "YYYY-MM-DD HH:MM:SS" in UTC; a list is relayed as received. Nearly every item has it, dated or not.',
+      ),
+    addeddate: z
+      .union([
+        z.string().describe('Single added date.'),
+        z.array(z.string().describe('Added date.')).describe('Multiple added dates.'),
+      ])
+      .optional()
+      .describe(
+        'When the item was added to the Archive, as the Metadata API stores it: "YYYY-MM-DD HH:MM:SS" in UTC, or on some records a bare "YYYY-MM-DD"; a list is relayed as received.',
       ),
     subject: z
       .union([
@@ -109,8 +145,20 @@ export const iaGetItem = tool('ia_get_item', {
       ])
       .optional()
       .describe('Collection(s) this item belongs to when provided.'),
-    licenseurl: z.string().optional().describe('License URL when provided.'),
-    rights: z.string().optional().describe('Rights statement when provided.'),
+    licenseurl: z
+      .union([
+        z.string().describe('Single license URL.'),
+        z.array(z.string().describe('License URL.')).describe('Multiple license URLs.'),
+      ])
+      .optional()
+      .describe('License URL when provided; a few records carry a list, relayed as received.'),
+    rights: z
+      .union([
+        z.string().describe('Single rights statement.'),
+        z.array(z.string().describe('Rights statement.')).describe('Multiple rights statements.'),
+      ])
+      .optional()
+      .describe('Rights statement when provided; a few records carry a list, relayed as received.'),
     language: z
       .union([
         z.string().describe('Single language.'),
@@ -130,9 +178,16 @@ export const iaGetItem = tool('ia_get_item', {
         'Publisher statement (e.g. "London : George Allen") when provided; a few records carry a list, relayed as received.',
       ),
     volume: z
-      .string()
+      .union([
+        z.string().describe('Single volume designation.'),
+        z
+          .array(z.string().describe('Volume designation.'))
+          .describe('Multiple volume designations.'),
+      ])
       .optional()
-      .describe('Volume designation when provided (e.g. "2", "v.6", "ser. 3, v. 10 (1912-16)").'),
+      .describe(
+        'Volume designation when provided (e.g. "2", "v.6", "ser. 3, v. 10 (1912-16)"); a few records carry a list (e.g. ["1931", "18"]), relayed as received.',
+      ),
     isbn: z
       .union([
         z.string().describe('Single ISBN.'),
@@ -155,13 +210,36 @@ export const iaGetItem = tool('ia_get_item', {
       .optional()
       .describe('Library of Congress Control Number(s) when provided.'),
     openlibrary_edition: z
-      .string()
+      .union([
+        z.string().describe('Single Open Library edition ID.'),
+        z
+          .array(z.string().describe('Open Library edition ID.'))
+          .describe('Multiple Open Library edition IDs.'),
+      ])
       .optional()
-      .describe('Open Library edition ID (e.g. "OL7173379M") when provided.'),
+      .describe(
+        'Open Library edition ID (e.g. "OL7173379M") when provided; a list is relayed as received.',
+      ),
     openlibrary_work: z
-      .string()
+      .union([
+        z.string().describe('Single Open Library work ID.'),
+        z
+          .array(z.string().describe('Open Library work ID.'))
+          .describe('Multiple Open Library work IDs.'),
+      ])
       .optional()
-      .describe('Open Library work ID (e.g. "OL66554W") when provided.'),
+      .describe(
+        'Open Library work ID (e.g. "OL66554W") when provided; a list is relayed as received.',
+      ),
+    runtime: z
+      .union([
+        z.string().describe('Single running time.'),
+        z.array(z.string().describe('Running time.')).describe('Multiple running times.'),
+      ])
+      .optional()
+      .describe(
+        'Total running time of an audio or video item as catalogued, e.g. "13:06:44", "20:33", or free text such as "27 min 13 sec"; a list is relayed as received.',
+      ),
     image_count: z
       .number()
       .optional()
@@ -182,6 +260,24 @@ export const iaGetItem = tool('ia_get_item', {
         z
           .object({
             name: z.string().describe('Filename relative to the item.'),
+            title: z
+              .string()
+              .optional()
+              .describe(
+                'Track or chapter title of an audio or video file, as catalogued. Some derived copies, such as an Ogg made from an MP3, lack it.',
+              ),
+            track: z
+              .string()
+              .optional()
+              .describe(
+                'Track number as catalogued: "1", "01", or "1/37" (track of total); "0" on checksum and file-list files.',
+              ),
+            length: z
+              .string()
+              .optional()
+              .describe(
+                'Duration as catalogued: minutes and seconds ("06:21") or seconds ("381.1", "1133.07"). The copies of one recording can carry different values, so compare lengths within one format.',
+              ),
             format: z.string().optional().describe('File format (e.g., DjVuTXT, MP3, JPEG).'),
             size: z.string().optional().describe('File size in bytes.'),
             md5: z.string().optional().describe('MD5 checksum when provided.'),
@@ -307,18 +403,12 @@ export const iaGetItem = tool('ia_get_item', {
       returned: page.length,
     });
 
-    // The service maps exactly the metadata fields the output declares, each omitted when absent.
+    // The service maps exactly the metadata and file fields the output declares, each omitted
+    // when absent; only the download URL is renamed.
     return {
       ...item.metadata,
       file_count: item.files.length,
-      files: page.map((f) => ({
-        name: f.name,
-        download_url: f.downloadUrl,
-        ...(f.format ? { format: f.format } : {}),
-        ...(f.size ? { size: f.size } : {}),
-        ...(f.md5 ? { md5: f.md5 } : {}),
-        ...(f.private ? { private: f.private } : {}),
-      })),
+      files: page.map(({ downloadUrl, ...file }) => ({ ...file, download_url: downloadUrl })),
     };
   },
 
@@ -330,6 +420,8 @@ export const iaGetItem = tool('ia_get_item', {
       ['Media Type', result.mediatype],
       ['Creator', result.creator],
       ['Date', result.date],
+      ['Public Date', result.publicdate],
+      ['Added Date', result.addeddate],
       ['Publisher', result.publisher],
       ['Volume', result.volume],
       ['Language', result.language],
@@ -340,14 +432,14 @@ export const iaGetItem = tool('ia_get_item', {
       ['LCCN', result.lccn],
       ['Open Library Edition', result.openlibrary_edition],
       ['Open Library Work', result.openlibrary_work],
+      ['Runtime', result.runtime],
     ];
     for (const [label, value] of labelled) {
       if (value) pushLabelledField(lines, label, value);
     }
     if (result.image_count !== undefined) lines.push(`**Page Images:** ${result.image_count}`);
-    if (result.licenseurl)
-      lines.push(`**License:** ${markdownLink(result.licenseurl, result.licenseurl)}`);
-    if (result.rights) lines.push(`**Rights:** ${escapeMarkdownInline(result.rights)}`);
+    if (result.licenseurl) pushLabelledField(lines, 'License', result.licenseurl, '', urlLink);
+    if (result.rights) pushLabelledField(lines, 'Rights', result.rights);
     if (result.access_restricted) lines.push('**Access Restricted:** true');
     // A list of two or more values already ends with the blank line a new block needs.
     if (result.description) {
@@ -360,6 +452,12 @@ export const iaGetItem = tool('ia_get_item', {
         ? `${result.file_count}`
         : `showing ${result.files.length} of ${result.file_count} in the manifest`;
     lines.push(`**Files (${count}):**`);
+    // An audio or video file's catalogued details, in render order.
+    const details = [
+      ['title', 'Title'],
+      ['track', 'Track'],
+      ['length', 'Length'],
+    ] as const;
     for (const f of result.files) {
       const meta = [
         f.format,
@@ -372,6 +470,11 @@ export const iaGetItem = tool('ia_get_item', {
       lines.push(
         `- **${escapeMarkdownInline(f.name)}**${meta ? ` (${escapeMarkdownInline(meta)})` : ''}: ${markdownLink(f.download_url, f.download_url)}`,
       );
+      // One nested item per detail, so a title holding a comma or a line break keeps its bounds.
+      for (const [key, label] of details) {
+        const value = f[key];
+        if (value) lines.push(`  - **${label}:** ${escapeMarkdownInline(value)}`);
+      }
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

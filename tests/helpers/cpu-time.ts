@@ -79,3 +79,39 @@ export async function expectLinearScaling(
   }
   expect(tLarge / tSmall, timings()).toBeLessThan(256);
 }
+
+/** Smallest input of `expectLinearDoubling`; each larger size doubles it, up to 64× at 320k. */
+const DOUBLING_BASE = 5_000;
+const DOUBLING_LARGEST = 320_000;
+
+/**
+ * Asserts that the work `setup(n)` returns grows linearly as `n` doubles from 5,000 to
+ * 320,000 characters. At each size the call must stay under `maxCpuMsPerChar` CPU
+ * milliseconds per character, and its best time over three rounds, against the smallest
+ * size's, must grow by less than 4× the size ratio, which leaves linear work 4× headroom
+ * (256 at the full span). `verify`, when given, runs on each larger size's call before it
+ * is timed.
+ */
+export async function expectLinearDoubling<T>(
+  setup: (n: number) => () => T,
+  maxCpuMsPerChar: number,
+  verify?: (large: () => T) => unknown,
+): Promise<void> {
+  const base = setup(DOUBLING_BASE);
+  for (let n = DOUBLING_BASE * 2; n <= DOUBLING_LARGEST; n *= 2) {
+    const large = setup(n);
+    await verify?.(large);
+    let growth = Number.POSITIVE_INFINITY;
+    for (let round = 0; round < 3; round++) {
+      const tBase = await cpuMsPerCall(base);
+      const tLarge = await cpuMsPerCall(large);
+      expect(tLarge, `${tLarge.toFixed(3)} ms CPU at ${n} characters`).toBeLessThan(
+        n * maxCpuMsPerChar,
+      );
+      growth = Math.min(growth, tLarge / tBase);
+    }
+    expect(growth, `×${growth.toFixed(1)} from ${DOUBLING_BASE} to ${n} characters`).toBeLessThan(
+      4 * (n / DOUBLING_BASE),
+    );
+  }
+}

@@ -11,7 +11,7 @@ export interface SearchResultItem {
   creator?: string | string[];
   /** Full creator count, present only when `creator` was cut to its first 10. */
   creator_count?: number;
-  /** Publication or upload date(s); a few records carry a list. */
+  /** Publication date(s); a few records carry a list. */
   date?: string | string[];
   /** Total download count. */
   downloads?: number;
@@ -19,6 +19,8 @@ export interface SearchResultItem {
   identifier: string;
   /** Media type (texts, audio, movies, software, image, etc.). */
   mediatype?: string;
+  /** When the item became public on the Archive, ISO 8601 in UTC as Advanced Search returns it. */
+  publicdate?: string | string[];
   /** Item title; a few records carry a list. */
   title?: string | string[];
 }

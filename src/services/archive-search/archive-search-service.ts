@@ -15,6 +15,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getUserAgent } from '@/config/server-config.js';
 import type { CallDeadline } from '../call-deadline.js';
+import { stringOrList } from '../string-or-list.js';
 import {
   bodyReadError,
   isHtmlPage,
@@ -75,6 +76,7 @@ const SEARCH_FIELDS = [
   'creator',
   'mediatype',
   'date',
+  'publicdate',
   'downloads',
   'collection',
 ];
@@ -232,8 +234,9 @@ export class ArchiveSearchService {
    * `response`; that body is answered after one request, as `invalid_query` when the error
    * blames the query or sort and as
    * `search_unavailable` otherwise. An HTTP 5xx, a network error (a connection dropped
-   * mid-body included), an HTML page, an unparseable body, or a body with neither key is
-   * `search_unavailable` after the retry loop; a 429, another 4xx, or a request timeout
+   * mid-body included), an HTML page, an unparseable body, a body with neither key, or `docs`
+   * that are not a list of records is `search_unavailable` after the retry loop; a 429,
+   * another 4xx, or a request timeout
    * (headers or body) is `search_unavailable` after one request, a 429 with a hint to wait.
    * The retry loop runs under what remains of the call's `deadline`, and every request gets the
    * request timeout or what remains, whichever is less; the deadline running out — mid-request,
@@ -241,6 +244,8 @@ export class ArchiveSearchService {
    * Every outage — a timeout, a network error, a 5xx, an unreadable body, or the deadline —
    * carries the outage hint in place of the declared query-text recovery.
    * A caller cancellation or caller-side deadline propagates as the fetch threw it.
+   * Each row's title, creator, mediatype, date, publicdate, and collection are read through
+   * `stringOrList`: a value of any other shape, and a mediatype list, is left out of that row.
    */
   search(params: SearchParams, ctx: Context, deadline: CallDeadline): Promise<SearchResult> {
     const q = searchQuery(params, ctx);
@@ -273,21 +278,25 @@ export class ArchiveSearchService {
           throw bodyReadError(err, UPSTREAM);
         });
         const body = readEnvelope(text, ctx);
-
-        const docs = body.docs ?? [];
         const totalFound = body.numFound ?? 0;
 
-        const items: SearchResultItem[] = docs.map((doc) => {
-          const d = doc as Record<string, unknown>;
-          const collection = d.collection
-            ? withoutFavorites(d.collection as string | string[])
-            : undefined;
+        const items: SearchResultItem[] = body.docs.map((d) => {
+          const title = stringOrList(d.title);
+          const creator = stringOrList(d.creator);
+          const mediatype = stringOrList(d.mediatype);
+          const date = stringOrList(d.date);
+          const publicdate = stringOrList(d.publicdate);
+          const storedCollection = stringOrList(d.collection);
+          const collection =
+            storedCollection === undefined ? undefined : withoutFavorites(storedCollection);
           return {
             identifier: (d.identifier as string) ?? '',
-            ...(d.title ? { title: d.title as string | string[] } : {}),
-            ...(d.creator ? creators(d.creator as string | string[]) : {}),
-            ...(d.mediatype ? { mediatype: d.mediatype as string } : {}),
-            ...(d.date ? { date: d.date as string | string[] } : {}),
+            ...(title !== undefined ? { title } : {}),
+            ...(creator !== undefined ? creators(creator) : {}),
+            // The output row holds one mediatype, so a list of them is left out.
+            ...(typeof mediatype === 'string' ? { mediatype } : {}),
+            ...(date !== undefined ? { date } : {}),
+            ...(publicdate !== undefined ? { publicdate } : {}),
             ...(typeof d.downloads === 'number' ? { downloads: d.downloads } : {}),
             ...(collection ? { collection } : {}),
           };
@@ -372,23 +381,28 @@ function creators(creator: string | string[]): Pick<SearchResultItem, 'creator' 
   return { creator: creator.slice(0, CREATOR_LIMIT), creator_count: creator.length };
 }
 
-/** Fields of the Advanced Search `response` object this service reads. */
+/** Fields of the Advanced Search `response` object this service reads, `docs` checked as records. */
 interface SearchEnvelope {
-  docs?: unknown[];
-  numFound?: number;
+  docs: Record<string, unknown>[];
+  numFound?: number | undefined;
 }
+
+/** A search row as Advanced Search sends one: a JSON object, not `null` or a list. */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /**
  * The `response` object of an Advanced Search body. An `error` body throws after this one
  * request: `invalid_query` when it blames the query or sort, otherwise `search_unavailable`
- * marked `retryable: false`. An HTML page, unparseable text, or a body with neither key throws
- * `search_unavailable` with the outage hint, which the retry loop retries like a 5xx.
+ * marked `retryable: false`. An HTML page, unparseable text, a body with neither key, or `docs`
+ * present but not a list of records throws `search_unavailable` with the outage hint, which the
+ * retry loop retries like a 5xx. An absent or `null` `docs` reads as no rows.
  */
 function readEnvelope(text: string, ctx: Context): SearchEnvelope {
   if (isHtmlPage(text)) {
     throw serviceUnavailable('Advanced Search returned an HTML page instead of JSON.', outage());
   }
-  let parsed: { error?: unknown; response?: SearchEnvelope };
+  let parsed: { error?: unknown; response?: { docs?: unknown; numFound?: number } };
   try {
     parsed = JSON.parse(text) as typeof parsed;
   } catch {
@@ -401,7 +415,14 @@ function readEnvelope(text: string, ctx: Context): SearchEnvelope {
       outage(),
     );
   }
-  return parsed.response;
+  const { docs, numFound } = parsed.response;
+  if (docs != null && !(Array.isArray(docs) && docs.every(isRecord))) {
+    throw serviceUnavailable(
+      'Advanced Search returned results whose docs are not a list of records.',
+      outage(),
+    );
+  }
+  return { docs: docs ?? [], numFound };
 }
 
 /**
