@@ -2,7 +2,7 @@
 
 **Server:** internet-archive-mcp-server
 **Version:** 0.6.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.23`
 **Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
@@ -133,7 +133,7 @@ export function getServerConfig(): ServerConfig {
 
 `parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`IA_USER_AGENT`) not the path (`userAgent`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
 
-For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false`, `1/0`, `yes/no`, `on/off`, `y/n`, and `enabled/disabled` (any case) and rejects anything else, so `=false` actually disables.
 
 ### Server identity and instructions
 

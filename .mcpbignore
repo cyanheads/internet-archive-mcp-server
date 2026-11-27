@@ -29,4 +29,5 @@
 /biome.json
 /tsconfig*.json
 /vitest.config.ts
+/.vitest/
 /node_modules/.vitest-cache/
