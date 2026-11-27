@@ -24,6 +24,7 @@ import {
   rateLimitError,
   statusOf,
   transportError,
+  unansweredRequestError,
   waitPhrase,
 } from '../upstream-errors.js';
 import { decodeHtml, decodeText } from './html-charset.js';
@@ -266,8 +267,8 @@ export class WaybackService {
    * its retries, an HTML or unparseable body, or an `error` in place of a capture, which is
    * not retried — CDX's closest query (`closest` + `sort=closest`, on a different host)
    * answers instead; it also finds captures the Availability API sometimes misses. No answer
-   * at all (a timeout or a network error), a 4xx refusal, and a caller cancellation never
-   * fall back.
+   * at all (a timeout, a network error, or a redirect chain `fetchWithTimeout` refused to
+   * follow), a 4xx refusal, and a caller cancellation never fall back.
    *
    * The Availability attempts and backoffs run under what remains of the call's `deadline`,
    * and the fallback's single attempt gets `CDX_FALLBACK_CEILING_MS`, the request timeout, or
@@ -311,9 +312,10 @@ export class WaybackService {
    * Fetch paginated capture history from the CDX API. Every CDX request — the page, and the
    * re-query a cursor-storage outage falls back to — runs under what remains of the call's
    * `deadline`. A page with no `records` is CDX listing no rows for the query, and nothing
-   * else. Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429 or a
-   * timeout (after one request), an HTML page, an unparseable body or JSON that is not a list
-   * of rows (after retries), or the deadline running out, mid-request or mid-backoff.
+   * else. Throws `cdx_unavailable` on an HTTP 5xx or network error (after retries), a 429, a
+   * timeout, or a redirect chain `fetchWithTimeout` refused to follow (after one request), an
+   * HTML page, an unparseable body or JSON that is not a list of rows (after retries), or the
+   * deadline running out, mid-request or mid-backoff.
    *
    * An exact URL pages through server cursors under every collapse: each page asks CDX for one
    * row past `limit`, and the next page resumes at that unreturned lookahead row's timestamp,
@@ -748,8 +750,11 @@ export class WaybackService {
    * call deadline, whichever is least. With 1 ms or less remaining it sends nothing, since
    * the request could only time out — unless the caller has already left, when the fetch
    * fails at once as the cancellation it is. Any upstream failure or timeout becomes
-   * `lookupFailed`'s declared failure, never a miss. A URL the Wayback Machine does not
-   * serve and a caller cancellation pass through untouched.
+   * `lookupFailed`'s declared failure, never a miss: a timeout, a network error, or a
+   * redirect chain `fetchWithTimeout` refused to follow is first named by what CDX did
+   * (`unansweredRequestError`), a timeout by the limit the attempt was sent under, while the
+   * call deadline running out stays for `lookupFailed` to name. A URL the Wayback Machine
+   * does not serve and a caller cancellation pass through untouched.
    */
   private async closestFromCdx(
     lookup: ClosestLookup,
@@ -761,8 +766,9 @@ export class WaybackService {
     } catch {
       throw this.lookupFailed(lookup, failure);
     }
+    const timeoutMs = Math.min(CDX_FALLBACK_CEILING_MS, lookup.deadline.nextTimeoutMs());
     try {
-      return await this.queryCdxClosest(lookup, ctx);
+      return await this.queryCdxClosest(lookup, timeoutMs, ctx);
     } catch (err) {
       if (
         !(err instanceof McpError) ||
@@ -772,7 +778,10 @@ export class WaybackService {
       ) {
         throw err;
       }
-      throw this.lookupFailed(lookup, failure, err);
+      const answer = lookup.deadline.isExpiry(err)
+        ? err
+        : unansweredRequestError(err, CDX_API.name, timeoutMs, declaredReason(CDX_API, ctx));
+      throw this.lookupFailed(lookup, failure, answer);
     }
   }
 
@@ -836,9 +845,10 @@ export class WaybackService {
   /**
    * An Availability failure the CDX fallback does not stand in for, as callers see it: the
    * call deadline expiring mid-request, mid-backoff, or before a request, which leaves the
-   * fallback no time, or a timeout or network error under the declared reason
-   * (`transportError`). A refusal, a URL the Wayback Machine does not serve, and a
-   * cancellation leave as thrown — a refusal that completed as the deadline ran out included.
+   * fallback no time, or a timeout, a network error, or a refused redirect chain under the
+   * declared reason (`transportError`). A refusal, a URL the Wayback Machine does not serve,
+   * and a cancellation leave as thrown — a refusal that completed as the deadline ran out
+   * included.
    */
   private availabilityError(
     err: unknown,
@@ -866,12 +876,12 @@ export class WaybackService {
 
   /**
    * The capture CDX ranks nearest `timestamp`, preferring a 200 within the first rows, in one
-   * request on the caller's signal, bounded by `CDX_FALLBACK_CEILING_MS`, the request timeout,
-   * or what remains of the call deadline, whichever is least. CDX reads a blank `closest` as
-   * the latest capture.
+   * request on the caller's signal under `timeoutMs`, the fallback's limit. CDX reads a blank
+   * `closest` as the latest capture.
    */
   private async queryCdxClosest(
-    { url, timestamp, deadline }: ClosestLookup,
+    { url, timestamp }: ClosestLookup,
+    timeoutMs: number,
     ctx: Context,
   ): Promise<ClosestSnapshot | undefined> {
     const rows = await this.queryCdx(
@@ -884,10 +894,7 @@ export class WaybackService {
         fl: 'timestamp,original,statuscode',
       }),
       ctx,
-      {
-        signal: ctx.signal,
-        timeoutMs: Math.min(CDX_FALLBACK_CEILING_MS, deadline.nextTimeoutMs()),
-      },
+      { signal: ctx.signal, timeoutMs },
     );
 
     const captures = rows.slice(1);
@@ -986,9 +993,10 @@ export class WaybackService {
   }
 
   /**
-   * Run `fn` under `attempts`. A timeout, a network error once its retries are spent, or the
-   * call `deadline` running out surfaces as `api`'s declared reason (`transportError`);
-   * everything else leaves as it was thrown.
+   * Run `fn` under `attempts`. A timeout, a network error once its retries are spent, a
+   * redirect chain `fetchWithTimeout` refused to follow, or the call `deadline` running out
+   * surfaces as `api`'s declared reason (`transportError`); everything else leaves as it was
+   * thrown.
    */
   private retry<T>(
     api: UpstreamApi,

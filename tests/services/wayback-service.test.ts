@@ -1187,7 +1187,8 @@ describe('WaybackService.findClosest resolution', () => {
       message: FALLBACK_INCOMPLETE.message,
       data: { reason: 'cdx_unavailable', recovery: { hint: FALLBACK_INCOMPLETE.hint } },
     });
-    expect(err.cause).toBe(timedOut);
+    expect(err.cause).toMatchObject({ message: 'CDX API timed out after 25 s.' });
+    expect((err.cause as McpError).cause).toBe(timedOut);
     expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
     const [availabilityTimeout, cdxDeadline] = fetchWithTimeout.mock.calls.map((c) => c[1]);
     expect(availabilityTimeout).toBe(30_000);

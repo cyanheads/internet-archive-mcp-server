@@ -54,11 +54,13 @@ const calls = (match: (r: Request) => boolean) => http.calls.filter((c) => match
 const route = (match: (r: Request) => boolean, respond: FetchMockResponder) =>
   http.route({ match, respond });
 
-const MANIFEST = () =>
-  Response.json({
-    metadata: { identifier: ID, title: 'A Volume', mediatype: 'texts' },
-    files: [{ name: FILE, format: 'DjVuTXT', size: '12' }],
-  });
+/** A text item's metadata: the file list ia_get_text reads, or the whole record ia_get_item reads. */
+const MANIFEST: FetchMockResponder = (request) => {
+  const files = [{ name: FILE, format: 'DjVuTXT', size: '12' }];
+  return request.url === `${ARCHIVE}/metadata/${ID}/files`
+    ? Response.json({ result: files })
+    : Response.json({ metadata: { identifier: ID, title: 'A Volume', mediatype: 'texts' }, files });
+};
 const S503 = () => new Response('Service Unavailable', { status: 503 });
 
 /** Never answers until the request's signal aborts. */

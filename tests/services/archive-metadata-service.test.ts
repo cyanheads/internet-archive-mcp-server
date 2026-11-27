@@ -41,13 +41,9 @@ import { expectLinearDoubling } from '../helpers/cpu-time.js';
 /** A call deadline at the default request timeout, started now. */
 const deadline = () => startCallDeadline(new AbortController().signal);
 
-/** Metadata API response for an item with one readable text file. */
+/** The Metadata API's file list (`/metadata/{identifier}/files`) for an item with one readable text file. */
 const metadataResponse = {
-  text: async () =>
-    JSON.stringify({
-      metadata: { title: 'A Book' },
-      files: [{ name: 'a-book_djvu.txt', format: 'Text' }],
-    }),
+  text: async () => JSON.stringify({ result: [{ name: 'a-book_djvu.txt', format: 'Text' }] }),
 } as Response;
 
 /** Mirror of fetchWithTimeout's status-mapped error for a non-2xx download response. */
@@ -137,6 +133,9 @@ describe('ArchiveMetadataService.getTextContent download contract', () => {
 /** A Metadata API body as the service reads it (`response.text()`). */
 const jsonBody = (body: unknown): Response =>
   ({ text: async () => JSON.stringify(body) }) as Response;
+
+/** The Metadata API's answer to `/metadata/{identifier}/files`, the manifest `getTextContent` reads. */
+const filesBody = (files: unknown): Response => jsonBody({ result: files });
 
 /** Reject any fetch a test did not stage, so an unexpected upstream call fails loudly. */
 const rejectUnstagedFetches = (): void => {
@@ -879,14 +878,11 @@ describe('ArchiveMetadataService.getItem file manifest', () => {
 
   it('keeps the ia_get_text default pick working when another file’s format is not a string', async () => {
     fetchWithTimeout.mockResolvedValueOnce(
-      jsonBody({
-        metadata: {},
-        files: [
-          { name: 'scan_0001.jpg', format: 5 },
-          { name: 'notes.txt', format: ['Text'] },
-          { name: 'book_djvu.txt', format: 'DjVuTXT' },
-        ],
-      }),
+      filesBody([
+        { name: 'scan_0001.jpg', format: 5 },
+        { name: 'notes.txt', format: ['Text'] },
+        { name: 'book_djvu.txt', format: 'DjVuTXT' },
+      ]),
     );
     fetchWithTimeout.mockResolvedValueOnce(new Response('book text'));
 
@@ -944,7 +940,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
       format: 'JPEG Thumb',
     }));
     files[100] = { name: 'big-item_djvu.txt', format: 'DjVuTXT' };
-    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: { title: 'Big' }, files }));
+    fetchWithTimeout.mockResolvedValueOnce(filesBody(files));
     fetchWithTimeout.mockResolvedValueOnce(new Response('Full OCR text.'));
 
     const result = await buildService().getTextContent(
@@ -967,7 +963,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
 
   /** The file the default pick downloads from a manifest of `files`. */
   const defaultPick = async (files: { name: string; format?: string }[]) => {
-    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    fetchWithTimeout.mockResolvedValueOnce(filesBody(files));
     fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
     return (await buildService().getTextContent('an-item', 10, 0, createMockContext(), deadline()))
       .sourceFile;
@@ -1018,14 +1014,11 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
 
   it('answers an item whose only .txt files are Metadata sidecars as no_text_file, with no download', async () => {
     fetchWithTimeout.mockResolvedValueOnce(
-      jsonBody({
-        metadata: {},
-        files: [
-          { name: 'case.pdf', format: 'Text PDF' },
-          { name: 'case.11.0.pdf_meta.txt', format: 'Metadata', size: '834' },
-          { name: 'case.12.0.pdf_meta.txt', format: 'metadata', size: '702' },
-        ],
-      }),
+      filesBody([
+        { name: 'case.pdf', format: 'Text PDF' },
+        { name: 'case.11.0.pdf_meta.txt', format: 'Metadata', size: '834' },
+        { name: 'case.12.0.pdf_meta.txt', format: 'metadata', size: '702' },
+      ]),
     );
 
     await expect(
@@ -1054,7 +1047,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
 
   /** Read `file` from the multi-volume item, or its default pick when `file` is omitted. */
   const readVolume = async (file?: string) => {
-    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files: volumeManifest }));
+    fetchWithTimeout.mockResolvedValueOnce(filesBody(volumeManifest));
     fetchWithTimeout.mockResolvedValueOnce(new Response('volume text'));
     return buildService().getTextContent(
       'strabo',
@@ -1134,7 +1127,7 @@ describe('ArchiveMetadataService.getTextContent text-file selection', () => {
     ['one readable file among sidecars', [djvu, { name: 'x_meta.txt', format: 'Metadata' }]],
     ['one readable file alone', [djvu]],
   ])('reports no textFiles summary for %s', async (_label, files) => {
-    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    fetchWithTimeout.mockResolvedValueOnce(filesBody(files));
     fetchWithTimeout.mockResolvedValueOnce(new Response('text'));
 
     const result = await buildService().getTextContent(
@@ -1229,12 +1222,9 @@ const mixedScriptText = (random: () => number, pieces: number): string => {
   ).join('');
 };
 
-/** A manifest naming one DjVuTXT file, with `size` when given. */
+/** A file list naming one DjVuTXT file, with `size` when given. */
 const textManifest = (size?: string): Response =>
-  jsonBody({
-    metadata: { title: 'A Volume' },
-    files: [{ name: 'volume_djvu.txt', format: 'DjVuTXT', ...(size !== undefined && { size }) }],
-  });
+  filesBody([{ name: 'volume_djvu.txt', format: 'DjVuTXT', ...(size !== undefined && { size }) }]);
 
 describe('ArchiveMetadataService.getTextContent streamed page read', () => {
   beforeEach(rejectUnstagedFetches);
@@ -1684,12 +1674,13 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
       [{ name: 'volume_djvu.txt', format: 'DjVuTXT', size: '6', md5: 'changed' }],
       'checksum changed',
     ],
+    [[{ name: 'volume_djvu.txt', format: 'DjVuTXT', size: '7' }], 'size changed'],
   ])('rejects a changed manifest (%s) before a ranged download', async (files) => {
     source(new TextEncoder().encode('abcdef'));
     const ctx = createMockContext();
     const svc = buildService();
     const first = await svc.getTextContent('a-volume', 2, 0, ctx, deadline());
-    fetchWithTimeout.mockResolvedValueOnce(jsonBody({ metadata: {}, files }));
+    fetchWithTimeout.mockResolvedValueOnce(filesBody(files));
     const before = fetchWithTimeout.mock.calls.length;
     await expect(
       svc.getTextContent('a-volume', 2, 0, ctx, deadline(), {
@@ -1714,7 +1705,7 @@ describe('ArchiveMetadataService continuation checkpoints', () => {
             format: 'DjVuTXT',
             size: String(bytes.get(name)?.length),
           }));
-          return jsonBody({ metadata: {}, files });
+          return filesBody(files);
         }
         const name = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
         downloads.push(name);
@@ -1898,12 +1889,11 @@ const findSource = (text: string, options: SourceOptions = {}): Download[] => {
   fetchWithTimeout.mockImplementation(
     async (url: string, _timeout: number, _ctx: unknown, init: RequestInit) => {
       if (url.includes('/metadata/')) {
-        return jsonBody({
-          metadata: { title: 'A Volume' },
-          files: options.files ?? [
+        return filesBody(
+          options.files ?? [
             { name: 'volume_djvu.txt', format: 'DjVuTXT', size: String(bytes.length) },
           ],
-        });
+        );
       }
       const range = new Headers(init.headers).get('range');
       const start = range ? Number(range.slice(6, -1)) : 0;
@@ -2671,8 +2661,7 @@ describe('ArchiveMetadataService.getTextContent find time', () => {
     const input = {
       bytes,
       manifest: JSON.stringify({
-        metadata: {},
-        files: [{ name: 'volume_djvu.txt', format: 'DjVuTXT', size: String(bytes.length) }],
+        result: [{ name: 'volume_djvu.txt', format: 'DjVuTXT', size: String(bytes.length) }],
       }),
     };
     const service = buildService();
@@ -2743,12 +2732,7 @@ describe('ArchiveMetadataService service-thrown reasons carry the caller’s rec
   });
 
   it('forwards the ia_get_text hint on no_text_file', async () => {
-    fetchWithTimeout.mockResolvedValueOnce(
-      jsonBody({
-        metadata: { title: 'A Film' },
-        files: [{ name: 'film.mp4', format: 'MPEG4' }],
-      }),
-    );
+    fetchWithTimeout.mockResolvedValueOnce(filesBody([{ name: 'film.mp4', format: 'MPEG4' }]));
 
     await expect(
       buildService().getTextContent(
@@ -2766,5 +2750,102 @@ describe('ArchiveMetadataService service-thrown reasons carry the caller’s rec
         recovery: { hint: declaredRecovery(iaGetText.errors, 'no_text_file') },
       },
     });
+  });
+});
+
+describe('ArchiveMetadataService.getTextContent reads the item file list (#73)', () => {
+  beforeEach(rejectUnstagedFetches);
+
+  const requested = () => fetchWithTimeout.mock.calls.map(([url]) => url as string);
+  const readItem = (identifier = 'a-volume') =>
+    buildService().getTextContent(
+      identifier,
+      10,
+      0,
+      createMockContext({ errors: iaGetText.errors }),
+      deadline(),
+    );
+
+  it('requests /metadata/{identifier}/files on the first page and its continuation, never the whole record', async () => {
+    findSource('abcdef');
+    const ctx = createMockContext({ errors: iaGetText.errors });
+    const svc = buildService();
+
+    const first = await svc.getTextContent('a-volume', 2, 0, ctx, deadline());
+    const second = await svc.getTextContent('a-volume', 2, 0, ctx, deadline(), {
+      continuation: first.nextContinuation,
+    });
+
+    expect(second).toMatchObject({ text: 'cd', charOffset: 2 });
+    expect(requested().filter((url) => url.includes('/metadata/'))).toEqual([
+      'https://archive.org/metadata/a-volume/files',
+      'https://archive.org/metadata/a-volume/files',
+    ]);
+  });
+
+  it('encodes the identifier in the file-list URL as the full record’s URL does', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(filesBody([]));
+
+    await readItem('a vol@me%').catch(() => undefined);
+
+    expect(requested()).toEqual(['https://archive.org/metadata/a%20vol%40me%25/files']);
+  });
+
+  it.each([
+    ['{} (an empty record)', {}],
+    ['an error for an unknown item', { error: "Couldn't locate item 'a-volume'" }],
+    ['an error for a dark item', { error: "Couldn't get 'files' for item a-volume" }],
+    ['a result that is a number', { result: 27 }],
+    ['a result that is a string', { result: 'a-volume_djvu.txt' }],
+    ['a result that is one entry', { result: { name: 'a-volume_djvu.txt', format: 'DjVuTXT' } }],
+    ['a null result', { result: null }],
+    ['a full record’s files', { files: [{ name: 'a-volume_djvu.txt', format: 'DjVuTXT' }] }],
+  ])(
+    'answers %s as item_not_found naming an unknown or dark item, with no download',
+    async (_label, body) => {
+      fetchWithTimeout.mockResolvedValueOnce(jsonBody(body));
+
+      await expect(readItem()).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: 'Item "a-volume" not found in the Internet Archive, or it is dark (restricted).',
+        data: {
+          reason: 'item_not_found',
+          identifier: 'a-volume',
+          recovery: { hint: declaredRecovery(iaGetText.errors, 'item_not_found') },
+        },
+      });
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('answers an empty file list as no_text_file, with no download', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(filesBody([]));
+
+    await expect(readItem()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_text_file', identifier: 'a-volume' },
+    });
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves out list entries that are not objects or name no file, as the full record’s manifest does', async () => {
+    fetchWithTimeout.mockResolvedValueOnce(
+      filesBody([
+        3,
+        null,
+        'loose_djvu.txt',
+        ['nested_djvu.txt'],
+        { format: 'DjVuTXT', size: '9' },
+        { name: '', format: 'DjVuTXT' },
+        { name: 'kept_djvu.txt', format: 'DjVuTXT', size: '4' },
+      ]),
+    );
+    fetchWithTimeout.mockResolvedValueOnce(new Response('kept'));
+
+    const page = await readItem();
+
+    expect(page).toMatchObject({ sourceFile: 'kept_djvu.txt', text: 'kept', sourceFileBytes: 4 });
+    expect(page).not.toHaveProperty('textFiles');
+    expect(requested()[1]).toBe('https://archive.org/download/a-volume/kept_djvu.txt');
   });
 });

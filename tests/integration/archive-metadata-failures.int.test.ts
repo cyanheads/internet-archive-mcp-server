@@ -45,12 +45,17 @@ const calls = (match: (r: Request) => boolean) => http.calls.filter((c) => match
 const routeMetadata = (respond: FetchMockResponder) => http.route({ match: isMetadata, respond });
 const routeDownload = (respond: FetchMockResponder) => http.route({ match: isDownload, respond });
 
-/** A text item's manifest. */
-const MANIFEST = () =>
-  Response.json({
-    metadata: { identifier: ID, title: 'A Volume', mediatype: 'texts' },
-    files: [{ name: FILE, format: 'DjVuTXT', size: '119000000' }],
-  });
+/** The Metadata API URL each caller reads: ia_get_text the file list alone, the others the whole record. */
+const RECORD_URL = `https://archive.org/metadata/${ID}`;
+const FILE_LIST_URL = `${RECORD_URL}/files`;
+
+/** A text item's metadata: its file list at FILE_LIST_URL, its whole record at RECORD_URL. */
+const MANIFEST: FetchMockResponder = (request) => {
+  const files = [{ name: FILE, format: 'DjVuTXT', size: '119000000' }];
+  return request.url === FILE_LIST_URL
+    ? Response.json({ result: files })
+    : Response.json({ metadata: { identifier: ID, title: 'A Volume', mediatype: 'texts' }, files });
+};
 
 /** The archive.org error page an upstream non-2xx carries, which must never reach the caller. */
 const ERROR_PAGE = '<!DOCTYPE html><html><body>upstream-error-page-marker</body></html>';
@@ -291,9 +296,7 @@ describe('Metadata and download handling that stays as it was', () => {
   });
 
   it('ia_get_text answers a manifest without a text file as no_text_file, with no download', async () => {
-    routeMetadata(() =>
-      Response.json({ metadata: {}, files: [{ name: 'a.mp4', format: 'MPEG4' }] }),
-    );
+    routeMetadata(() => Response.json({ result: [{ name: 'a.mp4', format: 'MPEG4' }] }));
 
     const { result } = await runTimed(() => getText());
 
@@ -324,8 +327,9 @@ describe('ia_get_text conditional Range continuation transport', () => {
   beforeEach(() =>
     routeMetadata(() =>
       Response.json({
-        metadata: {},
-        files: [{ name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' }],
+        result: [
+          { name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' },
+        ],
       }),
     ),
   );
@@ -520,9 +524,7 @@ describe('ia_get_text conditional Range continuation transport', () => {
 
   it('uses offset success when neither the response nor manifest supplies a byte length', async () => {
     http.reset();
-    routeMetadata(() =>
-      Response.json({ metadata: {}, files: [{ name: FILE, format: 'DjVuTXT' }] }),
-    );
+    routeMetadata(() => Response.json({ result: [{ name: FILE, format: 'DjVuTXT' }] }));
     routeDownload(() => new Response(bytes, { headers: { etag } }));
     const result = await session()({ max_chars: 2 });
     expect(result.structuredContent).toMatchObject({
@@ -532,14 +534,56 @@ describe('ia_get_text conditional Range continuation transport', () => {
     expect(contentText(result)).toContain('char_offset 2');
     expect(result.structuredContent).not.toHaveProperty('next_continuation');
   });
+
+  it.each([
+    ['md5', { md5: 'replaced-md5' }],
+    ['size', { size: String(bytes.length + 1) }],
+  ])(
+    'reads the file list again for a continuation and rejects one whose %s changed, before a ranged download',
+    async (_label, change) => {
+      http.reset();
+      let entry = {
+        name: FILE,
+        format: 'DjVuTXT',
+        size: String(bytes.length),
+        md5: 'manifest-md5',
+      };
+      routeMetadata(() => Response.json({ result: [entry] }));
+      routeDownload(inSequence(initial, validRange));
+      const run = session();
+      const first = await run({ max_chars: 2 });
+      const token = (first.structuredContent as { next_continuation: string }).next_continuation;
+      entry = { ...entry, ...change };
+
+      const result = await run({ max_chars: 2, continuation: token });
+
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_continuation', char_offset: 2 },
+      });
+      expect(contentText(result)).toContain('char_offset 2');
+      expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+        FILE_LIST_URL,
+        FILE_LIST_URL,
+      ]);
+      expect(calls(isDownload)).toHaveLength(1);
+    },
+  );
 });
 
 describe('Metadata API failures surface as archive_unavailable', () => {
   describe.each([
-    ['ia_get_item', getItem, iaGetItem],
-    ['ia_get_text', () => getText(), iaGetText],
-  ] as const)('%s', (_name, run, def) => {
+    ['ia_get_item', getItem, iaGetItem, RECORD_URL],
+    ['ia_get_text', () => getText(), iaGetText, FILE_LIST_URL],
+  ] as const)('%s', (_name, run, def, url) => {
     const declared = () => hint(def.errors, 'archive_unavailable');
+
+    // Every case below fails on the read this caller makes: the whole record, or the file list alone.
+    afterEach(() => {
+      expect(calls(isMetadata).map(({ request }) => request.url)).toEqual(
+        calls(isMetadata).map(() => url),
+      );
+    });
 
     it.each([
       ['headers never arrive', hang],
@@ -713,6 +757,21 @@ describe('Metadata API failures surface as archive_unavailable', () => {
       expect(errorOf(result).data?.reason).toBeUndefined();
       expect(calls(isMetadata)).toHaveLength(1);
     });
+  });
+
+  it('ia_get_text answers a Metadata API redirect loop as archive_unavailable naming it, unretried', async () => {
+    routeMetadata(
+      (request) => new Response(null, { status: 302, headers: { location: request.url } }),
+    );
+
+    const { result } = await runTimed(() => getText());
+
+    expectUnavailable(result, hint(iaGetText.errors, 'archive_unavailable'));
+    expect(errorOf(result).message).toBe(`${METADATA_API} redirected more than 127 times.`);
+    expect(contentText(result)).not.toContain('Request the final URL directly');
+    // One ladder attempt: the request and the 127 redirects followed before the refusal.
+    expect(calls(isMetadata)).toHaveLength(128);
+    expect(calls(isDownload)).toHaveLength(0);
   });
 
   it('ia://item answers a Metadata API 503 as archive_unavailable with its own hint', async () => {
@@ -923,8 +982,9 @@ describe('ia_get_text find (#70)', () => {
   beforeEach(() =>
     routeMetadata(() =>
       Response.json({
-        metadata: {},
-        files: [{ name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' }],
+        result: [
+          { name: FILE, format: 'DjVuTXT', size: String(bytes.length), md5: 'manifest-md5' },
+        ],
       }),
     ),
   );
@@ -1401,12 +1461,11 @@ describe('ia_get_text text file selection', () => {
   ];
   const volumeText = (name: string) => `Text of ${name}.`;
 
-  /** The Strabo manifest shape: per volume, page images, its DjVuTXT, and gzipped OCR search text. */
+  /** The Strabo file list: per volume, page images, its DjVuTXT, and gzipped OCR search text. */
   const routeStrabo = () =>
     routeMetadata(() =>
       Response.json({
-        metadata: { identifier: STRABO, mediatype: 'texts' },
-        files: volumeNames.flatMap((name) => [
+        result: volumeNames.flatMap((name) => [
           { name: name.replace('_djvu.txt', '_jp2.zip'), format: 'Single Page Processed JP2 ZIP' },
           { name, format: 'DjVuTXT', size: String(volumeText(name).length) },
           { name: name.replace('_djvu.txt', '_hocr_searchtext.txt.gz'), format: 'OCR Search Text' },
@@ -1503,8 +1562,8 @@ describe('ia_get_text text file selection', () => {
       source_file: VOLUME_2,
     });
     expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
-      `https://archive.org/metadata/${STRABO}`,
-      `https://archive.org/metadata/${STRABO}`,
+      `https://archive.org/metadata/${STRABO}/files`,
+      `https://archive.org/metadata/${STRABO}/files`,
     ]);
     expect(downloadedFiles()).toEqual([VOLUME_2, VOLUME_2]);
   });
@@ -1579,8 +1638,7 @@ describe('ia_get_text text file selection', () => {
   it('answers an item whose only .txt files are Metadata sidecars as no_text_file, with no download', async () => {
     routeMetadata(() =>
       Response.json({
-        metadata: { identifier: 'gov.uscourts.mieb.653252' },
-        files: [
+        result: [
           { name: 'gov.uscourts.mieb.653252.11.0.pdf', format: 'Text PDF' },
           { name: 'gov.uscourts.mieb.653252.11.0.pdf_meta.txt', format: 'Metadata', size: '834' },
           { name: 'gov.uscourts.mieb.653252.docket.xml', format: 'Metadata' },
@@ -1648,4 +1706,274 @@ describe('archive.org item URLs as identifiers', () => {
       expect(http.calls).toHaveLength(0);
     },
   );
+});
+
+describe('ia_get_text reads the item file list, never the whole record (#73)', () => {
+  const MICRO = 'micro_IA40244325_0031';
+  const MICRO_FILES_URL = `https://archive.org/metadata/${MICRO}/files`;
+  const MICRO_TEXT = `${MICRO}_djvu.txt`;
+  const text = 'THE TIMES, LONDON. Parliamentary intelligence, 1 March.';
+  const bytes = new TextEncoder().encode(text);
+  const etag = '"micro"';
+
+  /** Entries of the item's file list as the Metadata API sends them; no route serves its whole record. */
+  const routeMicro = () => {
+    http.route({
+      match: (r) => r.url === MICRO_FILES_URL,
+      respond: () =>
+        Response.json({
+          result: [
+            {
+              name: `${MICRO}.pdf`,
+              format: 'Text PDF',
+              size: '3314364622',
+              md5: '7d8aa30a5246bfa352fe8453e615a1fa',
+            },
+            {
+              name: MICRO_TEXT,
+              format: 'DjVuTXT',
+              size: '62740068',
+              md5: '2a409e2bd399ab8846859b780eb42828',
+            },
+            {
+              name: `${MICRO}_files.xml`,
+              format: 'Metadata',
+              md5: '53ab4377ca648cc2158c5db90bd0ccf0',
+            },
+            {
+              name: `${MICRO}_hocr_searchtext.txt.gz`,
+              format: 'OCR Search Text',
+              size: '27956772',
+              md5: '492a30efc49df36dcc44223a46db0fa2',
+            },
+            {
+              name: `${MICRO}_meta.xml`,
+              format: 'Metadata',
+              size: '2178',
+              md5: '84d5e0ed70f19c826cca3c7c8d73db59',
+            },
+          ],
+        }),
+    });
+    routeDownload((request) => {
+      const start = Number(request.headers.get('range')?.slice(6, -1) ?? 0);
+      return new Response(bytes.subarray(start), {
+        status: start > 0 ? 206 : 200,
+        headers: {
+          etag,
+          'content-length': String(bytes.length - start),
+          ...(start > 0 && {
+            'content-range': `bytes ${start}-${bytes.length - 1}/${bytes.length}`,
+          }),
+        },
+      });
+    });
+  };
+
+  it('requests the file list for a first page and for its continuation, on both surfaces', async () => {
+    routeMicro();
+    const run = session();
+
+    // Pages of 12 characters begin and end on a letter, which content[] renders as sent.
+    const first = await run({ identifier: MICRO, max_chars: 12 });
+    const token = (first.structuredContent as { next_continuation: string }).next_continuation;
+    const second = await run({ identifier: MICRO, continuation: token, max_chars: 12 });
+
+    expect(first.structuredContent).toMatchObject({
+      text: 'THE TIMES, L',
+      has_more: true,
+      source_file: MICRO_TEXT,
+      source_file_bytes: 62_740_068,
+    });
+    expect(contentText(first)).toContain('THE TIMES, L');
+    expect(contentText(first)).toContain(token);
+    expect(second.structuredContent).toMatchObject({
+      text: 'ONDON. Parli',
+      char_offset: 12,
+      source_file: MICRO_TEXT,
+    });
+    expect(contentText(second)).toContain('ONDON. Parli');
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      MICRO_FILES_URL,
+      MICRO_FILES_URL,
+    ]);
+    expect(calls(isDownload)[1]?.request.headers.get('range')).toBe('bytes=12-');
+  });
+
+  it.each([
+    ['an unknown item', { error: `Couldn't locate item '${ID}'` }],
+    ['a dark item', { error: `Couldn't get 'files' for item ${ID}` }],
+    ['an item named files', {}],
+    ['a result that is not a list', { result: 27 }],
+  ])(
+    'answers the file list of %s as item_not_found on both surfaces, after one request and no download',
+    async (_label, body) => {
+      routeMetadata(() => Response.json(body));
+
+      const { result } = await runTimed(() => getText());
+
+      const message = `Item "${ID}" not found in the Internet Archive, or it is dark (restricted).`;
+      const recovery = hint(iaGetText.errors, 'item_not_found');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message,
+          data: { reason: 'item_not_found', identifier: ID, recovery: { hint: recovery } },
+        },
+      });
+      expect(contentText(result)).toContain(message);
+      expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expect(JSON.stringify(result.structuredContent)).not.toContain("Couldn't");
+      expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([FILE_LIST_URL]);
+      expect(calls(isDownload)).toHaveLength(0);
+    },
+  );
+
+  it('answers an empty file list as no_text_file on both surfaces, with no download', async () => {
+    routeMetadata(() => Response.json({ result: [] }));
+
+    const { result } = await runTimed(() => getText());
+
+    const recovery = hint(iaGetText.errors, 'no_text_file');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_text_file', recovery: { hint: recovery } },
+      },
+    });
+    expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([FILE_LIST_URL]);
+    expect(calls(isDownload)).toHaveLength(0);
+  });
+});
+
+describe.each(['.', '..'])('a bare %s names no item', (identifier) => {
+  const message = `Item "${identifier}" not found in the Internet Archive.`;
+
+  beforeEach(() => {
+    http.route({ match: () => true, respond: () => new Response('unexpected request') });
+  });
+
+  it.each([
+    ['ia_get_item', iaGetItem],
+    ['ia_get_text', iaGetText],
+  ] as const)(
+    '%s answers it as item_not_found on both surfaces, before any request',
+    async (_name, def) => {
+      const { result } = await runTimed(() => runToolContract(def, { identifier }));
+
+      const recovery = hint(def.errors, 'item_not_found');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message,
+          data: { reason: 'item_not_found', identifier, recovery: { hint: recovery } },
+        },
+      });
+      expect(contentText(result)).toContain(`Recovery: ${recovery}`);
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  it('ia://item answers it as item_not_found, before any request', async () => {
+    vi.useFakeTimers();
+    const pending = iaItemResource
+      .handler(
+        iaItemResource.params.parse({ identifier }),
+        createMockContext({ errors: iaItemResource.errors }),
+      )
+      .catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+
+    expect(await pending).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message,
+      data: {
+        reason: 'item_not_found',
+        identifier,
+        recovery: { hint: hint(iaItemResource.errors, 'item_not_found') },
+      },
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+});
+
+describe('an item URL whose identifier resolves to no item', () => {
+  // archive.org decodes the %2F an encoded "/" becomes and resolves "." and "..": "../" reads its home page.
+  it.each([
+    ['https://archive.org/details/..%2F', '../'],
+    ['https://archive.org/details/a%2F..', 'a/..'],
+    // An empty segment names nothing: "a/../" and "./" resolve to the root, as "/metadata/" would.
+    ['https://archive.org/details/a%2F..%2F', 'a/../'],
+    ['https://archive.org/details/.%2F', './'],
+    // A ".." above the root names no item; archive.org would resolve "../a" to "/a", off the API.
+    ['https://archive.org/details/..%2Fa', '../a'],
+    ['https://archive.org/details/a%2F..%2F..', 'a/../..'],
+    ['https://archive.org/details/.%2F.', './.'],
+  ])('%s is item_not_found on both tools, before any request', async (url, identifier) => {
+    http.route({ match: () => true, respond: () => new Response('unexpected request') });
+
+    for (const def of [iaGetItem, iaGetText]) {
+      const { result } = await runTimed(() => runToolContract(def, { identifier: url }));
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: `Item "${identifier}" not found in the Internet Archive.`,
+          data: { reason: 'item_not_found', identifier },
+        },
+      });
+    }
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('still reads an identifier whose dot segments resolve to an item', async () => {
+    routeMetadata(MANIFEST);
+
+    const { result } = await runTimed(() =>
+      runToolContract(iaGetItem, { identifier: 'https://archive.org/details/.%2Fa-volume' }),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      'https://archive.org/metadata/.%2Fa-volume',
+    ]);
+  });
+
+  it('ia_get_item reads a/../b, whose .. resolves to an item, as sent', async () => {
+    routeMetadata(MANIFEST);
+
+    const { result } = await runTimed(() =>
+      runToolContract(iaGetItem, { identifier: 'https://archive.org/details/a%2F..%2Fb' }),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ identifier: 'a/../b', title: 'A Volume' });
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      'https://archive.org/metadata/a%2F..%2Fb',
+    ]);
+  });
+
+  it('ia_get_text reads ./a-volume, whose . resolves to an item, from its file list', async () => {
+    routeMetadata(() =>
+      Response.json({ result: [{ name: FILE, format: 'DjVuTXT', size: '119000000' }] }),
+    );
+    routeDownload(() => new Response('Chapter one. It was a dark night.'));
+
+    const { result } = await runTimed(() =>
+      runToolContract(iaGetText, {
+        identifier: 'https://archive.org/details/.%2Fa-volume',
+        max_chars: 11,
+      }),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ text: 'Chapter one', source_file: FILE });
+    expect(calls(isMetadata).map(({ request }) => request.url)).toEqual([
+      'https://archive.org/metadata/.%2Fa-volume/files',
+    ]);
+    expect(calls(isDownload).map(({ request }) => request.url)).toEqual([
+      `https://archive.org/download/.%2Fa-volume/${FILE}`,
+    ]);
+  });
 });

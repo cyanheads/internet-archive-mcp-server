@@ -3270,6 +3270,165 @@ describe('Wayback timeouts and network errors surface under the declared reason'
     expect(calls(isCdx)).toHaveLength(1);
   });
 
+  it('a CDX history redirect loop surfaces as cdx_unavailable naming it, after one ladder attempt', async () => {
+    routeCdx((request) => new Response(null, { status: 302, headers: { location: request.url } }));
+
+    const { result } = await runTimed(history);
+
+    expectDeclared(result, 'cdx_unavailable', hint(iaFindSnapshots.errors, 'cdx_unavailable'));
+    expect((result.structuredContent as { error: { message: string } }).error.message).toBe(
+      'CDX API redirected more than 127 times.',
+    );
+    expect(contentText(result)).not.toContain('Request the final URL directly');
+    // The request and the 127 redirects followed before fetchWithTimeout refused the chain.
+    expect(calls(isCdx)).toHaveLength(128);
+  });
+
+  const toItself: FetchMockResponder = (request) =>
+    new Response(null, { status: 302, headers: { location: request.url } });
+  const toFtp: FetchMockResponder = () =>
+    new Response(null, { status: 302, headers: { location: 'ftp://archive.org/cdx' } });
+
+  it.each([
+    ['ia_find_snapshots closest mode', 'availability_unavailable', findClosest, iaFindSnapshots],
+    ['ia_get_snapshot', 'content_fetch_failed', getClosest, iaGetSnapshot],
+  ] as const)(
+    'an Availability API redirect loop under %s surfaces as %s naming it, with no CDX fallback',
+    async (_label, reason, run, def) => {
+      routeAvailability(toItself);
+
+      const { result } = await runTimed(run);
+
+      expectDeclared(result, reason, hint(def.errors, reason));
+      expect((result.structuredContent as { error: { message: string } }).error.message).toBe(
+        'Availability API redirected more than 127 times.',
+      );
+      expect(JSON.stringify(result)).not.toContain('final URL directly');
+      // The request and the 127 redirects followed before fetchWithTimeout refused the chain.
+      expect(calls(isAvailability)).toHaveLength(128);
+      expect(calls(isCdx)).toHaveLength(0);
+    },
+  );
+
+  it('a CDX history redirect to an ftp: URL surfaces as cdx_unavailable naming it, after one request', async () => {
+    routeCdx(toFtp);
+
+    const { result } = await runTimed(history);
+
+    expectDeclared(result, 'cdx_unavailable', hint(iaFindSnapshots.errors, 'cdx_unavailable'));
+    expect((result.structuredContent as { error: { message: string } }).error.message).toBe(
+      'CDX API redirected to a URL that is not HTTP or HTTPS.',
+    );
+    expect(JSON.stringify(result)).not.toContain('Pass an absolute http:// or https:// URL');
+    expect(http.calls).toHaveLength(1);
+  });
+
+  describe('a closest-mode CDX check that gets no answer names what CDX did', () => {
+    const EMPTY_THEN =
+      'The Availability API found no capture of example.com near 20200101, and the CDX closest-capture check did not complete: ';
+    const FAILED_THEN =
+      'The closest-capture lookup for example.com near 20200101 did not complete: Availability API returned HTTP 503. (failed after 4 attempts) The CDX closest-capture check it fell back to did not complete either: ';
+    /** The hint a lookup that could not answer carries: no answer was a refusal or a 429. */
+    const RETRY_LATER =
+      'Retry later, or list nearby captures with ia_find_snapshots in history mode, passing from and to around the timestamp, then read one with ia_get_snapshot and its exact 14-digit timestamp, which needs no lookup.';
+
+    const expectLookupFailure = (result: ToolResult, reason: string, message: string) => {
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message,
+          data: { reason, recovery: { hint: RETRY_LATER } },
+        },
+      });
+      const text = contentText(result);
+      expect(text).toContain(`Error: ${message}`);
+      expect(text).toContain(`Recovery: ${RETRY_LATER}`);
+      expect(text).toContain(`(reason ${reason})`);
+      expect(text).not.toContain('not retryable');
+    };
+
+    it.each([
+      ['a redirect loop', toItself, 'CDX API redirected more than 127 times.', 128],
+      [
+        'a redirect to an ftp: URL',
+        toFtp,
+        'CDX API redirected to a URL that is not HTTP or HTTPS.',
+        1,
+      ],
+      ['a refused connection', refused, 'CDX API could not be reached (network error).', 1],
+      [
+        'a connection dropped mid-body',
+        dropped('[["timestamp"'),
+        'CDX API could not be reached (network error).',
+        1,
+      ],
+    ] as const)(
+      'after an empty Availability answer, %s is cdx_unavailable naming it',
+      async (_label, respond, what, cdxRequests) => {
+        routeAvailability(EMPTY_AVAILABILITY);
+        routeCdx(respond);
+
+        const { result } = await runTimed(findClosest);
+
+        expectLookupFailure(result, 'cdx_unavailable', `${EMPTY_THEN}${what}`);
+        expect(JSON.stringify(result)).not.toMatch(
+          /final URL directly|Pass an absolute|possible redirect loop|Only HTTP|Network error during/,
+        );
+        expect(calls(isAvailability)).toHaveLength(1);
+        expect(calls(isCdx)).toHaveLength(cdxRequests);
+      },
+    );
+
+    it.each([
+      ['the 25 s ceiling', REQUEST_TIMEOUT_MS, 25_000],
+      ['a 10 s request timeout', 10_000, 10_000],
+    ])(
+      'after an empty Availability answer, a timeout under %s is cdx_unavailable naming the limit the check was sent under',
+      async (_label, requestTimeoutMs, limitMs) => {
+        const config = getServerConfig();
+        const configured = config.requestTimeoutMs;
+        config.requestTimeoutMs = requestTimeoutMs;
+        try {
+          routeAvailability(EMPTY_AVAILABILITY);
+          routeCdx(hang);
+
+          const { result, elapsedMs } = await runTimed(findClosest);
+
+          // The one CDX request ran exactly its limit, and the message states that figure.
+          expect(elapsedMs).toBe(limitMs);
+          expectLookupFailure(
+            result,
+            'cdx_unavailable',
+            `${EMPTY_THEN}CDX API timed out after ${elapsedMs / 1000} s.`,
+          );
+          expect(JSON.stringify(result)).not.toContain('fetch GET');
+          expect(calls(isCdx)).toHaveLength(1);
+        } finally {
+          config.requestTimeoutMs = configured;
+        }
+      },
+    );
+
+    it('after four Availability 503s, a CDX redirect loop keeps availability_unavailable and names the loop', async () => {
+      routeAvailability(UNAVAILABLE);
+      routeCdx(toItself);
+
+      const { result } = await runTimed(findClosest);
+
+      expectLookupFailure(
+        result,
+        'availability_unavailable',
+        `${FAILED_THEN}CDX API redirected more than 127 times.`,
+      );
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { status: 503, retryAttempts: 4 } },
+      });
+      expect(JSON.stringify(result)).not.toMatch(/final URL directly|possible redirect loop/);
+      expect(calls(isAvailability)).toHaveLength(4);
+      expect(calls(isCdx)).toHaveLength(128);
+    });
+  });
+
   it('a replay 504 is retried as before and surfaces as content_fetch_failed', async () => {
     routeReplay(() => new Response('Gateway Timeout', { status: 504 }));
 

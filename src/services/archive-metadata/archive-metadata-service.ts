@@ -232,52 +232,41 @@ export class ArchiveMetadataService {
   }
 
   /**
-   * Retrieve full metadata and the complete file manifest for an Archive item —
-   * `ia_get_text` scans every file, so paging stays in the `ia_get_item` handler.
-   * Each metadata field is read through `stringOrList`: a string or a list of strings is kept,
-   * any other value is left out. Each description value is then converted from the HTML the
-   * Archive stores to plain-text lines (`descriptionToText`); a value left with no text is
+   * Retrieve full metadata and the complete file manifest for an Archive item, from its whole
+   * Metadata API record (`readMetadata`); the `ia_get_item` handler filters and pages the
+   * manifest. Each metadata field is read through `stringOrList`: a string or a list of strings
+   * is kept, any other value is left out. Each description value is then converted from the HTML
+   * the Archive stores to plain-text lines (`descriptionToText`); a value left with no text is
    * dropped, and a description left with none is omitted. Every other kept value is relayed as
    * received. Each manifest entry is read through `manifestFile`: an entry with no file name is
    * left out, and each other field is kept only as a non-empty string; a `files` value that is
    * not a list reads as no files. Throws `item_not_found` (with the caller's recovery hint)
    * when the API returns `{}`, the item is dark, or the body holds neither metadata nor
    * a file list — the `error` or `result` the API answers for an identifier with a `/`
-   * in it. Any other failure is `archive_unavailable` (see `retry` and `statusError`),
-   * the call's `deadline` running out included.
+   * in it — and, before any request, for an identifier that names no item once its dot segments
+   * resolve (`namesNoItem`: a bare `.` or `..`, `../`). Any other failure is
+   * `archive_unavailable` (see `retry` and `statusError`), the call's `deadline` running out
+   * included.
    */
   getItem(identifier: string, ctx: Context, deadline: CallDeadline): Promise<ArchiveItem> {
-    return this.retry(METADATA_API, ctx, deadline, async (signal) => {
-      const response = await fetchWithTimeout(
-        `${METADATA_BASE}/${encodeURIComponent(identifier)}`,
-        deadline.nextTimeoutMs(),
-        ctx,
-        { headers: this.headers, signal },
-      ).catch((err: unknown) => {
-        throw statusError(err, METADATA_API, ctx);
-      });
-      const text = await response.text().catch((err: unknown) => {
-        throw bodyReadError(err, METADATA_API.name);
-      });
-      const raw = readItemBody(text, ctx);
-
+    return this.readMetadata(identifier, '', ctx, deadline, (raw) => {
       // Dark/restricted items return HTTP 200 with routing fields but no metadata or files.
       // is_dark: true means the item has been removed or restricted — treat as not found.
       if (raw.is_dark === true) {
-        throw notFound(`Item "${identifier}" is dark (restricted) in the Internet Archive.`, {
-          reason: 'item_not_found',
+        throw itemNotFound(
+          ctx,
           identifier,
-          ...ctx.recoveryFor('item_not_found'),
-        });
+          `Item "${identifier}" is dark (restricted) in the Internet Archive.`,
+        );
       }
 
       // `{}` is the API's HTTP 200 answer for an unknown identifier.
       if (raw.metadata === undefined && raw.files === undefined) {
-        throw notFound(`Item "${identifier}" not found in the Internet Archive.`, {
-          reason: 'item_not_found',
+        throw itemNotFound(
+          ctx,
           identifier,
-          ...ctx.recoveryFor('item_not_found'),
-        });
+          `Item "${identifier}" not found in the Internet Archive.`,
+        );
       }
 
       const meta = raw.metadata as Record<string, unknown> | undefined;
@@ -327,11 +316,77 @@ export class ArchiveMetadataService {
   }
 
   /**
+   * An item's file manifest alone, from `GET /metadata/{identifier}/files` (`readMetadata`):
+   * the full record's `files` entries, without the rest of a record that can run to tens of
+   * megabytes. Each entry is read through `manifestFile`, as `getItem` reads them. The API
+   * answers HTTP 200 with an `error` body for an unknown item, a dark one, and an identifier
+   * holding a `/`, and telling those apart would take another request, so any body but a
+   * `result` list — `{}` and a `result` of another shape included — throws one `item_not_found`
+   * naming both an unknown and a dark item. Any other failure is `archive_unavailable`, as
+   * for `getItem`.
+   */
+  private getFiles(
+    identifier: string,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<ArchiveFile[]> {
+    return this.readMetadata(identifier, '/files', ctx, deadline, (raw) => {
+      if (!Array.isArray(raw.result)) {
+        throw itemNotFound(
+          ctx,
+          identifier,
+          `Item "${identifier}" not found in the Internet Archive, or it is dark (restricted).`,
+        );
+      }
+      const files = raw.result.flatMap((entry: unknown) => manifestFile(identifier, entry) ?? []);
+      ctx.log.debug('Item file list fetched', { identifier, fileCount: files.length });
+      return files;
+    });
+  }
+
+  /**
+   * One Metadata API read, `path` under the item's record (`''` for the whole record), parsed
+   * by `readItemBody` and handed to `read`, under `retry` with `statusError` on a non-2xx: one
+   * ladder, one set of messages and hints for every read. An identifier that names no item once
+   * its dot segments resolve (`namesNoItem`) is a rejected `item_not_found` before any request:
+   * the URL would land on `/metadata/`, under `/files` the record of an item named `files`, or off
+   * the API, on archive.org's home page or `/files`.
+   */
+  private readMetadata<T>(
+    identifier: string,
+    path: '' | '/files',
+    ctx: Context,
+    deadline: CallDeadline,
+    read: (raw: Record<string, unknown>) => T,
+  ): Promise<T> {
+    if (namesNoItem(identifier)) {
+      return Promise.reject(
+        itemNotFound(ctx, identifier, `Item "${identifier}" not found in the Internet Archive.`),
+      );
+    }
+    const url = `${METADATA_BASE}/${encodeURIComponent(identifier)}${path}`;
+    return this.retry(METADATA_API, ctx, deadline, async (signal) => {
+      const response = await fetchWithTimeout(url, deadline.nextTimeoutMs(), ctx, {
+        headers: this.headers,
+        signal,
+      }).catch((err: unknown) => {
+        throw statusError(err, METADATA_API, ctx);
+      });
+      const text = await response.text().catch((err: unknown) => {
+        throw bodyReadError(err, METADATA_API.name);
+      });
+      return read(readItemBody(text, ctx));
+    });
+  }
+
+  /**
    * Read one page of a text item's text: `maxChars` UTF-16 code units from `charOffset`.
    * The file is stream-decoded and the upstream read is cancelled once the
    * character after the page has arrived, so memory per call is bounded by the page size
    * and upstream reads stop at the page's end. `hasMore` comes from that one-character
    * lookahead. `sourceFileBytes` is the manifest `size`, omitted when the manifest has none.
+   * The manifest is the item's file list alone (`getFiles`), read on every call, first page and
+   * continuation alike, so a continuation sees the file's current `md5` and `size`.
    * The file read is the continuation's, found by name in the manifest; else `file`, which
    * must be listed and readable text (`isReadableText`) or the call throws `invalid_file`
    * before any download; else the default pick (`defaultTextFile`), with `textFiles` set when
@@ -402,11 +457,11 @@ export class ArchiveMetadataService {
       charOffset = cursor.nextCharOffset;
     }
     // Step 1: locate the text file
-    const item = await this.getItem(identifier, ctx, deadline);
+    const files = await this.getFiles(identifier, ctx, deadline);
 
     const name = cursor?.file ?? file;
-    const readable = name === undefined ? item.files.filter(isReadableText) : undefined;
-    const textFile = readable ? defaultTextFile(readable) : item.files.find((f) => f.name === name);
+    const readable = name === undefined ? files.filter(isReadableText) : undefined;
+    const textFile = readable ? defaultTextFile(readable) : files.find((f) => f.name === name);
     if (!textFile) {
       if (cursor) throw continuationError('invalid_continuation', charOffset);
       if (name !== undefined) throw invalidFile(ctx, identifier, name);
@@ -648,10 +703,11 @@ export class ArchiveMetadataService {
    * archive.org's metadata and download hosts stall intermittently and usually answer a second
    * request — and a second ends the ladder; a request the deadline cut short is no first
    * timeout. A 429 is not retried; any other failure follows `isRetriedFailure`. A timeout, a
-   * network error once its retries are spent, or the deadline running out surfaces as
-   * `archive_unavailable` (`transportError`). Everything else leaves as it was thrown. No
-   * `operation` label is passed: `withRetry` copies it into an exhausted error's `data`, which
-   * reaches the caller, and the message already names `upstream`.
+   * network error once its retries are spent, a redirect chain `fetchWithTimeout` refused to
+   * follow, or the deadline running out surfaces as `archive_unavailable` (`transportError`).
+   * Everything else leaves as it was thrown. No `operation` label is passed: `withRetry` copies
+   * it into an exhausted error's `data`, which reaches the caller, and the message already names
+   * `upstream`.
    */
   private retry<T>(
     upstream: Upstream,
@@ -748,6 +804,22 @@ function readItemBody(text: string, ctx: Context): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * True when `identifier` names no item once its `/`-separated dot segments resolve: a bare `.`
+ * or `..`, or what an item URL's percent-decoded identifier segment can hold (`../`, `a/..`).
+ * `fetch` resolves a bare one; archive.org decodes the `%2F` an encoded `/` becomes and resolves
+ * the rest. One that resolves to an item (`./a`, `a/`) is read as archive.org reads it.
+ */
+const namesNoItem = (identifier: string): boolean => {
+  let depth = 0;
+  for (const segment of identifier.split('/')) {
+    if (segment === '..') depth--;
+    else if (segment !== '.' && segment !== '') depth++;
+    if (depth < 0) return true;
+  }
+  return depth === 0;
+};
+
 /** `{ [name]: value }` when `stringOrList` keeps the value, `{}` otherwise: one relayed field. */
 const relay = <K extends keyof ArchiveItemMetadata>(
   name: K,
@@ -825,6 +897,15 @@ const descriptionText = (value: string | string[]): string | string[] | undefine
 /** `archive_unavailable` with the calling definition's recovery hint, as error `data` fields. */
 function unavailable(ctx: Context): Record<string, unknown> {
   return { reason: 'archive_unavailable', ...ctx.recoveryFor('archive_unavailable') };
+}
+
+/** `item_not_found` with `message` and the calling definition's recovery hint. */
+function itemNotFound(ctx: Context, identifier: string, message: string): McpError {
+  return notFound(message, {
+    reason: 'item_not_found',
+    identifier,
+    ...ctx.recoveryFor('item_not_found'),
+  });
 }
 
 /**

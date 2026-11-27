@@ -1835,6 +1835,20 @@ describe('ia_search_items timeouts and network errors surface as search_unavaila
     expect(http.calls).toHaveLength(1);
   });
 
+  it('answers a redirect loop with the outage hint, naming it, after one ladder attempt', async () => {
+    routeSearchWith(
+      (request) => new Response(null, { status: 302, headers: { location: request.url } }),
+    );
+
+    const { result } = await runTimed({ query: 'tesla' });
+
+    expectUnavailable(result);
+    expect(errorOf(result).message).toBe('Advanced Search redirected more than 127 times.');
+    expect(contentText(result)).not.toContain('Request the final URL directly');
+    // The request and the 127 redirects followed before fetchWithTimeout refused the chain.
+    expect(http.calls).toHaveLength(128);
+  });
+
   it('states timeouts, the call deadline, and network errors in the search_unavailable when text', () => {
     const entry = iaSearchItems.errors?.find((e) => e.reason === 'search_unavailable');
     expect(entry?.when).toMatch(/timed out/);

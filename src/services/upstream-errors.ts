@@ -2,7 +2,9 @@
  * @fileoverview Upstream failure classification shared by the Advanced Search, Metadata, and
  * Wayback services: the HTTP status a fetch error carries, the wait a 429 names, transport failures
  * (a request timeout, a network error, a connection dropped mid-body), the retry predicate built
- * on them, and how a request left without an answer — the call deadline included — fails.
+ * on them, and how a request left without an answer — the call deadline and a redirect chain
+ * `fetchWithTimeout` refuses to follow included — fails, whether it ran a retry ladder or was
+ * one request sent under its own limit.
  * @module services/upstream-errors
  */
 
@@ -107,12 +109,27 @@ export function isRetriedFailure(err: unknown): boolean {
 }
 
 /**
+ * What the upstream did when `fetchWithTimeout` refused to follow its redirects, from the
+ * `data.reason` of the `ValidationError` it throws: a chain past its hop limit
+ * (`too_many_redirects`, with `data.maxRedirects`), or a hop to a URL that is not `http:` or
+ * `https:` (`invalid_url`). Every URL these services request is one they build on an archive.org
+ * host, so `invalid_url` can only name a redirect target. Undefined for any other error.
+ */
+function redirectRefusal(err: unknown): string | undefined {
+  if (!(err instanceof McpError)) return;
+  const { reason, maxRedirects } = err.data ?? {};
+  if (reason === 'too_many_redirects') return `redirected more than ${maxRedirects} times`;
+  if (reason === 'invalid_url') return 'redirected to a URL that is not HTTP or HTTPS';
+  return;
+}
+
+/**
  * A request to `upstream` that got no usable answer, rethrown as `ServiceUnavailable` carrying
  * `data` (the calling tool's declared reason and hint). The call deadline running out —
  * mid-request, mid-backoff, or before a request (`CallDeadline.isExpiry`) — names the deadline,
  * except that an answer which completed as it ran out and would have ended the ladder anyway (a
- * 429 or a refusal) is returned as it was. A request's own timeout names the request timeout; a
- * network error names the attempts made. Any other error is returned as it is.
+ * 429 or a refusal) is returned as it was. Anything else is `unansweredRequestError`'s, a
+ * timeout naming the request timeout.
  */
 export function transportError(
   err: unknown,
@@ -130,12 +147,33 @@ export function transportError(
       { cause: err },
     );
   }
+  return unansweredRequestError(err, upstream, deadline.requestTimeoutMs, data);
+}
+
+/**
+ * A request to `upstream` that got no answer at all, sent under `timeoutMs`, rethrown as
+ * `ServiceUnavailable` carrying `data` and naming what the upstream did. A redirect chain
+ * `fetchWithTimeout` refused to follow (`redirectRefusal`), which no retry loop repeats, takes
+ * the place of the framework's hint to request another URL, which only fits a URL the caller
+ * chose. A timeout names `timeoutMs`; a network error names the attempts made, when a retry
+ * ladder made several. Any other error is returned as it is. A caller under a call deadline
+ * checks `CallDeadline.isExpiry` first (`transportError` does): a request timeout that fires as
+ * the deadline runs out counts as the deadline there, and would read here as a timeout.
+ */
+export function unansweredRequestError<E>(
+  err: E,
+  upstream: string,
+  timeoutMs: number,
+  data: Record<string, unknown>,
+): E | McpError {
+  const redirect = redirectRefusal(err);
+  if (redirect) return serviceUnavailable(`${upstream} ${redirect}.`, data, { cause: err });
   const failure = transportFailure(err);
   if (!failure) return err;
   const { retryAttempts } = (err as McpError).data ?? {};
   return serviceUnavailable(
     failure === 'timeout'
-      ? `${upstream} timed out after ${deadline.requestTimeoutMs / 1000} s.`
+      ? `${upstream} timed out after ${timeoutMs / 1000} s.`
       : `${upstream} could not be reached (network error${retryAttempts ? `, ${retryAttempts} attempts` : ''}).`,
     { ...data, ...(retryAttempts !== undefined && { retryAttempts }) },
     { cause: err },

@@ -240,9 +240,11 @@ export class ArchiveSearchService {
    * (headers or body) is `search_unavailable` after one request, a 429 with a hint to wait.
    * The retry loop runs under what remains of the call's `deadline`, and every request gets the
    * request timeout or what remains, whichever is less; the deadline running out — mid-request,
-   * mid-backoff, or before a request — is `search_unavailable` naming it (`transportError`).
-   * Every outage — a timeout, a network error, a 5xx, an unreadable body, or the deadline —
-   * carries the outage hint in place of the declared query-text recovery.
+   * mid-backoff, or before a request — is `search_unavailable` naming it (`transportError`), and
+   * so, after one request, is a redirect chain `fetchWithTimeout` refused to follow, naming what
+   * Advanced Search did. Every outage — a timeout, a network error, a 5xx, an unreadable body, a
+   * refused redirect chain, or the deadline — carries the outage hint in place of the declared
+   * query-text recovery.
    * A caller cancellation or caller-side deadline propagates as the fetch threw it.
    * Each row's title, creator, mediatype, date, publicdate, and collection are read through
    * `stringOrList`: a value of any other shape, and a mediatype list, is left out of that row.
