@@ -4,12 +4,12 @@ description: Use ia_* tools to investigate historical web pages or Internet Arch
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.3"
+  version: "1.4"
 ---
 
 ## Scope
 
-Use historical captures to establish what a page said at a captured time, and library items to investigate a particular edition or document. For the current page, use the live site. For page layout or raw HTML, follow the returned replay URL: an HTML page's snapshot text removes markup and can retain navigation alongside the page's content; it keeps lines, tab-separated table cells, and `<pre>` text as written. A capture of another text type (plain text, JSON, XML, JavaScript) comes back as stored; a PDF, image, or other non-text capture has no text to return, so open its replay URL.
+Use historical captures to establish what a page said at a captured time, and library items to investigate a particular edition or document. For the current page, use the live site. For page layout or raw HTML, follow the returned replay URL: an HTML page's snapshot text removes markup, template content, and phrasing content the page's own `hidden` attribute or inline `display:none` hides, and can retain navigation and content hidden by stylesheets alongside the page's content; it keeps lines, tab-separated table cells, and `<pre>` text as written. A capture of another text type (plain text, JSON, XML, JavaScript) comes back as stored; a PDF, image, or other non-text capture has no text to return, so open its replay URL.
 
 ## Identifiers
 
