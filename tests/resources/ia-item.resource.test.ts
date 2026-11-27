@@ -3,8 +3,13 @@
  * @module tests/resources/ia-item.resource.test
  */
 
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createInMemoryStorage,
+  createMockContext,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaItemResource } from '@/mcp-server/resources/definitions/ia-item.resource.js';
 import type { CallDeadline } from '@/services/call-deadline.js';
@@ -128,6 +133,47 @@ describe('iaItemResource', () => {
     const result = (await iaItemResource.handler(params, ctx)) as Record<string, unknown>;
 
     expect(result).toEqual({ ...metadata, file_count: 1 });
+  });
+
+  it('returns a stored description read by the real ArchiveMetadataService, a text-level tag read as nothing (#75)', async () => {
+    const { ArchiveMetadataService } = await vi.importActual<
+      typeof import('@/services/archive-metadata/archive-metadata-service.js')
+    >('@/services/archive-metadata/archive-metadata-service.js');
+    (getArchiveMetadataService as ReturnType<typeof vi.fn>).mockReturnValue(
+      new ArchiveMetadataService(
+        { mcpServerVersion: '0.0.0-test' } as AppConfig,
+        createInMemoryStorage(),
+      ),
+    );
+    const http = createFetchMock([
+      {
+        method: 'GET',
+        match: 'https://archive.org/metadata/recorded-live-1977',
+        respond: Response.json({
+          metadata: {
+            identifier: 'recorded-live-1977',
+            description: 'Recorded <i>live</i>, 1977.',
+          },
+          files: [],
+        }),
+      },
+    ]);
+    http.install();
+    try {
+      const ctx = createMockContext({ errors: iaItemResource.errors });
+      const params = iaItemResource.params.parse({ identifier: 'recorded-live-1977' });
+      const result = await iaItemResource.handler(params, ctx);
+
+      // The whole object the resource's JSON contents serialize.
+      expect(result).toStrictEqual({
+        identifier: 'recorded-live-1977',
+        description: 'Recorded live, 1977.',
+        file_count: 0,
+      });
+      expect(http.calls).toHaveLength(1);
+    } finally {
+      http.restore();
+    }
   });
 
   it('returns list-valued rights, licenseurl, volume, mediatype, and Open Library IDs unchanged', async () => {

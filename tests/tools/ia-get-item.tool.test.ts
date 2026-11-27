@@ -4,8 +4,14 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, requestCancelled } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createInMemoryStorage,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetItem } from '@/mcp-server/tools/definitions/ia-get-item.tool.js';
 import type { CallDeadline } from '@/services/call-deadline.js';
@@ -366,6 +372,48 @@ describe('iaGetItem', () => {
       expect(sc).not.toHaveProperty('truncated');
       expect(sc).not.toHaveProperty('totalCount');
       expect(sc).not.toHaveProperty('notice');
+    });
+  });
+
+  describe('a stored description read by the real ArchiveMetadataService (#75)', () => {
+    it('reads a text-level tag as nothing, so the comma stays on the word before it, on both surfaces', async () => {
+      const { ArchiveMetadataService } = await vi.importActual<
+        typeof import('@/services/archive-metadata/archive-metadata-service.js')
+      >('@/services/archive-metadata/archive-metadata-service.js');
+      (getArchiveMetadataService as ReturnType<typeof vi.fn>).mockReturnValue(
+        new ArchiveMetadataService(
+          { mcpServerVersion: '0.0.0-test' } as AppConfig,
+          createInMemoryStorage(),
+        ),
+      );
+      const http = createFetchMock([
+        {
+          method: 'GET',
+          match: 'https://archive.org/metadata/recorded-live-1977',
+          respond: Response.json({
+            metadata: {
+              identifier: 'recorded-live-1977',
+              description: 'Recorded <i>live</i>, 1977.',
+            },
+            files: [],
+          }),
+        },
+      ]);
+      http.install();
+      try {
+        const result = await runToolContract(iaGetItem, { identifier: 'recorded-live-1977' });
+
+        expect(result.isError).toBeFalsy();
+        expect((result.structuredContent as { description?: unknown }).description).toBe(
+          'Recorded live, 1977.',
+        );
+        expect(contentText(result)).toBe(
+          '# recorded-live-1977\n**Identifier:** recorded-live-1977\n\n**Description:** Recorded live, 1977.\n\n**Files (0):**',
+        );
+        expect(http.calls).toHaveLength(1);
+      } finally {
+        http.restore();
+      }
     });
   });
 

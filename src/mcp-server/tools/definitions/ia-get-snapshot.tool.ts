@@ -157,7 +157,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
     text: z
       .string()
       .describe(
-        "One page of the capture's text: up to max_chars characters from char_offset. An HTML page is reduced to readable plain text in lines: scripts, styles, comments, and tags removed and character references decoded; each block element (paragraph, heading, list item, table row) and <br> starts a new line; the cells of a table row are separated by tabs, empty cells included; <pre> text keeps its spacing and line breaks, and elsewhere a whitespace run reads as one space and blank lines collapse to one. Another text type (plain text, JSON, XML, JavaScript) is the body as archived, line breaks and markup kept. Taken from at most the first 4 MiB of the capture; a notice says so when it is longer.",
+        "One page of the capture's text: up to max_chars characters from char_offset. An HTML page is reduced to readable plain text in lines: scripts, styles, comments, and tags removed and character references decoded; each block element (paragraph, heading, list item, table row) and <br> starts a new line; the cells of a table row are separated by tabs, empty cells included; the tags of text-level elements (a, b, i, span, sup, …) add no space, so text the page writes without a space has none, though a link and the element beside it keep one space between two words outside CJK text; <pre> text keeps its spacing and line breaks, and elsewhere a whitespace run reads as one space and blank lines collapse to one. Left out are a <template>'s content, unless it declares a shadow root, and the content of an inline element (span, a, sup, …) the page hides with its own hidden attribute or inline display:none style; content hidden by a class, a stylesheet, or a hidden block element stays. Another text type (plain text, JSON, XML, JavaScript) is the body as archived, line breaks and markup kept. Taken from at most the first 4 MiB of the capture; a notice says so when it is longer.",
       ),
     char_offset: z.number().describe('Character offset (UTF-16 code units) this page starts at.'),
     max_chars: z
@@ -209,7 +209,7 @@ export const iaGetSnapshot = tool('ia_get_snapshot', {
       )
       .optional()
       .describe(
-        "Set when include_links is true: the links whose first occurrence starts in this page of text, in document order. Each http(s) target is listed once, with the first non-empty text it is linked by; the page's own URL is left out. The last page also takes the links at the very end of the text, so the pages of a read that follows has_more list each link once. Empty for a capture that is not HTML.",
+        "Set when include_links is true: the links whose first occurrence starts in this page of text, in document order. Each http(s) target is listed once, with the first non-empty text it is linked by; the page's own URL is left out, and so is a link inside content the text leaves out (a template or a hidden inline element). The last page also takes the links at the very end of the text, so the pages of a read that follows has_more list each link once. Empty for a capture that is not HTML.",
       ),
     total_links: z
       .number()

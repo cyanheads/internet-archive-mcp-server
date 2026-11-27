@@ -152,7 +152,7 @@ describe('fetchContent links (#67)', () => {
     const off = await fetchWith({ links: false }, SNAPSHOT, served(html));
     const on = await fetchWith({ links: true }, SNAPSHOT, served(html));
     expect(omitted).toEqual({
-      text: 'See the executive summary .',
+      text: 'See the executive summary.',
       replayUrl: SNAPSHOT,
       timestamp: '20120601000000',
       status: '200',
@@ -418,6 +418,53 @@ Library</a> )`;
       },
       0,
     );
+  });
+});
+
+describe('fetchContent text-level tags, hidden content, and templates (#75, #76)', () => {
+  const WIKI =
+    'https://web.archive.org/web/20141230091718/https://en.wikipedia.org/wiki/ISO_3166-1';
+
+  /** The text and links of `html` served as an HTML replay of the ISO 3166-1 capture. */
+  const read = async (html: string) => {
+    fetchWithTimeout.mockResolvedValueOnce(served(html));
+    const ctx = createMockContext({ errors: iaGetSnapshot.errors });
+    const result = await buildService().fetchContent(WIKI, ctx, startCallDeadline(ctx.signal), {
+      links: true,
+    });
+    return { text: result.text, links: result.links };
+  };
+
+  it('adds no separator at a text-level tag, and keeps one at an image', async () => {
+    const { text, links } = await read(
+      '<p>Name changes <i>(<a href="/wiki/Afghanistan">Afghanistan</a>, <a href="/wiki/Azerbaijan">Azerbaijan</a>)</i></p><p><b>H</b>ello<img src="x.png">world</p>',
+    );
+    expect(text).toBe('Name changes (Afghanistan, Azerbaijan)\nHello world');
+    expect(text).toHaveLength(50);
+    expect(links).toEqual([
+      { offset: 14, text: 'Afghanistan', url: 'https://en.wikipedia.org/wiki/Afghanistan' },
+      { offset: 27, text: 'Azerbaijan', url: 'https://en.wikipedia.org/wiki/Azerbaijan' },
+    ]);
+  });
+
+  it('leaves out a hidden phrasing element and the link inside it, and keeps a hidden block', async () => {
+    const { text, links } = await read(
+      '<p>Visible <span style="display:none"><a href="/wiki/Hidden">secret</a></span><a href="/wiki/Shown">shown</a>.</p><div hidden>Block</div>',
+    );
+    expect(text).toBe('Visible shown.\nBlock');
+    expect(text).toHaveLength(20);
+    expect(links).toEqual([
+      { offset: 8, text: 'shown', url: 'https://en.wikipedia.org/wiki/Shown' },
+    ]);
+  });
+
+  it('leaves out a template and the link inside it, and reads a declarative shadow root', async () => {
+    const { text, links } = await read(
+      '<p>Before<template><a href="/wiki/Template">T</a></template> after</p><div><template shadowrootmode="open"><a href="/wiki/Shadow">S</a></template></div>',
+    );
+    expect(text).toBe('Before after\nS');
+    expect(text).toHaveLength(14);
+    expect(links).toEqual([{ offset: 13, text: 'S', url: 'https://en.wikipedia.org/wiki/Shadow' }]);
   });
 });
 

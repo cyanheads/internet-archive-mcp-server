@@ -3,10 +3,18 @@
  * @module tests/tools/ia-get-snapshot.tool.test
  */
 
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, notFound, timeout } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createInMemoryStorage,
+  createMockContext,
+  type FetchMockHarness,
+  getEnrichment,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { markdown } from '@cyanheads/mcp-ts-core/utils';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { iaGetSnapshot } from '@/mcp-server/tools/definitions/ia-get-snapshot.tool.js';
 import type { CallDeadline } from '@/services/call-deadline.js';
 import { expectLinearDoubling } from '../helpers/cpu-time.js';
@@ -26,7 +34,7 @@ vi.mock('@/config/server-config.js', () => ({
   getUserAgent: vi.fn().mockReturnValue('test-agent/0.0.0'),
 }));
 
-import { getWaybackService } from '@/services/wayback/wayback-service.js';
+import { getWaybackService, WaybackService } from '@/services/wayback/wayback-service.js';
 
 const mockService = {
   findClosest: vi.fn(),
@@ -1813,6 +1821,220 @@ describe('iaGetSnapshot', () => {
       expect(text).toContain('include_links:');
       expect(text).not.toContain('Unrecognized key');
       expect(mockService.fetchContent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a replayed page read by the real WaybackService (#75, #76)', () => {
+    const PAGE_URL = 'https://en.wikipedia.org/wiki/ISO_3166-1';
+    const TIMESTAMP = '20141230091718';
+    const REPLAY = `https://web.archive.org/web/${TIMESTAMP}/${PAGE_URL}`;
+    /**
+     * An ISO 3166-1 row, its hidden sort key holding a link, then inline links in an
+     * emphasised run, and a template holding a link at the very end of the text.
+     */
+    const HTML =
+      '<table><tr><td><span style="display:none;" class="sortkey">Aland Islands !<a href="/wiki/Sort_key">sort key</a></span><span class="sorttext"><a href="/wiki/%C3%85land_Islands" title="Åland Islands">Åland Islands</a></span></td><td>AX</td></tr></table><p>Name changes <i>(<a href="/wiki/Afghanistan">Afghanistan</a>, <a href="/wiki/Azerbaijan">Azerbaijan</a>)</i><template><a href="/wiki/Template_link">template</a></template></p>';
+    const TEXT = 'Åland Islands\tAX\nName changes (Afghanistan, Azerbaijan)';
+    const ALAND = {
+      text: 'Åland Islands',
+      url: 'https://en.wikipedia.org/wiki/%C3%85land_Islands',
+    };
+    const AFGHANISTAN = { text: 'Afghanistan', url: 'https://en.wikipedia.org/wiki/Afghanistan' };
+    const AZERBAIJAN = { text: 'Azerbaijan', url: 'https://en.wikipedia.org/wiki/Azerbaijan' };
+    const HEADER = `**Replay URL:** [${REPLAY}](<${REPLAY}>)\n**Resolved Timestamp:** ${TIMESTAMP} | **Status:** 200`;
+    const listed = (...links: { text: string; url: string }[]) =>
+      links.map((l) => `\n- [${l.text}](<${l.url}>)`).join('');
+
+    let http: FetchMockHarness;
+
+    beforeEach(() => {
+      (getWaybackService as ReturnType<typeof vi.fn>).mockReturnValue(
+        new WaybackService(
+          { mcpServerVersion: '0.0.0-test' } as AppConfig,
+          createInMemoryStorage(),
+        ),
+      );
+      http = createFetchMock([
+        {
+          method: 'GET',
+          match: REPLAY,
+          respond: new Response(HTML, { headers: { 'content-type': 'text/html; charset=UTF-8' } }),
+        },
+      ]);
+      http.install();
+    });
+
+    afterEach(() => {
+      http.restore();
+    });
+
+    const read = async (input: Record<string, unknown> = {}) => {
+      const result = await runToolContract(iaGetSnapshot, {
+        url: PAGE_URL,
+        timestamp: TIMESTAMP,
+        ...input,
+      });
+      expect(result.isError).toBeFalsy();
+      const content = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { page: result.structuredContent as Record<string, unknown>, content };
+    };
+
+    it('reads the row without its hidden sort key, the links’ tags adding no space, and lists no links without include_links, on both surfaces', async () => {
+      const { page, content } = await read();
+
+      expect(page).toStrictEqual({
+        text: TEXT,
+        replay_url: REPLAY,
+        resolved_timestamp: TIMESTAMP,
+        resolved_status: '200',
+        char_offset: 0,
+        max_chars: 50_000,
+        has_more: false,
+        total_chars: 55,
+      });
+      expect(content).toBe(
+        `${HEADER}\n**Offset:** 0 | **Max Chars:** 50,000 | **Total Chars:** 55 — end of text\n\n---\n\nÅland Islands\tAX\\\nName changes (Afghanistan, Azerbaijan)`,
+      );
+      expect(http.calls).toHaveLength(1);
+    });
+
+    it('lists the inline links and leaves out the hidden sort key’s and the template’s, with include_links, on both surfaces', async () => {
+      const { page, content } = await read({ include_links: true });
+
+      expect(page.text).toBe(TEXT);
+      expect(page.total_chars).toBe(55);
+      expect(page.links).toStrictEqual([ALAND, AFGHANISTAN, AZERBAIJAN]);
+      expect(page.total_links).toBe(3);
+      expect(content).toBe(
+        `${HEADER}\n**Offset:** 0 | **Max Chars:** 50,000 | **Total Chars:** 55 — end of text\n\n---\n\nÅland Islands\tAX\\\nName changes (Afghanistan, Azerbaijan)\n\n**Links on this page:** 3 of 3\n${listed(ALAND, AFGHANISTAN, AZERBAIJAN)}`,
+      );
+      expect(http.calls).toHaveLength(1);
+    });
+
+    it('pages the text past the removed hidden part by the text returned: has_more, total_chars, and each link on one page agree, and a page past the end is empty, on both surfaces', async () => {
+      const first = await read({ include_links: true, max_chars: 28 });
+      const second = await read({ include_links: true, max_chars: 28, char_offset: 28 });
+      const past = await read({ include_links: true, max_chars: 28, char_offset: 56 });
+
+      const next = `More text follows: call ia_get_snapshot again with url \`${PAGE_URL}\`, timestamp ${TIMESTAMP} (resolved_timestamp), char_offset 28, and include_links true for the next page.`;
+      expect(first.page).toStrictEqual({
+        text: 'Åland Islands\tAX\nName change',
+        replay_url: REPLAY,
+        resolved_timestamp: TIMESTAMP,
+        resolved_status: '200',
+        char_offset: 0,
+        max_chars: 28,
+        has_more: true,
+        total_chars: 55,
+        links: [ALAND],
+        total_links: 3,
+        notice: next,
+      });
+      expect(first.content).toBe(
+        `${HEADER}\n**Offset:** 0 | **Max Chars:** 28 | **Total Chars:** 55 — more follows (next offset: 28)\n\n---\n\nÅland Islands\tAX\\\nName change\n\n**Links on this page:** 1 of 3\n${listed(ALAND)}\n\n\n> ${next}`,
+      );
+
+      expect(second.page).toStrictEqual({
+        text: 's (Afghanistan, Azerbaijan)',
+        replay_url: REPLAY,
+        resolved_timestamp: TIMESTAMP,
+        resolved_status: '200',
+        char_offset: 28,
+        max_chars: 28,
+        has_more: false,
+        total_chars: 55,
+        links: [AFGHANISTAN, AZERBAIJAN],
+        total_links: 3,
+      });
+      expect(second.content).toBe(
+        `${HEADER}\n**Offset:** 28 | **Max Chars:** 28 | **Total Chars:** 55 — end of text\n\n---\n\ns (Afghanistan, Azerbaijan)\n\n**Links on this page:** 2 of 3\n${listed(AFGHANISTAN, AZERBAIJAN)}`,
+      );
+      expect(`${first.page.text}${second.page.text}`).toBe(TEXT);
+
+      expect(past.page).toMatchObject({
+        text: '',
+        char_offset: 56,
+        has_more: false,
+        total_chars: 55,
+        links: [],
+        total_links: 3,
+      });
+      expect(past.page).not.toHaveProperty('notice');
+      expect(past.content).toBe(
+        `${HEADER}\n**Offset:** 56 | **Max Chars:** 28 | **Total Chars:** 55 — end of text\n\n---\n\n\n\n**Links on this page:** 0 of 3`,
+      );
+      expect(http.calls).toHaveLength(3);
+    });
+  });
+
+  describe('sibling links read by the real WaybackService (#75)', () => {
+    const PAGE_URL = 'https://elpais.com/';
+    const TIMESTAMP = '20210602012419';
+    const REPLAY = `https://web.archive.org/web/${TIMESTAMP}/${PAGE_URL}`;
+    /** An edition menu: sibling links the page's stylesheet spaces apart. */
+    const HTML =
+      '<p><a href="/?ed=esp">esp</a><a href="/?ed=ame">ame</a><a href="/?ed=mex">mex</a></p>';
+    const ESP = { text: 'esp', url: 'https://elpais.com/?ed=esp' };
+    const AME = { text: 'ame', url: 'https://elpais.com/?ed=ame' };
+    const MEX = { text: 'mex', url: 'https://elpais.com/?ed=mex' };
+    const HEADER = `**Replay URL:** [${REPLAY}](<${REPLAY}>)\n**Resolved Timestamp:** ${TIMESTAMP} | **Status:** 200`;
+
+    let http: FetchMockHarness;
+
+    beforeEach(() => {
+      (getWaybackService as ReturnType<typeof vi.fn>).mockReturnValue(
+        new WaybackService(
+          { mcpServerVersion: '0.0.0-test' } as AppConfig,
+          createInMemoryStorage(),
+        ),
+      );
+      http = createFetchMock([
+        {
+          method: 'GET',
+          match: REPLAY,
+          respond: new Response(HTML, { headers: { 'content-type': 'text/html; charset=UTF-8' } }),
+        },
+      ]);
+      http.install();
+    });
+
+    afterEach(() => {
+      http.restore();
+    });
+
+    const read = async (input: Record<string, unknown>) => {
+      const result = await runToolContract(iaGetSnapshot, {
+        url: PAGE_URL,
+        timestamp: TIMESTAMP,
+        include_links: true,
+        ...input,
+      });
+      expect(result.isError).toBeFalsy();
+      const content = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { page: result.structuredContent as Record<string, unknown>, content };
+    };
+
+    it('keeps a space between the links in text, outside each link’s text, and lists each link on the page its text starts on, on both surfaces', async () => {
+      const whole = await read({});
+      const first = await read({ max_chars: 4 });
+      const second = await read({ max_chars: 4, char_offset: 4 });
+
+      expect(whole.page).toMatchObject({
+        text: 'esp ame mex',
+        total_chars: 11,
+        links: [ESP, AME, MEX],
+        total_links: 3,
+      });
+      expect(whole.content).toContain('\n\n---\n\nesp ame mex\n\n**Links on this page:** 3 of 3');
+      // The space after "esp" ends page 1, so a link whose offset took it in would be listed there.
+      expect(first.page).toMatchObject({ text: 'esp ', links: [ESP], total_links: 3 });
+      expect(first.content).toContain(
+        `${HEADER}\n**Offset:** 0 | **Max Chars:** 4 | **Total Chars:** 11 — more follows (next offset: 4)\n\n---\n\nesp&#32;\n\n**Links on this page:** 1 of 3\n\n- [esp](<${ESP.url}>)`,
+      );
+      expect(second.page).toMatchObject({ text: 'ame ', links: [AME], total_links: 3 });
+      expect(second.content).toContain(
+        `**Offset:** 4 | **Max Chars:** 4 | **Total Chars:** 11 — more follows (next offset: 8)\n\n---\n\name&#32;\n\n**Links on this page:** 1 of 3\n\n- [ame](<${AME.url}>)`,
+      );
     });
   });
 
